@@ -1,0 +1,713 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include <atomic>
+#include <cstdio>
+#include <cinttypes>
+#include <cstring>
+#include <cstdlib>
+#include <ctime>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "hap_master.h"
+#include "hap_session.h"
+#include "hap_json.h"
+#include "hap_protocol.h"
+#include "metrics/metrics.h"
+#include "esp_timer.h"
+#include "esp_random.h"
+#include "esp_attr.h"
+#include "esp_https_ota.h"
+#include "esp_http_client.h"
+#include "ws_server.h"
+#include "mqtt_gw.h"
+#include "tg_gw.h"
+#include "esp_sntp.h"
+#include "esp_spiffs.h"
+#include "esp_heap_caps.h"
+#include "ArduinoJson.h"
+#include "s3_internal.h"
+#include "nvs_helpers.h"
+#include "log_ring.h"
+#include "task_stacks.h"
+
+static const char* TAG = "s3_main";
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+uint64_t parse_ieee(const char* s) {
+    if (!s || *s == '\0') return 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    char* end;
+    uint64_t v = strtoull(s, &end, 16);
+    if (end == s || *end != '\0') return 0;
+    return v;
+}
+
+// ── API authentication ────────────────────────────────────────────────────
+char s_api_token[33] = {};
+bool s_auth_enabled = false;
+
+// Auth-failure rate limit (CC-F8). Sliding 60-second window of failed
+// attempts; once we cross AUTH_FAIL_LIMIT in the window every check_auth
+// returns false until the window slides past the oldest entry. Prevents
+// online brute-force of the 32-hex-char token.
+static constexpr uint8_t  AUTH_FAIL_LIMIT  = 5;
+static constexpr uint32_t AUTH_FAIL_WINDOW_MS = 60 * 1000;
+static uint32_t s_auth_fail_ts[AUTH_FAIL_LIMIT] = {};
+static uint8_t  s_auth_fail_head = 0;
+static SemaphoreHandle_t s_auth_fail_mutex = nullptr;
+
+static void auth_record_failure() {
+    if (!s_auth_fail_mutex) return;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (xSemaphoreTake(s_auth_fail_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    s_auth_fail_ts[s_auth_fail_head] = now;
+    s_auth_fail_head = (s_auth_fail_head + 1) % AUTH_FAIL_LIMIT;
+    xSemaphoreGive(s_auth_fail_mutex);
+}
+
+static bool auth_is_locked() {
+    if (!s_auth_fail_mutex) return false;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (xSemaphoreTake(s_auth_fail_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+    uint8_t recent = 0;
+    for (int i = 0; i < AUTH_FAIL_LIMIT; i++) {
+        if (s_auth_fail_ts[i] != 0 &&
+            (now - s_auth_fail_ts[i]) < AUTH_FAIL_WINDOW_MS) recent++;
+    }
+    xSemaphoreGive(s_auth_fail_mutex);
+    return recent >= AUTH_FAIL_LIMIT;
+}
+
+void auth_init() {
+    if (!s_auth_fail_mutex) s_auth_fail_mutex = xSemaphoreCreateMutex();
+
+    nvs_handle_t h;
+    esp_err_t oe = nvs_open("zhac_auth", NVS_READWRITE, &h);
+    if (oe != ESP_OK) {
+        ESP_LOGE(TAG, "auth_init: nvs_open failed: %s", esp_err_to_name(oe));
+        return;
+    }
+
+    // Load auth enabled flag (default: disabled)
+    uint8_t auth_en = 0;
+    nvs_get_u8(h, "enabled", &auth_en);
+    s_auth_enabled = (auth_en != 0);
+
+    // Always generate/load a token so it's ready if auth is enabled later
+    size_t len = sizeof(s_api_token);
+    esp_err_t err = nvs_get_str(h, "token", s_api_token, &len);
+    if (err != ESP_OK || s_api_token[0] == '\0') {
+        uint8_t rnd[16];
+        esp_fill_random(rnd, sizeof(rnd));
+        for (int i = 0; i < 16; i++) {
+            snprintf(s_api_token + i * 2, 3, "%02x", rnd[i]);
+        }
+        esp_err_t se = nvs_set_str(h, "token", s_api_token);
+        if (se != ESP_OK) ESP_LOGE(TAG, "auth_init: nvs_set token: %s",
+                                    esp_err_to_name(se));
+        esp_err_t ce = nvs_commit(h);
+        if (ce != ESP_OK) ESP_LOGE(TAG, "auth_init: nvs_commit: %s",
+                                    esp_err_to_name(ce));
+    }
+    nvs_close(h);
+
+    if (s_auth_enabled) {
+        ws_server_set_api_token(s_api_token);
+        ESP_LOGI(TAG, "API auth enabled (token len=%u)", (unsigned)strlen(s_api_token));
+    } else {
+        ws_server_set_api_token(nullptr);
+        ESP_LOGI(TAG, "API auth disabled");
+    }
+}
+
+// Generate a new random token, persist, and apply to ws_server. Returns
+// the new token via `out` (33 bytes incl. NUL). Used by api_token_rotate.
+extern "C" bool auth_rotate_token(char* out, size_t out_cap) {
+    if (out_cap < 33) return false;
+    uint8_t rnd[16];
+    esp_fill_random(rnd, sizeof(rnd));
+    char fresh[33] = {};
+    for (int i = 0; i < 16; i++) snprintf(fresh + i * 2, 3, "%02x", rnd[i]);
+
+    nvs_handle_t h;
+    esp_err_t oe = nvs_open("zhac_auth", NVS_READWRITE, &h);
+    if (oe != ESP_OK) { ESP_LOGE(TAG, "rotate: nvs_open: %s", esp_err_to_name(oe)); return false; }
+    esp_err_t se = nvs_set_str(h, "token", fresh);
+    esp_err_t ce = (se == ESP_OK) ? nvs_commit(h) : se;
+    nvs_close(h);
+    if (se != ESP_OK || ce != ESP_OK) {
+        ESP_LOGE(TAG, "rotate: nvs persist failed");
+        return false;
+    }
+    memcpy(s_api_token, fresh, sizeof(fresh));
+    if (s_auth_enabled) ws_server_set_api_token(s_api_token);
+    memcpy(out, fresh, sizeof(fresh));
+    ESP_LOGW(TAG, "API token rotated");
+    return true;
+}
+
+bool check_auth(httpd_req_t* req) {
+    if (!s_auth_enabled) return true;
+    if (auth_is_locked()) return false;     // CC-F8 rate-limit
+    char key[64] = {};
+    if (httpd_req_get_hdr_value_str(req, "X-Api-Key", key, sizeof(key)) != ESP_OK) {
+        auth_record_failure();
+        return false;
+    }
+    if (strlen(key) != 32) { auth_record_failure(); return false; }
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++)
+        diff |= (uint8_t)key[i] ^ (uint8_t)s_api_token[i];
+    if (diff != 0) { auth_record_failure(); return false; }
+    return true;
+}
+
+// ── OTA signalling ────────────────────────────────────────────────────────
+char              s_ota_url[256] = {};
+SemaphoreHandle_t s_ota_sem      = nullptr;
+
+// ── Script request/response synchronisation ───────────────────────────────
+SemaphoreHandle_t s_script_req_mutex = nullptr;
+SemaphoreHandle_t s_script_rsp_sem   = nullptr;
+char*             s_script_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
+size_t            s_script_rsp_len   = 0;
+
+// ── P4 state cache (updated from SYNC_ACK and HEARTBEAT) ─────────────────
+std::atomic<uint16_t> s_p4_device_count{0};
+std::atomic<uint32_t> s_p4_uptime_s{0};
+std::atomic<uint32_t> s_p4_psram_free{0};
+std::atomic<uint32_t> s_p4_psram_total{0};
+std::atomic<uint8_t>  s_p4_cpu_pct_c0{0};
+std::atomic<uint8_t>  s_p4_cpu_pct_c1{0};
+std::atomic<uint32_t> s_p4_proto_mask{0};
+char                  s_p4_fw_ver[16] = {};
+std::atomic<uint32_t> s_p4_heap_free{0};
+std::atomic<uint32_t> s_p4_heap_min_free{0};
+std::atomic<uint32_t> s_p4_internal_free{0};
+std::atomic<uint32_t> s_p4_internal_min_free{0};
+std::atomic<uint32_t> s_p4_internal_largest_block{0};
+std::atomic<uint32_t> s_p4_psram_min_free{0};
+std::atomic<uint32_t> s_p4_psram_largest_block{0};
+std::atomic<uint32_t> s_p4_task_stack_hwm_bytes{0};
+
+// ── P4 OTA ────────────────────────────────────────────────────────────────
+SemaphoreHandle_t      s_p4ota_sem          = nullptr;
+SemaphoreHandle_t      s_p4ota_rsp_sem       = nullptr;
+SemaphoreHandle_t      s_p4ota_ckpt_rsp_sem  = nullptr;
+char                   s_p4ota_url[256]      = {};
+HapOtaStatus           s_p4ota_status        = {};
+uint32_t               s_p4ota_ckpt_offset   = 0;
+
+// ── Alert ring buffer ─────────────────────────────────────────────────────
+AlertLogEntry     s_alert_log[ALERT_LOG_MAX];
+uint8_t           s_alert_log_head  = 0;
+uint8_t           s_alert_log_count = 0;
+SemaphoreHandle_t s_alert_log_mutex = nullptr;
+
+// ── Device-list request/response synchronisation ─────────────────────────
+SemaphoreHandle_t s_devlist_req_mutex = nullptr;
+SemaphoreHandle_t s_devlist_rsp_sem   = nullptr;
+char*             s_devlist_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
+size_t            s_devlist_rsp_len   = 0;
+
+// ── Device-info request/response synchronisation ─────────────────────────
+SemaphoreHandle_t s_devinfo_req_mutex = nullptr;
+SemaphoreHandle_t s_devinfo_rsp_sem   = nullptr;
+char*             s_devinfo_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
+size_t            s_devinfo_rsp_len   = 0;
+
+// ── Set-attribute request/response synchronisation ───────────────────────
+SemaphoreHandle_t s_setattr_req_mutex = nullptr;
+SemaphoreHandle_t s_setattr_rsp_sem   = nullptr;
+bool              s_setattr_rsp_ok    = false;
+
+// ── Bind request/response synchronisation ────────────────────────────────
+SemaphoreHandle_t s_bind_req_mutex = nullptr;
+SemaphoreHandle_t s_bind_rsp_sem   = nullptr;
+bool              s_bind_rsp_ok    = false;
+
+// ── Device-delete request/response synchronisation ───────────────────────
+SemaphoreHandle_t s_devdel_req_mutex = nullptr;
+SemaphoreHandle_t s_devdel_rsp_sem   = nullptr;
+bool              s_devdel_rsp_ok    = false;
+
+// ── Device-options request/response synchronisation ──────────────────────
+SemaphoreHandle_t s_devopt_req_mutex = nullptr;
+SemaphoreHandle_t s_devopt_rsp_sem   = nullptr;
+bool              s_devopt_rsp_ok    = false;
+
+// ── Zigbee-config (channel + net_key) request/response synchronisation ──
+SemaphoreHandle_t s_zbcfg_req_mutex    = nullptr;
+SemaphoreHandle_t s_zbcfg_rsp_sem      = nullptr;
+bool              s_zbcfg_rsp_ok       = false;
+uint8_t           s_zbcfg_rsp_channel  = 11;
+bool              s_zbcfg_rsp_key_set  = false;
+
+// ── Rule request/response synchronisation ────────────────────────────────
+SemaphoreHandle_t s_rule_req_mutex = nullptr;
+SemaphoreHandle_t s_rule_rsp_sem   = nullptr;
+char*             s_rule_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
+size_t            s_rule_rsp_len   = 0;
+
+// ── Diagnostics sync ──────────────────────────────────────────────────────
+SemaphoreHandle_t s_diag_req_mutex = nullptr;
+SemaphoreHandle_t s_diag_rsp_sem   = nullptr;
+char*             s_diag_rsp_json  = nullptr;
+size_t            s_diag_rsp_len   = 0;
+
+// ── Cached NVS handles ────────────────────────────────────────────────────
+nvs_handle_t s_nvs_zhac_opt = 0;
+
+// ── S3 HAP + WiFi state ───────────────────────────────────────────────────
+std::atomic<bool> s_synced{false};
+std::atomic<bool> s_wifi_connected{false};
+bool              s_metrics_enabled = false;
+bool              s_ap_disabled     = false;
+
+// ── WiFi (managed by wifi_mgr.cpp) ───────────────────────────────────────
+
+// ── task_time_sync ────────────────────────────────────────────────────────
+static void task_time_sync(void*) {
+    ESP_LOGI(TAG, "task_time_sync started");
+    static constexpr time_t MIN_VALID_TS = 1577836800; // 2020-01-01 UTC
+
+    for (;;) {
+        time_t now = time(nullptr);
+        while (now < MIN_VALID_TS) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            now = time(nullptr);
+        }
+
+        uint8_t ts_buf[32];
+        uint16_t ts_len = 0;
+        if (hap_json_encode_time_sync(ts_buf, sizeof(ts_buf), &ts_len,
+                                      static_cast<uint32_t>(now))) {
+            hap_send(HapMsgType::TIME_SYNC, ts_buf, ts_len);
+            ESP_LOGI(TAG, "TIME_SYNC sent ts=%lld", (long long)now);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(3600 * 1000));
+    }
+}
+
+// ── task_ota ──────────────────────────────────────────────────────────────
+static void task_ota(void*) {
+    ESP_LOGI(TAG, "TaskOTA ready");
+    while (true) {
+        xSemaphoreTake(s_ota_sem, portMAX_DELAY);
+        ESP_LOGI(TAG, "OTA: downloading from %s", s_ota_url);
+
+        esp_http_client_config_t http_cfg = {};
+        http_cfg.url                      = s_ota_url;
+
+        esp_https_ota_config_t ota_cfg = {};
+        ota_cfg.http_config            = &http_cfg;
+
+        esp_err_t ret = esp_https_ota(&ota_cfg);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "OTA complete — rebooting in 2 s");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+        } else {
+            ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
+// ── task_p4_ota ───────────────────────────────────────────────────────────
+static void task_p4_ota(void*) {
+    ESP_LOGI(TAG, "TaskP4OTA ready");
+    while (true) {
+        xSemaphoreTake(s_p4ota_sem, portMAX_DELAY);
+        ESP_LOGI(TAG, "P4 OTA: downloading from %s", s_p4ota_url);
+
+        s_p4ota_ckpt_offset = 0;
+        xSemaphoreTake(s_p4ota_ckpt_rsp_sem, 0);
+        hap_send(HapMsgType::OTA_CHECKPOINT_REQ, nullptr, 0, 0);
+        bool got_ckpt = xSemaphoreTake(s_p4ota_ckpt_rsp_sem, pdMS_TO_TICKS(2000)) == pdTRUE;
+        uint32_t resume_offset = got_ckpt ? s_p4ota_ckpt_offset : 0;
+        if (resume_offset > 0) {
+            ESP_LOGI(TAG, "P4 OTA: resuming from offset %" PRIu32, resume_offset);
+        }
+
+        esp_http_client_config_t http_cfg = {};
+        http_cfg.url                      = s_p4ota_url;
+
+        esp_http_client_handle_t client = nullptr;
+        int content_len = 0;
+        uint32_t total  = 0;
+        bool open_ok    = false;
+
+        // Try resume; on any disagreement from the server, fall back to a
+        // clean restart from offset 0. Loops at most twice.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            client = esp_http_client_init(&http_cfg);
+            if (!client) {
+                ESP_LOGE(TAG, "P4 OTA: esp_http_client_init failed");
+                break;
+            }
+
+            if (resume_offset > 0) {
+                char range_hdr[32];
+                snprintf(range_hdr, sizeof(range_hdr), "bytes=%" PRIu32 "-", resume_offset);
+                esp_http_client_set_header(client, "Range", range_hdr);
+            }
+
+            esp_err_t err = esp_http_client_open(client, 0);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "P4 OTA: open failed: %s", esp_err_to_name(err));
+                esp_http_client_cleanup(client);
+                client = nullptr;
+                break;
+            }
+            content_len = esp_http_client_fetch_headers(client);
+
+            if (resume_offset == 0) {
+                total = (content_len > 0) ? (uint32_t)content_len : 0;
+                open_ok = true;
+                break;
+            }
+
+            // Resume requested — verify server honoured the Range request.
+            int status = esp_http_client_get_status_code(client);
+            char* cr_val = nullptr;
+            esp_http_client_get_header(client, "Content-Range", &cr_val);
+
+            uint32_t cr_start = 0, cr_end = 0, cr_total = 0;
+            bool cr_ok = (cr_val != nullptr) &&
+                         (sscanf(cr_val, "bytes %" SCNu32 "-%" SCNu32 "/%" SCNu32,
+                                 &cr_start, &cr_end, &cr_total) == 3);
+
+            if (status == 206 && cr_ok && cr_start == resume_offset) {
+                total = (cr_total > 0)
+                        ? cr_total
+                        : ((content_len > 0)
+                           ? (resume_offset + (uint32_t)content_len)
+                           : 0);
+                open_ok = true;
+                break;
+            }
+
+            ESP_LOGW(TAG,
+                     "P4 OTA: server ignored Range (status=%d, Content-Range=%s) — restarting from 0",
+                     status, cr_val ? cr_val : "<none>");
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            client = nullptr;
+            resume_offset = 0;
+            // Loop again to reopen with no Range header.
+        }
+
+        if (!open_ok) {
+            if (client) {
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+            }
+            continue;
+        }
+
+        EXT_RAM_BSS_ATTR static uint8_t chunk_buf[HAP_MAX_PAYLOAD];
+        uint8_t* data_ptr = chunk_buf + HAP_OTA_CHUNK_HDR_SIZE;
+        const size_t data_max = sizeof(chunk_buf) - HAP_OTA_CHUNK_HDR_SIZE;
+
+        uint32_t offset = resume_offset;
+        bool download_ok = true;
+
+        while (true) {
+            int n = esp_http_client_read(client, reinterpret_cast<char*>(data_ptr), data_max);
+            if (n < 0) {
+                ESP_LOGE(TAG, "P4 OTA: read error");
+                download_ok = false;
+                break;
+            }
+            if (n == 0) break;
+
+            auto* hdr    = reinterpret_cast<HapOtaChunkHdr*>(chunk_buf);
+            hdr->total   = total;
+            hdr->offset  = offset;
+            hdr->flags   = esp_http_client_is_complete_data_received(client) ? 0x01 : 0x00;
+            memset(hdr->_pad, 0, sizeof(hdr->_pad));
+
+            offset += (uint32_t)n;
+
+            hap_send(HapMsgType::OTA_CHUNK, chunk_buf,
+                     (uint16_t)(HAP_OTA_CHUNK_HDR_SIZE + n), 0);
+
+            if (hdr->flags & 0x01) break;
+        }
+
+        if (!download_ok) {
+            ESP_LOGI(TAG, "P4 OTA: interrupted at offset %" PRIu32 " — resumable", offset);
+        }
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        if (!download_ok) continue;
+
+        bool acked = xSemaphoreTake(s_p4ota_rsp_sem, pdMS_TO_TICKS(P4_OTA_RESPONSE_TIMEOUT_MS)) == pdTRUE;
+        if (!acked) {
+            xSemaphoreTake(s_p4ota_rsp_sem, 0);
+            ESP_LOGE(TAG, "P4 OTA: timeout — no OTA_STATUS from P4");
+        } else if (!s_p4ota_status.ok) {
+            ESP_LOGE(TAG, "P4 OTA failed: %s", s_p4ota_status.err);
+        } else {
+            ESP_LOGI(TAG, "P4 OTA success — P4 will reboot");
+        }
+    }
+}
+
+// ── task_stack_mon ────────────────────────────────────────────────────────
+static void task_stack_mon(void*) {
+    vTaskDelay(pdMS_TO_TICKS(STACK_MON_INITIAL_DELAY_MS));
+    while (true) {
+        ESP_LOGI(TAG, "=== Stack HWM (S3) ===");
+        for (const auto* e = zhac::stack::kTable; e->name != nullptr; ++e) {
+            TaskHandle_t h = xTaskGetHandle(e->name);
+            if (!h) continue;
+            uint32_t free_bytes = uxTaskGetStackHighWaterMark(h) * sizeof(StackType_t);
+            if (free_bytes < 512) {
+                ESP_LOGW(TAG, "  %-16s  LOW STACK: free=%" PRIu32 " bytes", e->name, free_bytes);
+            }
+            uint32_t used = (free_bytes > e->size) ? 0 : (e->size - free_bytes);
+            ESP_LOGI(TAG, "  %-16s  total=%4" PRIu32 "  free=%4" PRIu32 "  used=%4" PRIu32,
+                     e->name, e->size, free_bytes, used);
+        }
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+
+// Provided by metrics_mqtt.cpp — C linkage so main can forward-declare
+// without pulling in a tiny header.
+extern "C" void metrics_mqtt_publisher_start();
+
+// ── app_main ──────────────────────────────────────────────────────────────
+extern "C" void app_main() {
+    esp_reset_reason_t rr = esp_reset_reason();
+    static const char* const s_reset_names[] = {
+        "UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT",
+        "TASK_WDT", "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO",
+    };
+    const char* rr_str = (rr < (esp_reset_reason_t)(sizeof(s_reset_names)/sizeof(s_reset_names[0])))
+                         ? s_reset_names[rr] : "?";
+    ESP_LOGI(TAG, "ZHAC S3 core starting (reset reason: %s)", rr_str);
+
+    esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms      = 10000,
+        .idle_core_mask  = 0,
+        .trigger_panic   = true,
+    };
+    ESP_ERROR_CHECK(esp_task_wdt_reconfigure(&wdt_cfg));
+
+    // TODO: Enable NVS encryption (nvs_flash_secure_init) — see docs/TODO.md
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    } else {
+        ESP_ERROR_CHECK(nvs_ret);
+    }
+
+    // Capture log lines into an in-memory ring for /api/logs. Installed
+    // early so subsequent ESP_LOG* calls are captured from boot onward.
+    log_ring_init();
+
+    // Metrics engine — zero-init shard storage. Safe to call at any
+    // time before the first counter/value/timer emission.
+    metrics::init();
+
+    // Start the periodic MQTT snapshot publisher (no-op when exporter
+    // disabled in sdkconfig).
+    metrics_mqtt_publisher_start();
+
+    // SPI master must init before WiFi — WiFi driver corrupts the interrupt
+    // descriptor linked list (vector_desc_head), causing LoadProhibited in
+    // esp_intr_alloc when SPI2 tries to allocate its interrupt afterwards.
+    hap_master_init();
+
+    // WiFi manager handles esp_netif_init() + esp_event_loop_create_default()
+    wifi_mgr_init();
+
+    // Open hot-path NVS namespaces once and keep handles cached (S4)
+    nvs_open("zhac_opt", NVS_READWRITE, &s_nvs_zhac_opt);  // best-effort; 0 means uncached
+
+    s_ota_sem = xSemaphoreCreateBinary();
+    configASSERT(s_ota_sem);
+
+    s_rule_req_mutex    = xSemaphoreCreateMutex();
+    s_rule_rsp_sem      = xSemaphoreCreateBinary();
+    s_script_req_mutex  = xSemaphoreCreateMutex();
+    s_script_rsp_sem    = xSemaphoreCreateBinary();
+    s_p4ota_sem         = xSemaphoreCreateBinary();
+    s_p4ota_rsp_sem     = xSemaphoreCreateBinary();
+    s_p4ota_ckpt_rsp_sem = xSemaphoreCreateBinary();
+    s_alert_log_mutex   = xSemaphoreCreateMutex();
+    configASSERT(s_alert_log_mutex);
+    s_devlist_req_mutex = xSemaphoreCreateMutex();
+    s_devlist_rsp_sem   = xSemaphoreCreateBinary();
+    s_devinfo_req_mutex = xSemaphoreCreateMutex();
+    s_devinfo_rsp_sem   = xSemaphoreCreateBinary();
+    s_setattr_req_mutex = xSemaphoreCreateMutex();
+    s_setattr_rsp_sem   = xSemaphoreCreateBinary();
+    s_bind_req_mutex    = xSemaphoreCreateMutex();
+    s_bind_rsp_sem      = xSemaphoreCreateBinary();
+    s_devdel_req_mutex  = xSemaphoreCreateMutex();
+    s_devdel_rsp_sem    = xSemaphoreCreateBinary();
+    s_devopt_req_mutex  = xSemaphoreCreateMutex();
+    s_devopt_rsp_sem    = xSemaphoreCreateBinary();
+    s_zbcfg_req_mutex   = xSemaphoreCreateMutex();
+    s_zbcfg_rsp_sem     = xSemaphoreCreateBinary();
+    s_diag_req_mutex    = xSemaphoreCreateMutex();
+    s_diag_rsp_sem      = xSemaphoreCreateBinary();
+    configASSERT(s_diag_req_mutex && s_diag_rsp_sem);
+    configASSERT(s_devlist_req_mutex);
+    configASSERT(s_devlist_rsp_sem);
+    configASSERT(s_setattr_req_mutex);
+    configASSERT(s_setattr_rsp_sem);
+    configASSERT(s_bind_req_mutex);
+    configASSERT(s_bind_rsp_sem);
+    configASSERT(s_devdel_req_mutex);
+    configASSERT(s_devdel_rsp_sem);
+    configASSERT(s_p4ota_sem);
+    configASSERT(s_p4ota_rsp_sem);
+    configASSERT(s_p4ota_ckpt_rsp_sem);
+    configASSERT(s_rule_req_mutex);
+    configASSERT(s_rule_rsp_sem);
+    configASSERT(s_script_req_mutex);
+    configASSERT(s_script_rsp_sem);
+    configASSERT(s_devinfo_req_mutex);
+    configASSERT(s_devinfo_rsp_sem);
+
+    // Allocate HAP response JSON buffers from PSRAM (saves 16 KB of DRAM — M3)
+    s_devlist_rsp_json = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    s_devinfo_rsp_json = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    s_rule_rsp_json    = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    s_script_rsp_json  = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    s_diag_rsp_json    = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    configASSERT(s_devlist_rsp_json && s_devinfo_rsp_json && s_rule_rsp_json && s_script_rsp_json && s_diag_rsp_json);
+
+    // Mount SPIFFS for web UI static files
+    {
+        esp_vfs_spiffs_conf_t spiffs_conf = {
+            .base_path              = "/spiffs",
+            .partition_label        = nullptr,
+            .max_files              = 8,
+            .format_if_mount_failed = false,
+        };
+        esp_err_t ret = esp_vfs_spiffs_register(&spiffs_conf);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "SPIFFS mount failed (%s) — web UI unavailable", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "SPIFFS mounted at /spiffs");
+            alert_log_load();
+        }
+    }
+
+    // Load persisted timezone and metrics toggle from NVS
+    {
+        nvs_handle_t h;
+        char tz[64] = {};
+        size_t tz_len = sizeof(tz);
+        uint8_t metrics_en = 0;
+        uint8_t ap_disabled = 0;
+        if (nvs_open("sys_cfg", NVS_READONLY, &h) == ESP_OK) {
+            nvs_get_str(h, "timezone", tz, &tz_len);
+            nvs_get_u8(h, "metrics_en", &metrics_en);
+            nvs_get_u8(h, "ap_disabled", &ap_disabled);
+            nvs_close(h);
+        }
+        if (tz[0]) { setenv("TZ", tz, 1); tzset(); ESP_LOGI(TAG, "Timezone: %s", tz); }
+        s_metrics_enabled = (metrics_en != 0);
+        s_ap_disabled     = (ap_disabled != 0);
+        ESP_LOGI(TAG, "Prometheus metrics: %s", s_metrics_enabled ? "enabled" : "disabled");
+    }
+
+    // hap_master_init() moved before wifi_mgr_init() for test 2
+    ws_server_init();
+
+    // ── Log-streaming sink toggles — load regardless of WiFi mode ──
+    {
+        nvs_handle_t h;
+        if (nvs_open("log_cfg", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t en = 0;
+            uint8_t lvl = (uint8_t)'I';
+            nvs_get_u8(h, "mqtt_en",  &en);
+            nvs_get_u8(h, "mqtt_lvl", &lvl);
+            log_sinks_set_mqtt(en != 0, (char)lvl);
+            en = 0; lvl = (uint8_t)'I';
+            nvs_get_u8(h, "ws_en",    &en);
+            nvs_get_u8(h, "ws_lvl",   &lvl);
+            log_sinks_set_ws(en != 0, (char)lvl);
+            nvs_close(h);
+        }
+    }
+
+    // MQTT config must be staged at boot even when we're still in
+    // AP+STA concurrent mode — `wifi_mgr_is_ap_mode()` returns true for
+    // the whole APSTA lifetime, not just pure-AP fallback. Gating this
+    // block on !is_ap_mode() would skip staging forever on boards that
+    // keep the captive portal up in parallel with STA. The actual
+    // client start is deferred to the WiFi STA-got-IP handler.
+    //
+    // mqtt_gw_init creates the publish worker queue + task. Without it
+    // every mqtt_gw_publish silently early-outs on null s_pubq even
+    // after the broker connects, leaving the WebUI showing "connected"
+    // while not a single message reaches the broker.
+    mqtt_gw_init();
+    tg_gw_init();
+    {
+        // MQTT disabled by default — opt-in via /api/settings {mqtt_enabled:true}
+        uint8_t mqtt_en = 0;
+        char url[128] = {};
+        char root[32] = {};
+        char cid[32]  = {};
+        nvs_read_mqtt_cfg(&mqtt_en,
+                          url,  sizeof(url),
+                          root, sizeof(root),
+                          cid,  sizeof(cid));
+        if (mqtt_en && url[0]) {
+            mqtt_gw_configure(url, root, cid);
+            ESP_LOGI(TAG, "MQTT configured — will start on STA_GOT_IP; broker=%s root=%s cid=%s",
+                     url, mqtt_gw_get_root_topic(),
+                     cid[0] ? cid : "(auto)");
+        } else {
+            if (root[0]) mqtt_gw_set_root_topic(root);
+            if (cid[0])  mqtt_gw_set_client_id(cid);
+            ESP_LOGI(TAG, "MQTT disabled (enabled=%u, url=%s)", mqtt_en, url[0] ? "set" : "empty");
+        }
+    }
+
+    // TDD Section 8.2 — WiFi is already running (wifi_mgr_init above)
+    xTaskCreatePinnedToCore(task_hap,   "TaskHAP",   zhac::stack::kHapS3, nullptr, 5, nullptr, 1);
+    xTaskCreate(             task_http, "TaskHTTP",  zhac::stack::kHttp, nullptr, 3, nullptr);
+    alert_persist_task_init();
+    ws_server_set_rx_callback(on_ws_rx);
+    {
+        // Wire the MQTT rx callback unconditionally. The subscribe
+        // below is a no-op until the client is actually running, which
+        // happens on STA_GOT_IP; mqtt_gw_subscribe stores the filter
+        // and applies it on the next CONNECTED event.
+        mqtt_gw_set_rx_callback(on_mqtt_rx);
+        // Subscribe under the configured root so two controllers on
+        // one broker don't receive each other's device commands.
+        char sub[40];
+        snprintf(sub, sizeof(sub), "%s/#", mqtt_gw_get_root_topic());
+        mqtt_gw_subscribe(sub, 0);
+    }
+    xTaskCreate(             task_time_sync, "TaskTimeSync", zhac::stack::kTimeSync, nullptr, 2, nullptr);
+    xTaskCreate(             task_ota,    "TaskOTA",   zhac::stack::kOta, nullptr, 2, nullptr);
+    xTaskCreate(             task_p4_ota, "TaskP4OTA", zhac::stack::kP4Ota, nullptr, 2, nullptr);
+    xTaskCreate(             task_stack_mon,"TaskStackMon", zhac::stack::kStackMonS3, nullptr, 1, nullptr);
+
+    vTaskDelete(nullptr);
+}

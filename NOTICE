@@ -1,0 +1,59 @@
+zhac-net-core — ZHAC ESP32-S3 firmware
+Copyright © 2025–2026 Evgenij Cjura and project contributors.
+
+Licensed under the GNU Affero General Public License v3 or later.
+See `LICENSE` and `LICENSES/AGPL-3.0-or-later.txt`.
+
+================================================================================
+Trademarks
+================================================================================
+
+"ZHAC" and any associated logos, product names, and marks are the
+exclusive property of the project maintainer. The AGPL license
+governing this firmware DOES NOT grant any right to use these names
+or marks. Forks and derivative works must choose a different
+product name and branding.
+
+================================================================================
+Third-party components vendored in this repository
+================================================================================
+
+1. esp-mqtt — components/mqtt/esp-mqtt/
+   Copyright © Espressif Systems (Shanghai) CO LTD
+   Licensed under the Apache License 2.0.
+   See components/mqtt/esp-mqtt/LICENSE
+
+ArduinoJson (MIT) is vendored in the zhac-components repo rather than
+here; the `hap_json` component from zhac-components pulls it in
+transitively when this firmware builds.
+
+================================================================================
+Third-party dependencies pulled at build time (not vendored)
+================================================================================
+
+- ESP-IDF v6.0 — Apache License 2.0 (Espressif Systems).
+- FreeRTOS — MIT License (Amazon Web Services, Inc.).
+- zhac-components — mixed Apache-2.0 / AGPL-3.0-or-later
+  (same project, separate repo).
+- embedded-zhc — Apache License 2.0 (same project, separate repo).
+- www-spa — AGPL-3.0-or-later (same project, separate repo, pulled as
+  a git submodule and built into `dist/` before firmware build).
+
+================================================================================
+Web-UI runtime dependencies (pulled by npm inside www-spa)
+================================================================================
+
+The Web UI carries its own node_modules during build. The bundled
+dist/ artefact is governed by the AGPL-3.0-or-later of the www-spa
+codebase; individual third-party JavaScript libraries vendored into
+that bundle retain their own upstream licenses (Preact — MIT,
+CodeMirror — MIT, Vite — MIT, and so on).
+
+================================================================================
+License compatibility
+================================================================================
+
+All linked components are compatible with AGPL-3.0-or-later for
+inclusion in this firmware's combined binary, which is distributed
+under AGPL-3.0-or-later as a whole. Each upstream component retains
+its own license when used in isolation.

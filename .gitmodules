@@ -1,0 +1,4 @@
+[submodule "www-spa"]
+	path = www-spa
+	url = git@github.com:zhac-project/www-spa.git
+	branch = main

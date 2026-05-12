@@ -1,0 +1,842 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include "s3_internal.h"
+#include "esp_random.h"
+#include <cinttypes>
+#include <cstring>
+#include <cstdio>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "esp_system.h"
+#include "hap_master.h"
+#include "hap_session.h"
+#include "hap_json.h"
+#include "hap_protocol.h"
+#include "ArduinoJson.h"
+#include "ws_server.h"
+#include "mqtt_gw.h"
+#include "log_ring.h"
+#include "api_handlers.h"
+#include "metrics/metrics_macros.h"
+#include "task_stacks.h"
+
+static const char* TAG = "hap_bridge";
+
+// Telegram gateway handler forward declarations
+extern "C" void tg_gw_handle_settoken(const uint8_t*, uint16_t);
+extern "C" void tg_gw_handle_setchat (const uint8_t*, uint16_t);
+extern "C" void tg_gw_handle_send    (const uint8_t*, uint16_t);
+
+
+// Heartbeat liveness tracking. Updated by the on_frame HEARTBEAT branch,
+// polled by task_hap. Three consecutive missed intervals (15 s by default)
+// flag the P4 as unresponsive. Flag clears on next received heartbeat.
+static std::atomic<TickType_t> s_last_p4_hb_tick{0};
+static std::atomic<bool>       s_p4_unresponsive{false};
+bool hap_bridge_is_p4_unresponsive() {
+    return s_p4_unresponsive.load(std::memory_order_relaxed);
+}
+
+// Cached P4 Prometheus snapshot (served via HapMsgType::METRICS_RSP).
+// Fetched asynchronously from the bridge loop every
+// HAP_METRICS_REFRESH_MS. Readers (rest_ops /metrics handler) copy
+// under a mutex; writers (HAP frame handler) do the same.
+static constexpr TickType_t HAP_METRICS_REFRESH_MS = 30000;
+EXT_RAM_BSS_ATTR static char s_p4_metrics_buf[HAP_MAX_PAYLOAD];
+static uint16_t          s_p4_metrics_len = 0;
+static SemaphoreHandle_t s_p4_metrics_mutex = nullptr;
+
+size_t hap_bridge_copy_p4_metrics(char* out, size_t max) {
+    if (!s_p4_metrics_mutex || !out || max == 0) return 0;
+    xSemaphoreTake(s_p4_metrics_mutex, portMAX_DELAY);
+    const size_t n = (s_p4_metrics_len < max - 1) ? s_p4_metrics_len : max - 1;
+    memcpy(out, s_p4_metrics_buf, n);
+    out[n] = '\0';
+    xSemaphoreGive(s_p4_metrics_mutex);
+    return n;
+}
+
+void hap_bridge_copy_p4_fw_ver(char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!s_p4_metrics_mutex) return;
+    xSemaphoreTake(s_p4_metrics_mutex, portMAX_DELAY);
+    const size_t n = strnlen(s_p4_fw_ver, sizeof(s_p4_fw_ver));
+    const size_t copy = (n < cap - 1) ? n : cap - 1;
+    memcpy(out, s_p4_fw_ver, copy);
+    out[copy] = '\0';
+    xSemaphoreGive(s_p4_metrics_mutex);
+}
+
+static void task_alert_persist(void*) {
+    // Heap-allocate snapshot buffer — stack can't hold 32 × ~100 B safely
+    auto* snap = static_cast<AlertLogEntry*>(heap_caps_malloc(sizeof(AlertLogEntry) * ALERT_LOG_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    configASSERT(snap);
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Snapshot under mutex, then write outside the critical section
+        uint8_t head, count;
+        xSemaphoreTake(s_alert_log_mutex, portMAX_DELAY);
+        memcpy(snap, s_alert_log, sizeof(AlertLogEntry) * ALERT_LOG_MAX);
+        head  = s_alert_log_head;
+        count = s_alert_log_count;
+        xSemaphoreGive(s_alert_log_mutex);
+
+        FILE* f = fopen("/spiffs/alerts.bin", "wb");
+        if (!f) { ESP_LOGW(TAG, "alert_log_persist: fopen failed"); continue; }
+        fwrite(&head,  1, 1,             f);
+        fwrite(&count, 1, 1,             f);
+        fwrite(snap,   sizeof(AlertLogEntry), ALERT_LOG_MAX, f);
+        fclose(f);
+        ESP_LOGD(TAG, "alert_log persisted count=%u", count);
+    }
+}
+
+void alert_log_schedule_persist() {
+    TaskHandle_t h = xTaskGetHandle("TaskAlertPrst");
+    if (h) xTaskNotifyGive(h);
+}
+
+void alert_log_load() {
+    FILE* f = fopen("/spiffs/alerts.bin", "rb");
+    if (!f) return;  // first boot, nothing to load
+
+    uint8_t head = 0, count = 0;
+    // Read directly into s_alert_log (BSS) — local array would overflow main task stack (3584 B)
+    xSemaphoreTake(s_alert_log_mutex, portMAX_DELAY);
+    bool ok = fread(&head,        1, 1,             f) == 1 &&
+              fread(&count,       1, 1,             f) == 1 &&
+              fread(s_alert_log,  sizeof(AlertLogEntry), ALERT_LOG_MAX, f) == ALERT_LOG_MAX;
+    if (ok) {
+        s_alert_log_head  = head;
+        s_alert_log_count = count;
+    } else {
+        memset(s_alert_log, 0, sizeof(s_alert_log));
+    }
+    xSemaphoreGive(s_alert_log_mutex);
+    fclose(f);
+
+    if (!ok) { ESP_LOGW(TAG, "alert_log_load: corrupt file"); return; }
+    ESP_LOGI(TAG, "alert_log loaded: %u entr%s", count, count == 1 ? "y" : "ies");
+}
+
+void alert_persist_task_init() {
+    xTaskCreate(task_alert_persist, "TaskAlertPrst", zhac::stack::kAlertPersist, nullptr, 1, nullptr);
+}
+
+void hap_send(HapMsgType type, const uint8_t* payload, uint16_t payload_len,
+              uint8_t flags) {
+    HapFrame f{};
+    f.type        = type;
+    f.seq         = hap_session_next_seq();
+    f.flags       = flags;
+    f.payload     = payload;
+    f.payload_len = payload_len;
+    hap_session_send(f);
+}
+
+// ── Response correlation table (wire v2) ────────────────────────────────
+//
+// For each response type, we record the seq of the last request that
+// expects that response. An incoming response whose ack_seq does not match
+// this table is dropped (never releases the waiter). This prevents a late
+// reply from a previously-timed-out request from unblocking the next call
+// on the same per-type semaphore.
+//
+// Legacy/unsolicited frames carry ack_seq == 0 and bypass the check.
+static std::atomic<uint16_t> s_ack_expected[256];
+
+static HapMsgType expected_response_for(HapMsgType req) {
+    switch (req) {
+        case HapMsgType::GET_DEVICES:       return HapMsgType::DEVICE_LIST;
+        case HapMsgType::GET_DEVICE_BY_ID:
+        case HapMsgType::DEVICE_SET_NAME:   return HapMsgType::DEVICE_INFO;
+        case HapMsgType::DIAG_UNHANDLED_REQ: return HapMsgType::DIAG_UNHANDLED_RSP;
+        case HapMsgType::BIND_REQ:          return HapMsgType::BIND_ACK;
+        case HapMsgType::DEVICE_DELETE:     return HapMsgType::DEVICE_DELETE_ACK;
+        case HapMsgType::DEVICE_OPTIONS_SET:return HapMsgType::DEVICE_OPTIONS_SET_ACK;
+        case HapMsgType::ZIGBEE_CFG_SET:    return HapMsgType::ZIGBEE_CFG_SET_ACK;
+        case HapMsgType::SET_ATTRIBUTE:     return HapMsgType::SET_ACK;
+        case HapMsgType::RULE_CREATE:
+        case HapMsgType::RULE_UPDATE:
+        case HapMsgType::RULE_UPDATE_DSL:
+        case HapMsgType::RULE_DELETE:       return HapMsgType::RULE_EXEC_RESULT;
+        case HapMsgType::RULE_LIST_REQ:     return HapMsgType::RULE_LIST_RSP;
+        case HapMsgType::SCRIPT_WRITE:
+        case HapMsgType::SCRIPT_DELETE:     return HapMsgType::SCRIPT_ACK;
+        case HapMsgType::SCRIPT_LIST_REQ:   return HapMsgType::SCRIPT_LIST_RSP;
+        case HapMsgType::SCRIPT_READ_REQ:   return HapMsgType::SCRIPT_READ_RSP;
+        case HapMsgType::SCRIPT_CHECK_REQ:  return HapMsgType::SCRIPT_CHECK_RSP;
+        case HapMsgType::OTA_CHECKPOINT_REQ:return HapMsgType::OTA_CHECKPOINT_RSP;
+        default:                            return static_cast<HapMsgType>(0);
+    }
+}
+
+static bool hap_accept_response(HapMsgType rsp_type, uint16_t ack_seq) {
+    if (ack_seq == 0) return true;   // legacy / unsolicited frame
+    const uint16_t expected = s_ack_expected[static_cast<uint8_t>(rsp_type)]
+        .load(std::memory_order_relaxed);
+    if (expected == 0 || ack_seq == expected) return true;
+    ESP_LOGW(TAG, "stale response type=0x%02x ack_seq=%u expected=%u — dropping",
+             static_cast<uint8_t>(rsp_type), ack_seq, expected);
+    return false;
+}
+
+bool hap_roundtrip(HapMsgType type,
+                   const uint8_t* payload, uint16_t payload_len,
+                   SemaphoreHandle_t rsp_sem,
+                   uint32_t /*timeout_ms*/) {
+    // Fixed retry schedule with mild exponential backoff. Total wall-clock
+    // budget is 1500 + 2500 + 4000 = 8000 ms. Earlier 500/750/1000 was too
+    // tight for >1 KB DEVICE_LIST / DEVICE_INFO replies on a busy P4 (JSON
+    // build + SPI transit + handler dispatch easily exceed 500 ms under
+    // concurrent interview / mqtt traffic), causing benign late replies to
+    // be dropped as stale and triggering needless re-roundtrips. Each
+    // attempt still uses a fresh seq so late replies match `ack_seq` to
+    // exactly one attempt's expected slot.
+    static constexpr uint32_t kAttemptMs[]  = { 1500, 2500, 4000 };
+    static constexpr int      kMaxAttempts  =
+        sizeof(kAttemptMs) / sizeof(kAttemptMs[0]);
+
+    xSemaphoreTake(rsp_sem, 0);
+
+    HapFrame f{};
+    f.type        = type;
+    f.flags       = HAP_FLAG_NO_ACK;
+    f.payload     = payload;
+    f.payload_len = payload_len;
+
+    const HapMsgType rsp_type = expected_response_for(type);
+
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        f.seq = hap_session_next_seq();
+        if (static_cast<uint8_t>(rsp_type) != 0) {
+            s_ack_expected[static_cast<uint8_t>(rsp_type)].store(
+                f.seq, std::memory_order_relaxed);
+        }
+
+        hap_session_send(f);
+
+        bool ok = xSemaphoreTake(rsp_sem,
+                                  pdMS_TO_TICKS(kAttemptMs[attempt])) == pdTRUE;
+        if (ok) {
+            if (static_cast<uint8_t>(rsp_type) != 0) {
+                s_ack_expected[static_cast<uint8_t>(rsp_type)].store(
+                    0, std::memory_order_relaxed);
+            }
+            return true;
+        }
+        // Drain any signal that arrived right after the timeout fired so
+        // the next attempt's wait doesn't see a stale wake.
+        xSemaphoreTake(rsp_sem, 0);
+        ESP_LOGW(TAG, "hap_roundtrip retry %d/%d type=0x%02x after %" PRIu32 "ms",
+                 attempt + 1, kMaxAttempts,
+                 static_cast<int>(type), kAttemptMs[attempt]);
+    }
+
+    // All attempts failed — clear the expected-ack slot so the next caller
+    // (or a very-late peer reply) doesn't trip the stale-response check.
+    if (static_cast<uint8_t>(rsp_type) != 0) {
+        s_ack_expected[static_cast<uint8_t>(rsp_type)].store(
+            0, std::memory_order_relaxed);
+    }
+    return false;
+}
+
+void send_sync_req() {
+    uint32_t sid = esp_random();
+    uint8_t tx_buf[256];
+    uint16_t len = 0;
+    if (!hap_json_encode_sync_req(tx_buf, sizeof(tx_buf), &len, sid, "0.4.0")) {
+        ESP_LOGE(TAG, "SYNC_REQ encode failed");
+        return;
+    }
+    hap_send(HapMsgType::SYNC, tx_buf, len, 0);   // flags=0: SYNC bypasses window
+    ESP_LOGI(TAG, "SYNC_REQ sent sid=0x%08" PRIx32, sid);
+}
+
+// ── attr.bulk WebSocket coalescer ────────────────────────────────────────
+//
+// Under heavy reporting (10+ Zigbee RPS) one ws_event_broadcast per
+// per-attr BULK_STATE_UPDATE swamps the WS send buffer for slow clients
+// (mobile WiFi, NAT idle) and trips reconnect storms. We accumulate the
+// per-attr device_update payloads from P4 and emit one WS frame per
+// BULK_COALESCE_WIN_MS — `data` is now an array, the SPA iterates.
+//
+// Both bulk_append() and bulk_flush() run on task_hap exclusively (the
+// frame callback fires from task_hap, the flush is the loop-tail timer
+// check); no mutex needed. If another task ever needs to drive these,
+// add a lock here.
+static constexpr size_t   BULK_COALESCE_CAP    = 4096;
+static constexpr uint32_t BULK_COALESCE_WIN_MS = 100;
+
+static char        s_bulk_buf[BULK_COALESCE_CAP];
+static size_t      s_bulk_len   = 0;
+static uint16_t    s_bulk_count = 0;
+static TickType_t  s_bulk_last_flush = 0;
+
+static bool bulk_append(const char* payload, size_t len) {
+    if (len == 0) return true;
+    // Reserve 1 byte for the leading '[' or ',' separator and 1 byte
+    // for the closing ']' added at flush time.
+    const size_t need = 1 + len + 1;
+    if (s_bulk_len + need > BULK_COALESCE_CAP) return false;
+    s_bulk_buf[s_bulk_len++] = (s_bulk_count == 0) ? '[' : ',';
+    memcpy(s_bulk_buf + s_bulk_len, payload, len);
+    s_bulk_len += len;
+    s_bulk_count++;
+    return true;
+}
+
+static void bulk_flush() {
+    s_bulk_last_flush = xTaskGetTickCount();
+    if (s_bulk_count == 0) return;
+    s_bulk_buf[s_bulk_len++] = ']';
+    ws_event_broadcast("attr.bulk", s_bulk_buf, s_bulk_len);
+    s_bulk_len   = 0;
+    s_bulk_count = 0;
+}
+
+void task_hap(void*) {
+    ESP_LOGI(TAG, "TaskHAP S3 started");
+
+    TaskHandle_t hap_task_handle = xTaskGetCurrentTaskHandle();
+
+    s_p4_metrics_mutex = xSemaphoreCreateMutex();
+
+    hap_session_init(HapSessionCfg{
+        .send         = hap_master_send,
+        .on_frame     = [](const HapFrame& f) {
+            _METRIC_COUNTER_INC(METRIC_HAP_RX_FRAMES_TOTAL, 1);
+            _METRIC_TIMER_SCOPE(METRIC_HAP_RX_HANDLE);
+            switch (f.type) {
+                case HapMsgType::HEARTBEAT: {
+                    HapHeartbeat hb{};
+                    hap_json_decode_heartbeat(f.payload, f.payload_len, hb);
+                    s_p4_uptime_s.store(hb.uptime,        std::memory_order_relaxed);
+                    s_p4_psram_free.store(hb.psram_free,  std::memory_order_relaxed);
+                    s_p4_psram_total.store(hb.psram_total,std::memory_order_relaxed);
+                    s_p4_cpu_pct_c0.store(hb.cpu_pct_c0,  std::memory_order_relaxed);
+                    s_p4_cpu_pct_c1.store(hb.cpu_pct_c1,  std::memory_order_relaxed);
+                    s_p4_proto_mask.store(hb.proto_mask,  std::memory_order_relaxed);
+                    s_p4_heap_free.store(hb.heap,                           std::memory_order_relaxed);
+                    s_p4_heap_min_free.store(hb.heap_min_free,              std::memory_order_relaxed);
+                    s_p4_internal_free.store(hb.internal_free,              std::memory_order_relaxed);
+                    s_p4_internal_min_free.store(hb.internal_min_free,      std::memory_order_relaxed);
+                    s_p4_internal_largest_block.store(hb.internal_largest_block, std::memory_order_relaxed);
+                    s_p4_psram_min_free.store(hb.psram_min_free,            std::memory_order_relaxed);
+                    s_p4_psram_largest_block.store(hb.psram_largest_block,  std::memory_order_relaxed);
+                    s_p4_task_stack_hwm_bytes.store(hb.task_stack_hwm_bytes,std::memory_order_relaxed);
+                    s_p4_device_count.store(hb.device_count,                std::memory_order_relaxed);
+                    s_last_p4_hb_tick.store(xTaskGetTickCount(),
+                                             std::memory_order_relaxed);
+                    if (s_p4_unresponsive.exchange(false,
+                                                   std::memory_order_relaxed)) {
+                        ESP_LOGI(TAG, "P4 heartbeat recovered");
+                        static const char kRecover[] =
+                            "{\"kind\":\"p4_unresponsive\",\"state\":false}";
+                        ws_event_broadcast("alert", kRecover,
+                                            sizeof(kRecover) - 1);
+                    }
+                    ESP_LOGI(TAG, "HEARTBEAT from P4 uptime=%" PRIu32 " proto_mask=0x%02x",
+                             hb.uptime, (unsigned)hb.proto_mask);
+                    // status.tick event disabled — generating a full
+                    // status snapshot (NVS reads, WiFi state, memory
+                    // caps) in the TaskHAP heartbeat path and
+                    // broadcasting 2 KB on every tick was enough to
+                    // contend with bootstrap traffic when the SPA
+                    // connects. If the Info page needs live refresh,
+                    // the SPA can poll `status.get` on its own cadence.
+                    break;
+                }
+                case HapMsgType::DEVICE_LIST: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    ESP_LOGI(TAG, "DEVICE_LIST received len=%d", f.payload_len);
+                    ws_event_broadcast("device.list.snapshot",
+                                        reinterpret_cast<const char*>(f.payload),
+                                        f.payload_len);
+                    size_t dl_copy = f.payload_len < HAP_MAX_PAYLOAD - 1
+                                     ? f.payload_len : HAP_MAX_PAYLOAD - 1;
+                    memcpy(s_devlist_rsp_json, f.payload, dl_copy);
+                    s_devlist_rsp_json[dl_copy] = '\0';
+                    s_devlist_rsp_len = dl_copy;
+                    // Refresh `device_count` from the payload — `s_p4_device_count`
+                    // is otherwise only seeded by the boot-time SYNC ACK and
+                    // grows stale once devices join after init. Each device
+                    // entry carries exactly one `"ieee":"0x` token in the
+                    // JSON; count occurrences as a cheap, alloc-free proxy.
+                    {
+                        uint16_t cnt = 0;
+                        const char* p = s_devlist_rsp_json;
+                        const char* end = s_devlist_rsp_json + dl_copy;
+                        while (p < end) {
+                            const char* hit = strstr(p, "\"ieee\":\"0x");
+                            if (!hit) break;
+                            ++cnt;
+                            p = hit + 10;
+                        }
+                        s_p4_device_count.store(cnt, std::memory_order_relaxed);
+                    }
+                    xSemaphoreGive(s_devlist_rsp_sem);
+                    break;
+                }
+                case HapMsgType::DEVICE_INFO: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
+                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
+                    memcpy(s_devinfo_rsp_json, f.payload, copy_len);
+                    s_devinfo_rsp_json[copy_len] = '\0';
+                    s_devinfo_rsp_len = copy_len;
+                    xSemaphoreGive(s_devinfo_rsp_sem);
+                    break;
+                }
+                case HapMsgType::BULK_STATE_UPDATE: {
+                    // Demote from INFO to DEBUG: under heavy reporting traffic
+                    // (multiple devices reporting at once) the per-frame log
+                    // line floods the console at >100/sec, slows task_hap
+                    // enough to back up SPI exchanges, and hampers WS clients
+                    // that subscribe to log streaming.
+                    ESP_LOGD(TAG, "BULK len=%d", f.payload_len);
+                    // Append to the WS coalescer; flushed every
+                    // BULK_COALESCE_WIN_MS by the task_hap loop. If the
+                    // buffer can't fit this payload, force an early flush
+                    // and retry — never drop attrs silently.
+                    if (!bulk_append(reinterpret_cast<const char*>(f.payload),
+                                      f.payload_len)) {
+                        bulk_flush();
+                        bulk_append(reinterpret_cast<const char*>(f.payload),
+                                     f.payload_len);
+                    }
+                    // Forward the per-attr update to MQTT on a per-device
+                    // topic so subscribers can filter by IEEE without parsing
+                    // every message: `<root>/devices/<ieee>/state`. The
+                    // payload already carries `ieee`, `attrs`, `lqi`,
+                    // `last_seen`. ArduinoJson parse is cheap (~100-200 bytes,
+                    // single field lookup) on the task_hap stack.
+                    {
+                        JsonDocument doc;
+                        if (deserializeJson(doc,
+                                              reinterpret_cast<const char*>(f.payload),
+                                              f.payload_len) == DeserializationError::Ok) {
+                            const char* ieee_str =
+                                doc["ieee"] | (const char*)nullptr;
+                            // Strip leading "0x" if present so the topic
+                            // segment is just the hex address.
+                            if (ieee_str && ieee_str[0] == '0' &&
+                                (ieee_str[1] == 'x' || ieee_str[1] == 'X')) {
+                                ieee_str += 2;
+                            }
+                            if (ieee_str && ieee_str[0]) {
+                                char suffix[64];
+                                int sn = snprintf(suffix, sizeof(suffix),
+                                                   "devices/%s/state", ieee_str);
+                                if (sn > 0 && (size_t)sn < sizeof(suffix)) {
+                                    char topic[96];
+                                    if (mqtt_gw_format_topic(topic, sizeof(topic),
+                                                              suffix) > 0) {
+                                        mqtt_gw_publish(topic,
+                                                         reinterpret_cast<const char*>(f.payload),
+                                                         f.payload_len, 0, false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                case HapMsgType::ALERT: {
+                    HapAlert alert{};
+                    if (hap_json_decode_alert(f.payload, f.payload_len, alert)) {
+                        ESP_LOGW(TAG, "ALERT code=%u ieee=0x%016llX msg=%s",
+                                 static_cast<uint8_t>(alert.code),
+                                 (unsigned long long)alert.ieee, alert.msg);
+                        xSemaphoreTake(s_alert_log_mutex, portMAX_DELAY);
+                        s_alert_log[s_alert_log_head] = { alert, (uint32_t)(esp_timer_get_time() / 1000000) };
+                        s_alert_log_head = (s_alert_log_head + 1) % ALERT_LOG_MAX;
+                        if (s_alert_log_count < ALERT_LOG_MAX) s_alert_log_count++;
+                        xSemaphoreGive(s_alert_log_mutex);
+                        alert_log_schedule_persist();
+                    }
+                    ws_event_broadcast("alert.fired",
+                                        reinterpret_cast<const char*>(f.payload),
+                                        f.payload_len);
+                    // SPA alerts store subscribes to this so new entries
+                    // appear without polling `alerts.get`.
+                    ws_event_broadcast("alert.added",
+                                        reinterpret_cast<const char*>(f.payload),
+                                        f.payload_len);
+                    {
+                        char topic[64];
+                        if (mqtt_gw_format_topic(topic, sizeof(topic), "alert") > 0)
+                            mqtt_gw_publish(topic,
+                                            reinterpret_cast<const char*>(f.payload),
+                                            f.payload_len, 0, false);
+                    }
+                    break;
+                }
+                case HapMsgType::DEVICE_JOIN: {
+                    uint64_t ieee = 0;
+                    hap_json_decode_device_join(f.payload, f.payload_len, &ieee);
+                    ESP_LOGI(TAG, "DEVICE_JOIN ieee=0x%016llX", (unsigned long long)ieee);
+                    ws_event_broadcast("device.added",
+                                        reinterpret_cast<const char*>(f.payload),
+                                        f.payload_len);
+                    {
+                        char topic[64];
+                        if (mqtt_gw_format_topic(topic, sizeof(topic), "device/join") > 0)
+                            mqtt_gw_publish(topic,
+                                            reinterpret_cast<const char*>(f.payload),
+                                            f.payload_len, 0, false);
+                    }
+                    break;
+                }
+                case HapMsgType::DEVICE_LEAVE: {
+                    uint64_t ieee = 0;
+                    hap_json_decode_device_join(f.payload, f.payload_len, &ieee);
+                    ESP_LOGI(TAG, "DEVICE_LEAVE ieee=0x%016llX", (unsigned long long)ieee);
+                    ws_event_broadcast("device.removed",
+                                        reinterpret_cast<const char*>(f.payload),
+                                        f.payload_len);
+                    {
+                        char topic[64];
+                        if (mqtt_gw_format_topic(topic, sizeof(topic), "device/leave") > 0)
+                            mqtt_gw_publish(topic,
+                                            reinterpret_cast<const char*>(f.payload),
+                                            f.payload_len, 0, false);
+                    }
+                    break;
+                }
+                case HapMsgType::SET_ACK: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    bool cmd_ok = false;
+                    if (f.payload_len > 0) {
+                        JsonDocument doc;
+                        DeserializationError err = deserializeJson(
+                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
+                        cmd_ok = (err == DeserializationError::Ok) &&
+                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
+                        if (err)
+                            ESP_LOGW(TAG, "SET_ACK JSON decode error: %s", err.c_str());
+                    }
+                    s_setattr_rsp_ok = cmd_ok;
+                    xSemaphoreGive(s_setattr_rsp_sem);
+                    ESP_LOGI(TAG, "SET_ACK received ok=%d", (int)cmd_ok);
+                    break;
+                }
+                case HapMsgType::BIND_ACK: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    bool cmd_ok = false;
+                    if (f.payload_len > 0) {
+                        JsonDocument doc;
+                        DeserializationError err = deserializeJson(
+                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
+                        cmd_ok = (err == DeserializationError::Ok) &&
+                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
+                        if (err)
+                            ESP_LOGW(TAG, "BIND_ACK JSON decode error: %s", err.c_str());
+                    }
+                    s_bind_rsp_ok = cmd_ok;
+                    xSemaphoreGive(s_bind_rsp_sem);
+                    break;
+                }
+                case HapMsgType::DEVICE_DELETE_ACK: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    bool cmd_ok = false;
+                    if (f.payload_len > 0) {
+                        JsonDocument doc;
+                        DeserializationError err = deserializeJson(
+                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
+                        cmd_ok = (err == DeserializationError::Ok) &&
+                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
+                        if (err)
+                            ESP_LOGW(TAG, "DEVICE_DELETE_ACK JSON decode error: %s", err.c_str());
+                    }
+                    s_devdel_rsp_ok = cmd_ok;
+                    xSemaphoreGive(s_devdel_rsp_sem);
+                    break;
+                }
+                case HapMsgType::DEVICE_OPTIONS_SET_ACK: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    bool cmd_ok = false;
+                    if (f.payload_len > 0) {
+                        JsonDocument doc;
+                        DeserializationError err = deserializeJson(
+                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
+                        cmd_ok = (err == DeserializationError::Ok) &&
+                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
+                        if (err)
+                            ESP_LOGW(TAG, "DEVICE_OPTIONS_SET_ACK JSON decode error: %s", err.c_str());
+                    }
+                    s_devopt_rsp_ok = cmd_ok;
+                    xSemaphoreGive(s_devopt_rsp_sem);
+                    break;
+                }
+                case HapMsgType::ZIGBEE_CFG_SET_ACK: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    bool     cmd_ok   = false;
+                    uint8_t  chan_val = 11;
+                    bool     key_set  = false;
+                    if (f.payload_len > 0) {
+                        JsonDocument doc;
+                        DeserializationError err = deserializeJson(
+                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
+                        if (!err) {
+                            cmd_ok   = doc["ok"]          | false;
+                            chan_val = (uint8_t)(doc["channel"]     | 11);
+                            key_set  = doc["net_key_set"] | false;
+                        } else {
+                            ESP_LOGW(TAG, "ZIGBEE_CFG_SET_ACK JSON decode error: %s", err.c_str());
+                        }
+                    }
+                    s_zbcfg_rsp_ok      = cmd_ok;
+                    s_zbcfg_rsp_channel = chan_val;
+                    s_zbcfg_rsp_key_set = key_set;
+                    xSemaphoreGive(s_zbcfg_rsp_sem);
+                    break;
+                }
+                case HapMsgType::RULE_EXEC_RESULT:
+                case HapMsgType::RULE_LIST_RSP: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
+                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
+                    memcpy(s_rule_rsp_json, f.payload, copy_len);
+                    s_rule_rsp_json[copy_len] = '\0';
+                    s_rule_rsp_len = copy_len;
+                    xSemaphoreGive(s_rule_rsp_sem);
+                    ESP_LOGI(TAG, "rule response type=0x%02x len=%u",
+                             static_cast<uint8_t>(f.type), (unsigned)copy_len);
+                    break;
+                }
+                case HapMsgType::SCRIPT_ACK:
+                case HapMsgType::SCRIPT_LIST_RSP:
+                case HapMsgType::SCRIPT_CHECK_RSP: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
+                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
+                    memcpy(s_script_rsp_json, f.payload, copy_len);
+                    s_script_rsp_json[copy_len] = '\0';
+                    s_script_rsp_len = copy_len;
+                    xSemaphoreGive(s_script_rsp_sem);
+                    break;
+                }
+                case HapMsgType::DIAG_UNHANDLED_RSP: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
+                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
+                    memcpy(s_diag_rsp_json, f.payload, copy_len);
+                    s_diag_rsp_json[copy_len] = '\0';
+                    s_diag_rsp_len = copy_len;
+                    xSemaphoreGive(s_diag_rsp_sem);
+                    break;
+                }
+                case HapMsgType::METRICS_RSP: {
+                    // Unsolicited in the sense that the /metrics
+                    // scrape isn't blocking on it — the bridge loop
+                    // periodically asks, we cache whatever arrives.
+                    const size_t copy_len =
+                        f.payload_len < sizeof(s_p4_metrics_buf) - 1
+                            ? f.payload_len
+                            : sizeof(s_p4_metrics_buf) - 1;
+                    if (s_p4_metrics_mutex) {
+                        xSemaphoreTake(s_p4_metrics_mutex, portMAX_DELAY);
+                        memcpy(s_p4_metrics_buf, f.payload, copy_len);
+                        s_p4_metrics_buf[copy_len] = '\0';
+                        s_p4_metrics_len =
+                            static_cast<uint16_t>(copy_len);
+                        xSemaphoreGive(s_p4_metrics_mutex);
+                    }
+                    break;
+                }
+                case HapMsgType::SCRIPT_READ_RSP: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
+                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
+                    memcpy(s_script_rsp_json, f.payload, copy_len);
+                    s_script_rsp_json[copy_len] = '\0';
+                    s_script_rsp_len = copy_len;
+                    xSemaphoreGive(s_script_rsp_sem);
+                    ESP_LOGI(TAG, "script response type=0x%02x len=%u",
+                             static_cast<uint8_t>(f.type), (unsigned)copy_len);
+                    break;
+                }
+                case HapMsgType::MQTT_PUBLISH: {
+                    HapMqttPublish msg{};
+                    if (hap_json_decode_mqtt_publish(f.payload, f.payload_len, msg)) {
+                        mqtt_gw_publish(msg.topic, msg.payload,
+                                         strlen(msg.payload),
+                                         msg.qos, msg.retain);
+                    } else {
+                        ESP_LOGE(TAG, "MQTT_PUBLISH decode failed");
+                    }
+                    break;
+                }
+                case HapMsgType::TG_SETTOKEN: {
+                    tg_gw_handle_settoken(f.payload, f.payload_len);
+                    break;
+                }
+                case HapMsgType::TG_SETCHAT: {
+                    tg_gw_handle_setchat(f.payload, f.payload_len);
+                    break;
+                }
+                case HapMsgType::TG_SEND: {
+                    tg_gw_handle_send(f.payload, f.payload_len);
+                    break;
+                }
+                case HapMsgType::OTA_STATUS: {
+                    HapOtaStatus st{};
+                    if (hap_json_decode_ota_status(f.payload, f.payload_len, st)) {
+                        s_p4ota_status = st;
+                        xSemaphoreGive(s_p4ota_rsp_sem);
+                        ESP_LOGI(TAG, "P4 OTA_STATUS ok=%d rcvd=%" PRIu32 "/%" PRIu32,
+                                 st.ok, st.rcvd, st.total);
+                    }
+                    break;
+                }
+                case HapMsgType::OTA_CHECKPOINT_RSP: {
+                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    if (f.payload_len >= 8) {
+                        s_p4ota_ckpt_offset =
+                            (uint32_t)f.payload[0]        |
+                            ((uint32_t)f.payload[1] << 8)  |
+                            ((uint32_t)f.payload[2] << 16) |
+                            ((uint32_t)f.payload[3] << 24);
+                    }
+                    xSemaphoreGive(s_p4ota_ckpt_rsp_sem);
+                    break;
+                }
+                case HapMsgType::LOG_LINE: {
+                    char msg[HAP_LOG_MSG_MAX]{};
+                    if (hap_json_decode_log_line(f.payload, f.payload_len, msg, sizeof(msg))) {
+                        // Route through the log sinks so `src` reads "p4"
+                        // on the MQTT / WS output, and the line appears in
+                        // /api/logs alongside S3-side entries.
+                        log_sinks_publish_p4('I', "p4", msg);
+                    }
+                    break;
+                }
+                default:
+                    ESP_LOGW(TAG, "unhandled HAP type=0x%02x",
+                             static_cast<uint8_t>(f.type));
+                    break;
+            }
+        },
+        .on_sync      = [](const HapFrame& f) {
+            HapSyncInfo info{};
+            if (!hap_json_decode_sync(f.payload, f.payload_len, info)) return;
+            if (!info.is_ack) return;
+            s_synced.store(true, std::memory_order_release);
+            s_p4_device_count.store(info.device_count, std::memory_order_relaxed);
+            {
+                const size_t cap = sizeof(s_p4_fw_ver) - 1;
+                const size_t n   = strnlen(info.fw_ver, cap);
+                xSemaphoreTake(s_p4_metrics_mutex, portMAX_DELAY);
+                memcpy(s_p4_fw_ver, info.fw_ver, n);
+                s_p4_fw_ver[n] = '\0';
+                xSemaphoreGive(s_p4_metrics_mutex);
+            }
+            if (info.fw_ver[0] != '0' || info.fw_ver[2] != '4') {
+                ESP_LOGW(TAG, "SYNC version mismatch: S3=0.4.0 P4=%s — protocol may be incompatible",
+                         info.fw_ver);
+            }
+            ESP_LOGI(TAG, "SYNC_ACK received — P4 has %d devices, fw=%s",
+                     info.device_count, info.fw_ver);
+        },
+        .on_link_dead = []() {
+            s_synced.store(false, std::memory_order_release);
+            ESP_LOGE(TAG, "HAP link dead — will retry SYNC");
+        },
+    });
+
+    hap_master_set_callback([hap_task_handle](const HapFrame& f) {
+        hap_session_on_receive(f);
+        xTaskNotifyGive(hap_task_handle);
+    });
+    hap_master_set_task_handle(hap_task_handle);
+
+    send_sync_req();
+
+    TickType_t last_sync_attempt = xTaskGetTickCount();
+    TickType_t last_hb           = xTaskGetTickCount();
+    TickType_t last_metrics_req  = 0;   // send one on first sync
+
+    while (true) {
+        // pdFALSE: decrement count by 1 (treat as counting semaphore).
+        // pdTRUE would clear all pending notifies on each call — under
+        // burst traffic, multiple DRDY edges could accumulate between
+        // iterations and we'd silently drop every frame past the first.
+        // That manifested as S3 seeing only 1-in-10 of P4's 5 s
+        // heartbeats and missing many BULK_STATE_UPDATE pushes too.
+        uint32_t notified = ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(100));
+        if (notified) {
+            hap_master_recv();
+        }
+        hap_session_tick();
+
+        if (!s_synced.load(std::memory_order_acquire) &&
+            xTaskGetTickCount() - last_sync_attempt >= pdMS_TO_TICKS(2000)) {
+            last_sync_attempt = xTaskGetTickCount();
+            send_sync_req();
+        }
+
+        // Detect a silent P4: if three heartbeat intervals have passed
+        // without a HEARTBEAT from P4, flag the link as unresponsive. Flag
+        // is cleared by the HEARTBEAT receive path above.
+        if (s_synced.load(std::memory_order_acquire)) {
+            const TickType_t last_rx = s_last_p4_hb_tick.load(
+                std::memory_order_relaxed);
+            if (last_rx != 0 &&
+                xTaskGetTickCount() - last_rx >=
+                    pdMS_TO_TICKS(HAP_HEARTBEAT_INTERVAL_MS * 3) &&
+                !s_p4_unresponsive.exchange(true,
+                                             std::memory_order_relaxed)) {
+                ESP_LOGW(TAG, "P4 unresponsive: no heartbeat for %d ms",
+                         HAP_HEARTBEAT_INTERVAL_MS * 3);
+                static const char kTimeout[] =
+                    "{\"kind\":\"p4_unresponsive\",\"state\":true}";
+                ws_event_broadcast("alert", kTimeout,
+                                    sizeof(kTimeout) - 1);
+            }
+        }
+
+        if (s_synced.load(std::memory_order_acquire) &&
+            xTaskGetTickCount() - last_hb >= pdMS_TO_TICKS(HAP_HEARTBEAT_INTERVAL_MS)) {
+            last_hb = xTaskGetTickCount();
+            uint8_t hb_buf[384];
+            uint16_t len = 0;
+            HapHeartbeat hbs{};
+            hbs.uptime      = (uint32_t)(esp_timer_get_time() / 1000000UL);
+            hbs.heap        = esp_get_free_heap_size();
+            hbs.psram_free  = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            hbs.psram_total = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+            // S3 CPU is reported via /api/status (sampled in the REST handler);
+            // no value to carry over the wire to P4 here.
+            hbs.cpu_pct_c0  = 0;
+            hbs.cpu_pct_c1  = 0;
+            hbs.proto_mask  = 0;
+            if (hap_json_encode_heartbeat(hb_buf, sizeof(hb_buf), &len, hbs)) {
+                hap_send(HapMsgType::HEARTBEAT, hb_buf, len, HAP_FLAG_NO_ACK);
+            }
+        }
+
+        // Periodic P4 metrics refresh — fire-and-forget request; the
+        // METRICS_RSP case above caches whatever arrives.
+        if (s_synced.load(std::memory_order_acquire) &&
+            xTaskGetTickCount() - last_metrics_req >=
+                pdMS_TO_TICKS(HAP_METRICS_REFRESH_MS)) {
+            last_metrics_req = xTaskGetTickCount();
+            hap_send(HapMsgType::METRICS_REQ, nullptr, 0, HAP_FLAG_NO_ACK);
+        }
+
+        // Flush the attr.bulk coalescer on the BULK_COALESCE_WIN_MS
+        // cadence. Skipping this lets accumulated attrs grow stale on
+        // the SPA; tightening defeats the throughput win.
+        if (xTaskGetTickCount() - s_bulk_last_flush >=
+                pdMS_TO_TICKS(BULK_COALESCE_WIN_MS)) {
+            bulk_flush();
+        }
+    }
+}

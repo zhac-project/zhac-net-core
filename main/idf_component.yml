@@ -1,0 +1,61 @@
+---
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Dependency manifest for zhac-net-core (ESP32-S3 firmware).
+#
+# Shared components are referenced by LOCAL RELATIVE PATH into the
+# zhac-components checkout. Works for two layouts without edits:
+#
+#   Platform (submodule):  zhac-platform/zhac-net-core/main/
+#                          ../../zhac-components/components/<name>
+#                          → zhac-platform/zhac-components/components/<name>
+#
+#   Sibling (standalone):  <workspace>/zhac-net-core/main/
+#                          ../../zhac-components/components/<name>
+#                          → <workspace>/zhac-components/components/<name>
+#
+# No git fetch, no GitHub round-trip, no Component-Manager cache to clear.
+
+dependencies:
+  idf:
+    version: '>=6.0.0'
+
+  zap_common:
+    path: "../../zhac-components/components/zap_common"
+
+  metrics:
+    path: "../../zhac-components/components/metrics"
+
+  event_bus:
+    path: "../../zhac-components/components/event_bus"
+
+  hap_protocol:
+    path: "../../zhac-components/components/hap_protocol"
+
+  hap_session:
+    path: "../../zhac-components/components/hap_session"
+
+  hap_json:
+    path: "../../zhac-components/components/hap_json"
+
+  device_shadow:
+    path: "../../zhac-components/components/device_shadow"
+
+  device_backend:
+    path: "../../zhac-components/components/device_backend"
+
+  zap_store:
+    path: "../../zhac-components/components/zap_store"
+
+  zhc_adapter:
+    path: "../../zhac-components/components/zhc_adapter"
+
+  # Dual-chip: carries target-specific mqtt_gw_p4.cpp / mqtt_gw_s3.cpp
+  # in the same component; CMake picks the right one per IDF_TARGET.
+  mqtt_gw:
+    path: "../../zhac-components/components/mqtt_gw"
+
+  # embedded-zhc is NOT a Component-Manager dependency — it ships its
+  # own CMake tree. Pulled via FetchContent / EMBEDDED_ZHC_PATH in the
+  # root CMakeLists.txt.

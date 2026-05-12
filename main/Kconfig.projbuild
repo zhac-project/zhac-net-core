@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+menu "ZHAC WiFi"
+
+# Removed 2026-04-20: compile-time WIFI_SSID / WIFI_PASSWORD were a
+# foot-gun — a user overriding WIFI_PASSWORD in sdkconfig.defaults
+# baked their home WiFi password into every build artefact (and every
+# core dump). Credentials now come exclusively from runtime
+# provisioning: first boot comes up as an AP, user POSTs to
+# /api/wifi with SSID+password, creds persist in NVS. See
+# components/wifi_mgr/ + rest_ops.cpp::handle_post_wifi.
+
+config WIFI_MAX_RETRIES
+    int "Max reconnect attempts before reboot"
+    default 10
+    help
+        Number of consecutive failed connect attempts before the device reboots.
+
+config ZHAC_WIFI_RESET_GPIO
+    int "WiFi reset button GPIO"
+    default 0
+    help
+        GPIO pin for WiFi credential reset. Hold for 5 seconds to erase
+        WiFi credentials and reboot into AP mode. Default GPIO0 is the
+        BOOT button on most ESP32-S3 modules (active-low, internal pull-up).
+
+endmenu
+
+menu "ZHAC Security"
+
+config ZHAC_CORS_WILDCARD
+    bool "Emit 'Access-Control-Allow-Origin: *' on REST responses"
+    default n
+    help
+        Permit cross-origin browser requests from any origin. Intended
+        for local development (e.g. a vite dev server hitting the
+        device API). Disable in production images: with auth disabled
+        or a token leak, any web page can drive the controller.
+        When unset, REST responses omit the Access-Control-Allow-Origin
+        header, forcing same-origin access only (the WebUI shipped on
+        the device).
+
+endmenu

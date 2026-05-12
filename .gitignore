@@ -1,0 +1,10 @@
+build/
+managed_components/
+dependencies.lock
+sdkconfig.old
+sdkconfig.ci.*
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+.DS_Store

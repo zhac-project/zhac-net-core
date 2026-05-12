@@ -1,0 +1,89 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// S-F4 (docs/OPTIMIZATIONS.md): single source of truth for the api_*
+// command surface. Both `ws_bridge.cpp` and `rest_ops.cpp` X-include
+// this file — adding a handler is one row here, never two.
+//
+// Each row:
+//   X(ws_cmd_name, api_handler_fn, REST_HTTP_METHOD, "/api/uri")
+//
+// Where:
+//   * `ws_cmd_name`     — exact WS envelope `cmd` string the SPA sends.
+//   * `api_handler_fn`  — `ApiHandlerFn` from `api_handlers.h`.
+//   * `REST_HTTP_METHOD`— bare `GET` or `POST` token; expanded to
+//                          `HTTP_GET` / `HTTP_POST` by the consumer.
+//   * REST URI         — path the generic REST dispatcher matches.
+//
+// REST exceptions (URI-parameterised routes like `/api/devices/<ieee>`,
+// streaming routes like `/metrics`, `/api/scripts` bulk upload, the
+// SPIFFS static handler) keep their hand-rolled `httpd_uri_t` entry
+// in `rest_ops.cpp` and are NOT listed here. The compile-time count
+// assertion in `rest_ops.cpp` keeps the WS-vs-REST drift visible: if
+// you add a row here, you also add a generic-table row there (or
+// document the omission).
+//
+// Don't forget to declare new `api_*` symbols in `api_handlers.h`.
+
+#ifndef ZHAC_API_ROUTE
+#error "ZHAC_API_ROUTE must be defined before including api_routes.def"
+#endif
+
+// ── Status / system ─────────────────────────────────────────────────
+ZHAC_API_ROUTE("status.get",                 api_status_get,                  GET,  "/api/status")
+ZHAC_API_ROUTE("alerts.get",                 api_alerts_get,                  GET,  "/api/alerts")
+ZHAC_API_ROUTE("logs.get",                   api_logs_get,                    GET,  "/api/logs")
+ZHAC_API_ROUTE("diagnostics.unhandled.get",  api_diagnostics_unhandled_get,   GET,  "/api/diagnostics/unhandled")
+ZHAC_API_ROUTE("settings.set",               api_settings_set,                POST, "/api/settings")
+ZHAC_API_ROUTE("system.token.rotate",        api_token_rotate,                POST, "/api/system/token/rotate")
+
+// ── WiFi ────────────────────────────────────────────────────────────
+ZHAC_API_ROUTE("wifi.status",                api_wifi_status,                 GET,  "/api/wifi/status")
+ZHAC_API_ROUTE("wifi.scan",                  api_wifi_scan,                   GET,  "/api/wifi/scan")
+ZHAC_API_ROUTE("wifi.connect",               api_wifi_connect,                POST, "/api/wifi/connect")
+ZHAC_API_ROUTE("wifi.disconnect",            api_wifi_disconnect,             POST, "/api/wifi/disconnect")
+
+// ── OTA ─────────────────────────────────────────────────────────────
+ZHAC_API_ROUTE("ota.s3",                     api_ota_s3,                      POST, "/api/ota/s3")
+ZHAC_API_ROUTE("ota.p4",                     api_ota_p4,                      POST, "/api/ota/p4")
+
+// ── Zigbee control ──────────────────────────────────────────────────
+ZHAC_API_ROUTE("zigbee.permit_join",         api_zigbee_permit_join,          POST, "/api/zigbee/permit_join")
+ZHAC_API_ROUTE("zigbee.permit_join.status",  api_zigbee_permit_join_status,   GET,  "/api/zigbee/permit_join/status")
+ZHAC_API_ROUTE("zigbee.reset",               api_zigbee_reset,                POST, "/api/zigbee/reset")
+ZHAC_API_ROUTE("zigbee.settings.set",        api_zigbee_settings_set,         POST, "/api/zigbee/settings")
+
+// ── Devices ─────────────────────────────────────────────────────────
+ZHAC_API_ROUTE("device.list",                api_device_list,                 GET,  "/api/device/list")
+ZHAC_API_ROUTE("device.get",                 api_device_get,                  POST, "/api/device/get")
+ZHAC_API_ROUTE("device.bind",                api_device_bind,                 POST, "/api/device/bind")
+ZHAC_API_ROUTE("device.delete",              api_device_delete,               POST, "/api/device/delete")
+ZHAC_API_ROUTE("device.rename",              api_device_rename,               POST, "/api/device/rename")
+ZHAC_API_ROUTE("device.attr.set",            api_device_attr_set,             POST, "/api/device/attr/set")
+ZHAC_API_ROUTE("device.options.set",         api_device_options_set,          POST, "/api/device/options/set")
+ZHAC_API_ROUTE("device.reinterview",         api_device_reinterview,          POST, "/api/device/reinterview")
+
+// ── Rules ───────────────────────────────────────────────────────────
+ZHAC_API_ROUTE("rule.list",                  api_rule_list,                   GET,  "/api/rule/list")
+ZHAC_API_ROUTE("rule.create",                api_rule_create,                 POST, "/api/rule/create")
+ZHAC_API_ROUTE("rule.delete",                api_rule_delete,                 POST, "/api/rule/delete")
+ZHAC_API_ROUTE("rule.enable",                api_rule_enable,                 POST, "/api/rule/enable")
+ZHAC_API_ROUTE("rule.update",                api_rule_update,                 POST, "/api/rule/update")
+
+// ── Scripts ─────────────────────────────────────────────────────────
+ZHAC_API_ROUTE("script.list",                api_script_list,                 GET,  "/api/script/list")
+ZHAC_API_ROUTE("script.read",                api_script_read,                 POST, "/api/script/read")
+ZHAC_API_ROUTE("script.delete",              api_script_delete,               POST, "/api/script/delete")
+ZHAC_API_ROUTE("script.write",               api_script_write,                POST, "/api/script/write")
+ZHAC_API_ROUTE("script.run",                 api_script_run,                  POST, "/api/script/run")
+ZHAC_API_ROUTE("script.check",               api_script_check,                POST, "/api/script/check")
+
+// ── Groups ──────────────────────────────────────────────────────────
+ZHAC_API_ROUTE("group.list",                 api_group_list,                  GET,  "/api/group/list")
+ZHAC_API_ROUTE("group.create",               api_group_create,                POST, "/api/group/create")
+ZHAC_API_ROUTE("group.get",                  api_group_get,                   POST, "/api/group/get")
+ZHAC_API_ROUTE("group.update",               api_group_update,                POST, "/api/group/update")
+ZHAC_API_ROUTE("group.delete",               api_group_delete,                POST, "/api/group/delete")
+ZHAC_API_ROUTE("group.cmd",                  api_group_cmd,                   POST, "/api/group/cmd")
+
+#undef ZHAC_API_ROUTE

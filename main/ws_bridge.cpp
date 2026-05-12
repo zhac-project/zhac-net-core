@@ -1,0 +1,338 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include "s3_internal.h"
+#include <cinttypes>
+#include <cstring>
+#include <cstdio>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "hap_json.h"
+#include "hap_protocol.h"
+#include "ws_server.h"
+#include "mqtt_gw.h"
+#include "ArduinoJson.h"
+#include "api_handlers.h"
+
+static const char* TAG = "ws_bridge";
+
+// ── Envelope dispatch table ─────────────────────────────────────────────
+// Maps WS command names → shared `api_*` handlers. The transport layer
+// (this file) is the only thing that knows about the JSON envelope
+// `{id, cmd, args}` ↔ `{id, ok, data|err}`. Handlers themselves are
+// transport-agnostic — REST wrappers in `rest_*.cpp` call exactly the
+// same functions.
+//
+// S-F4 (docs/OPTIMIZATIONS.md): the table is generated from the
+// shared `api_routes.def` X-macro. Same source feeds the REST
+// dispatcher in `rest_ops.cpp`, so adding a handler is one row in
+// `api_routes.def` instead of two-place editing.
+struct WsCmd {
+    const char* name;
+    ApiStatus (*fn)(const char*, size_t, char*, size_t, size_t*);
+};
+static const WsCmd kWsCmds[] = {
+    #define ZHAC_API_ROUTE(ws_cmd, fn, method, uri)  { ws_cmd, fn },
+    #include "api_routes.def"
+};
+
+static const WsCmd* ws_lookup(const char* name) {
+    for (size_t i = 0; i < sizeof(kWsCmds) / sizeof(kWsCmds[0]); i++) {
+        if (strcmp(kWsCmds[i].name, name) == 0) return &kWsCmds[i];
+    }
+    return nullptr;
+}
+
+// `id` may be any JSON value; we pass it through verbatim by quoting if
+// it was a string. Most clients will send an int.
+static void send_envelope_error(int fd, JsonVariantConst id_var,
+                                  const char* err) {
+    char buf[256];
+    int n;
+    if (id_var.is<int>()) {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}",
+                     id_var.as<int>(), err);
+    } else if (id_var.is<const char*>()) {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"id\":\"%s\",\"ok\":false,\"err\":\"%s\"}",
+                     id_var.as<const char*>(), err);
+    } else {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"id\":null,\"ok\":false,\"err\":\"%s\"}", err);
+    }
+    if (n > 0 && (size_t)n < sizeof(buf)) ws_server_reply(fd, buf, (size_t)n);
+}
+
+// Dispatch one envelope. Allocates response + envelope buffers in PSRAM
+// since `logs.get` alone needs 32 KB and stack is precious in TaskHTTP.
+static void dispatch_envelope(int fd, JsonDocument& doc) {
+    JsonVariantConst id_var = doc["id"];
+    const char* cmd = doc["cmd"] | "";
+    if (!cmd[0]) {
+        send_envelope_error(fd, id_var, "missing cmd");
+        return;
+    }
+    const WsCmd* entry = ws_lookup(cmd);
+    if (!entry) {
+        send_envelope_error(fd, id_var, "unknown cmd");
+        return;
+    }
+    ESP_LOGI(TAG, "ws dispatch cmd=%s", cmd);
+
+    // Serialize args object to a string body so the api_* helper sees
+    // the same input it would from a REST POST/PUT.
+    char args_buf[2048];
+    size_t args_len = 0;
+    if (doc["args"].is<JsonObjectConst>()) {
+        args_len = serializeJson(doc["args"], args_buf, sizeof(args_buf));
+    }
+
+    // Response + envelope live in PSRAM. `logs.get` alone needs ~32 KB;
+    // every other command fits comfortably in 8 KB. Starting small
+    // keeps per-command allocation churn low during bootstrap bursts
+    // (8+ commands hit the backend the moment the SPA connects). If
+    // the handler's output would overflow 32 KB we bail with an error
+    // — only `logs.get` realistically needs that room and we size it
+    // explicitly below.
+    const bool is_logs = (strcmp(cmd, "logs.get") == 0);
+    const size_t kRspCap      = is_logs ? (40 * 1024) : (8 * 1024);
+    const size_t kEnvelopeCap = kRspCap + 1024;
+    char* rsp_buf = static_cast<char*>(heap_caps_malloc(kRspCap, MALLOC_CAP_SPIRAM));
+    char* env_buf = static_cast<char*>(heap_caps_malloc(kEnvelopeCap, MALLOC_CAP_SPIRAM));
+    if (!rsp_buf || !env_buf) {
+        heap_caps_free(rsp_buf);
+        heap_caps_free(env_buf);
+        send_envelope_error(fd, id_var, "alloc failed");
+        return;
+    }
+
+    size_t rsp_len = 0;
+    ApiStatus st = entry->fn(args_buf, args_len, rsp_buf, kRspCap, &rsp_len);
+
+    if (st != API_OK) {
+        const char* err = "internal error";
+        if      (st == API_BAD_REQUEST)        err = "bad request";
+        else if (st == API_NOT_FOUND)          err = "not found";
+        else if (st == API_METHOD_NOT_ALLOWED) err = "method not allowed";
+        send_envelope_error(fd, id_var, err);
+        heap_caps_free(rsp_buf);
+        heap_caps_free(env_buf);
+        return;
+    }
+
+    // Build envelope. id passes through verbatim — int or string.
+    int n;
+    if (id_var.is<int>()) {
+        n = snprintf(env_buf, kEnvelopeCap,
+                     "{\"id\":%d,\"ok\":true,\"data\":%.*s}",
+                     id_var.as<int>(), (int)rsp_len, rsp_buf);
+    } else if (id_var.is<const char*>()) {
+        n = snprintf(env_buf, kEnvelopeCap,
+                     "{\"id\":\"%s\",\"ok\":true,\"data\":%.*s}",
+                     id_var.as<const char*>(), (int)rsp_len, rsp_buf);
+    } else {
+        n = snprintf(env_buf, kEnvelopeCap,
+                     "{\"id\":null,\"ok\":true,\"data\":%.*s}",
+                     (int)rsp_len, rsp_buf);
+    }
+    if (n > 0 && (size_t)n < kEnvelopeCap) {
+        ws_server_reply(fd, env_buf, (size_t)n);
+    } else {
+        send_envelope_error(fd, id_var, "response too large");
+    }
+    heap_caps_free(rsp_buf);
+    heap_caps_free(env_buf);
+}
+
+// Escape a byte array as a JSON string value (without surrounding quotes).
+// Writes into out[0..out_cap-1], null-terminates, returns written length.
+static size_t json_escape(const char* src, int src_len, char* out, size_t out_cap) {
+    size_t wi = 0;
+    for (int i = 0; i < src_len && wi + 2 < out_cap; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            if (wi + 3 > out_cap) break;
+            out[wi++] = '\\'; out[wi++] = (char)c;
+        } else if (c == '\n') {
+            if (wi + 3 > out_cap) break;
+            out[wi++] = '\\'; out[wi++] = 'n';
+        } else if (c == '\r') {
+            if (wi + 3 > out_cap) break;
+            out[wi++] = '\\'; out[wi++] = 'r';
+        } else if (c == '\t') {
+            if (wi + 3 > out_cap) break;
+            out[wi++] = '\\'; out[wi++] = 't';
+        } else if (c < 0x20) {
+            // Skip other control characters
+        } else {
+            out[wi++] = (char)c;
+        }
+    }
+    out[wi] = '\0';
+    return wi;
+}
+
+// ── ws_event_broadcast ──────────────────────────────────────────────────
+//
+// Wraps `payload_json` in `{"event":"<name>","data":<payload>}` and
+// fans it out to every connected WS client. The scratch buffer is a
+// file-static 2 KB slab protected by a mutex — callers come from
+// arbitrary tasks (log pipeline, hap_bridge, etc.), some of which
+// (TaskGPIORst, TaskAlertPrst) have tight stacks where a 1 KB local
+// was enough to trip the canary watchpoint.
+static SemaphoreHandle_t s_evt_mutex = nullptr;
+EXT_RAM_BSS_ATTR static char s_evt_buf[2048];
+
+static void evt_mutex_init_once() {
+    if (!s_evt_mutex) {
+        static StaticSemaphore_t s_mbuf;
+        s_evt_mutex = xSemaphoreCreateMutexStatic(&s_mbuf);
+    }
+}
+
+void ws_event_broadcast(const char* name, const char* payload_json, size_t payload_len) {
+    evt_mutex_init_once();
+    if (xSemaphoreTake(s_evt_mutex, portMAX_DELAY) != pdTRUE) return;
+
+    // Format under the mutex (s_evt_buf is shared scratch), then snapshot
+    // length and release before calling ws_server_broadcast — that call
+    // takes the ws_server fd-table lock and may block in
+    // httpd_ws_send_frame_async if a client is slow. Holding s_evt_mutex
+    // across a slow send is a priority-inversion landmine that stalls
+    // every event producer (TaskHAP, log pipeline, alerts). Static slab
+    // means we cannot let a second producer race the formatting half;
+    // copy onto the stack so the broadcast half can run unlocked.
+    // (WEB-F2 in docs/FINDINGS.md.)
+    int n;
+    if (payload_json && payload_len > 0) {
+        n = snprintf(s_evt_buf, sizeof(s_evt_buf),
+                     "{\"event\":\"%s\",\"data\":%.*s}",
+                     name, (int)payload_len, payload_json);
+    } else {
+        n = snprintf(s_evt_buf, sizeof(s_evt_buf),
+                     "{\"event\":\"%s\",\"data\":null}", name);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(s_evt_buf)) {
+        n = snprintf(s_evt_buf, sizeof(s_evt_buf),
+                     "{\"event\":\"%s\",\"data\":null,\"trunc\":true}", name);
+    }
+
+    // Heap-allocate the snapshot rather than putting 2 KB on stack —
+    // this function gets called from the master_send dispatch chain
+    // (httpd thread -> api_rule_list -> hap_roundtrip -> SPI exchange ->
+    //  peer BULK callback -> ws_event_broadcast -> ws_server_broadcast ->
+    //  lwip_send), and the deep call chain plus a 2 KB stack local
+    // tripped the stack canary on the HTTP server task.
+    char*    local    = nullptr;
+    size_t   send_len = 0;
+    if (n > 0 && (size_t)n < sizeof(s_evt_buf)) {
+        local = static_cast<char*>(malloc((size_t)n));
+        if (local) {
+            send_len = (size_t)n;
+            memcpy(local, s_evt_buf, send_len);
+        }
+    }
+    xSemaphoreGive(s_evt_mutex);
+
+    if (local && send_len > 0) ws_server_broadcast(local, send_len);
+    if (local) free(local);
+}
+
+// Called from httpd task context — keep work minimal, no blocking calls.
+// `fd` identifies the client socket so envelope responses can be sent
+// back point-to-point via `ws_server_reply()`.
+//
+// Frame routing:
+//   - Envelope-shaped frames (`{"id":..,"cmd":..,"args":..}`) → new SPA
+//     command surface; dispatch through the api_* registry.
+//   - Legacy ad-hoc frames (no `id` field) → preserved for the existing
+//     vanilla-JS UI's `set_attr` / `get_devices` paths until the SPA
+//     migration is complete.
+void on_ws_rx(int fd, const char* data, size_t len) {
+    JsonDocument doc;
+    if (deserializeJson(doc, data, len)) return;
+
+    // Envelope mode: presence of `id` distinguishes SPA frames from
+    // legacy ones. Both intact during Phase 2/3 of the migration.
+    if (!doc["id"].isNull()) {
+        dispatch_envelope(fd, doc);
+        return;
+    }
+
+    ESP_LOGW(TAG, "WS cmd: unknown command \"%s\"", doc["cmd"] | "");
+}
+
+// Called from the esp-mqtt event task — keep it fast, no blocking.
+void on_mqtt_rx(const char* topic, int topic_len,
+                const char* data,  int data_len) {
+    // Check for interview trigger: <root>/devices/0x.../interview
+    {
+        char prefix[48];
+        int pfx_len = mqtt_gw_format_topic(prefix, sizeof(prefix), "devices/");
+        const char* suffix = "/interview";
+        int sfx_len = (int)strlen(suffix);
+        if (pfx_len > 0 &&
+            topic_len > pfx_len + sfx_len &&
+            strncmp(topic, prefix, pfx_len) == 0 &&
+            strncmp(topic + topic_len - sfx_len, suffix, sfx_len) == 0) {
+            char ieee_str[20] = {};
+            int seg_len = topic_len - pfx_len - sfx_len;
+            if (seg_len > 0 && seg_len < (int)sizeof(ieee_str)) {
+                memcpy(ieee_str, topic + pfx_len, (size_t)seg_len);
+                uint64_t ieee = parse_ieee(ieee_str);
+                if (ieee) {
+                    uint8_t hap_buf[48];
+                    uint16_t hap_len = 0;
+                    if (hap_json_encode_interview_req(hap_buf, sizeof(hap_buf), &hap_len, ieee)) {
+                        hap_send(HapMsgType::INTERVIEW_REQ, hap_buf, hap_len);
+                    }
+                    ESP_LOGI(TAG, "MQTT interview trigger for 0x%016llx", (unsigned long long)ieee);
+                }
+            }
+        }
+    }
+
+    // Build: {"type":"mqtt","topic":"<topic>","data":<data>}
+    char buf[768];
+    char topic_esc[256];
+    char data_esc[512];
+
+    json_escape(topic, topic_len, topic_esc, sizeof(topic_esc));
+
+    bool data_is_json = (data_len > 0 && (data[0] == '{' || data[0] == '['));
+
+    int n;
+    if (data_is_json) {
+        n = snprintf(buf, sizeof(buf),
+            "{\"type\":\"mqtt\",\"topic\":\"%s\",\"data\":%.*s}",
+            topic_esc, data_len, data);
+    } else {
+        json_escape(data, data_len, data_esc, sizeof(data_esc));
+        n = snprintf(buf, sizeof(buf),
+            "{\"type\":\"mqtt\",\"topic\":\"%s\",\"data\":\"%s\"}",
+            topic_esc, data_esc);
+    }
+
+    if (n > 0 && n < (int)sizeof(buf)) {
+        ws_server_broadcast(buf, (size_t)n);
+        ESP_LOGD(TAG, "MQTT→WS topic=%s len=%d", topic_esc, n);
+    }
+
+    // Forward to P4 so Lua scripts and simple_rules can react.
+    char t_buf[64];
+    char p_buf[256];
+    int t_copy = (topic_len < (int)sizeof(t_buf) - 1) ? topic_len : (int)sizeof(t_buf) - 1;
+    int p_copy = (data_len  < (int)sizeof(p_buf) - 1) ? data_len  : (int)sizeof(p_buf) - 1;
+    memcpy(t_buf, topic, t_copy); t_buf[t_copy] = '\0';
+    memcpy(p_buf, data,  p_copy); p_buf[p_copy] = '\0';
+
+    uint8_t mqtt_fwd_buf[384];
+    uint16_t mqtt_fwd_len = 0;
+    if (hap_json_encode_mqtt_msg_in(mqtt_fwd_buf, sizeof(mqtt_fwd_buf), &mqtt_fwd_len,
+                                    t_buf, p_buf)) {
+        hap_send(HapMsgType::MQTT_MSG_IN, mqtt_fwd_buf, mqtt_fwd_len);
+    }
+}
