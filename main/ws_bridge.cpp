@@ -113,10 +113,30 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     ApiStatus st = entry->fn(args_buf, args_len, rsp_buf, kRspCap, &rsp_len);
 
     if (st != API_OK) {
+        // Default per-status text — used when the handler didn't fill
+        // rsp_buf with a JSON body carrying a richer message.
         const char* err = "internal error";
         if      (st == API_BAD_REQUEST)        err = "bad request";
         else if (st == API_NOT_FOUND)          err = "not found";
         else if (st == API_METHOD_NOT_ALLOWED) err = "method not allowed";
+
+        // Some handlers (api_rule_create / api_rule_update on
+        // ParseResult::ERR_*) put the DSL parse error verbatim into
+        // rsp_buf. Prefer that detail over the generic status label
+        // so the SPA shows e.g. "cron expression too long (max 31)"
+        // instead of "bad request".
+        char detail[160] = {};
+        if (rsp_len > 0 && rsp_len < kRspCap) {
+            JsonDocument ed;
+            if (deserializeJson(ed, rsp_buf, rsp_len) ==
+                    DeserializationError::Ok) {
+                const char* e = ed["err"] | (const char*)nullptr;
+                if (e && e[0]) {
+                    strncpy(detail, e, sizeof(detail) - 1);
+                    err = detail;
+                }
+            }
+        }
         send_envelope_error(fd, id_var, err);
         heap_caps_free(rsp_buf);
         heap_caps_free(env_buf);

@@ -60,14 +60,15 @@ different GPIO bank — GPIO18..22 — wired to the S3 pins above).
 | Setting     | Value                  | Source                        |
 |-------------|------------------------|-------------------------------|
 | Bus         | `SPI2_HOST` (HSPI)     | `spi_bus_initialize`          |
-| Clock       | 10 MHz                 | `spi_device_interface_config` |
+| Clock       | 8 MHz                  | `spi_device_interface_config` |
 | Mode        | 0 (CPOL=0, CPHA=0)     | default                       |
 | DMA channel | `SPI_DMA_CH_AUTO`      | always-DMA                    |
 | Buffer cap  | `HAP_DMA_BUF_SIZE`     | matches `HAP_MAX_FRAME_SIZE`  |
 
-The 10 MHz cap is operating spec — signal integrity on the inter-board
-jumper wiring does not survive 20 MHz reliably. Documented in
-`hap_master.cpp:96`.
+8 MHz is the current operating speed on a 2–3 cm soldered-copper
+breadboard rig (4 MHz proved stable, 8 MHz remains stable; 10 MHz is
+the next candidate on a real PCB). 20 MHz does not survive the
+inter-board jumper wiring. Documented in `hap_master.cpp:81`.
 
 ## Public API (`include/hap_master.h`)
 
@@ -76,7 +77,7 @@ using HapFrameCallback = std::function<void(const HapFrame&)>;
 
 // One-time init: claim SPI2, configure GPIOs, install drdy_isr, create
 // the SPI mutex. Idempotent — safe to call once at boot only. Logs
-//   I hap_master init OK — SPI2 master 10 MHz, DRDY GPIO8
+//   I hap_master init OK — SPI2 master 8 MHz, DRDY GPIO8
 void hap_master_init();
 
 // Encode `frame` and clock it out. Acquires s_spi_mutex (blocking,
@@ -172,7 +173,7 @@ for (;;) {
 - `components/hap_slave/README.md` — P4-side counterpart and pin map
 - `components/hap_session/README.md` — sliding-window layer above this driver
 - `components/hap_protocol/README.md` — wire format
-- `docs/FINDINGS.md` — SPI signal-integrity notes (10 MHz cap rationale)
+- `docs/FINDINGS.md` — SPI signal-integrity notes (8 MHz operating point rationale)
 
 ## Recent changes
 
