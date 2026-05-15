@@ -62,6 +62,7 @@ ZHAC_API_ROUTE("device.rename",              api_device_rename,               PO
 ZHAC_API_ROUTE("device.attr.set",            api_device_attr_set,             POST, "/api/device/attr/set")
 ZHAC_API_ROUTE("device.options.set",         api_device_options_set,          POST, "/api/device/options/set")
 ZHAC_API_ROUTE("device.reinterview",         api_device_reinterview,          POST, "/api/device/reinterview")
+ZHAC_API_ROUTE("device.configure",           api_device_configure,            POST, "/api/device/configure")
 
 // ── Rules ───────────────────────────────────────────────────────────
 ZHAC_API_ROUTE("rule.list",                  api_rule_list,                   GET,  "/api/rule/list")

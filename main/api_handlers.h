@@ -157,6 +157,13 @@ ApiStatus api_device_options_set(const char* body, size_t body_len,
 ApiStatus api_device_reinterview(const char* body, size_t body_len,
                                   char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
+// POST /api/device/configure — args: {"ieee":"..."}. Re-fires
+// `run_configure` on P4 without redoing the full interview. Use after
+// firmware updates a def's reports[] / config_steps[] for a paired
+// device that doesn't otherwise re-trigger configure.
+ApiStatus api_device_configure(const char* body, size_t body_len,
+                                char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
 // ── Rules ────────────────────────────────────────────────────────────────
 ApiStatus api_rule_list(const char* body, size_t body_len,
                          char* rsp_buf, size_t rsp_cap, size_t* rsp_len);

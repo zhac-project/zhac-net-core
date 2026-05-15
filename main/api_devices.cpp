@@ -437,3 +437,37 @@ extern "C" ApiStatus api_device_reinterview(const char* body, size_t body_len,
     return API_OK;
 }
 
+// CONFIGURE_REQ — fire-and-forget. Payload identical to INTERVIEW_REQ
+// (just IEEE), so reuse the same hap_json encoder; only the HAP msg
+// type differs. P4 handler re-runs `zhac_adapter_configure` against
+// the cached (model_id, manufacturer_name) and skips the full
+// interview. Use after firmware adds new `reports[]` / `config_steps[]`
+// to a def for a device that's already paired (ZG-204Z's read-on-join
+// for sensitivity / keep_time is the original motivating case).
+extern "C" ApiStatus api_device_configure(const char* body, size_t body_len,
+                                           char* rsp_buf, size_t rsp_cap,
+                                           size_t* rsp_len) {
+    if (body_len == 0) return API_BAD_REQUEST;
+    JsonDocument doc;
+    if (deserializeJson(doc, body, body_len)) return API_BAD_REQUEST;
+    const char* ieee_str = doc["ieee"] | (const char*)nullptr;
+    if (!ieee_str || ieee_str[0] == '\0') return API_BAD_REQUEST;
+    uint64_t ieee = parse_ieee(ieee_str);
+    if (ieee == 0) return API_BAD_REQUEST;
+
+    uint8_t hap_buf[48];
+    uint16_t hap_len = 0;
+    if (!hap_json_encode_interview_req(hap_buf, sizeof(hap_buf), &hap_len, ieee)) {
+        int n = snprintf(rsp_buf, rsp_cap,
+                         "{\"ok\":false,\"err\":\"encode failed\"}");
+        if (rsp_len) *rsp_len = (size_t)n;
+        return API_OK;
+    }
+    hap_send(HapMsgType::CONFIGURE_REQ, hap_buf, hap_len);
+    ESP_LOGI(TAG_API, "configure re-fired for 0x%016llx",
+             (unsigned long long)ieee);
+    const size_t n = api_write_ok(rsp_buf, rsp_cap);
+    if (rsp_len) *rsp_len = n;
+    return API_OK;
+}
+
