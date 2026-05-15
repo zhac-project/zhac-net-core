@@ -307,19 +307,78 @@ static void task_ota(void*) {
         xSemaphoreTake(s_ota_sem, portMAX_DELAY);
         ESP_LOGI(TAG, "OTA: downloading from %s", s_ota_url);
 
+        // ── Multi-step OTA so the SPA can render a progress bar ────────
+        //
+        // The one-shot `esp_https_ota()` blocks until done and gives no
+        // per-byte progress. Switching to the multi-step API (begin →
+        // perform → finish) lets us poll `esp_https_ota_get_image_len_read`
+        // between `_perform` calls and push `ota.progress` WS events.
+        // Devices stay paired across the post-flash reboot — same NVS
+        // partition layout, same network state.
         esp_http_client_config_t http_cfg = {};
         http_cfg.url                      = s_ota_url;
+        http_cfg.skip_cert_common_name_check = true;   // home-LAN HTTPS-self-signed or HTTP
 
         esp_https_ota_config_t ota_cfg = {};
         ota_cfg.http_config            = &http_cfg;
 
-        esp_err_t ret = esp_https_ota(&ota_cfg);
+        ws_event_broadcast("ota.start",
+            "{\"target\":\"s3\",\"total\":0,\"offset\":0}", 38);
+
+        esp_https_ota_handle_t handle = nullptr;
+        esp_err_t ret = esp_https_ota_begin(&ota_cfg, &handle);
+        if (ret != ESP_OK || handle == nullptr) {
+            ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(ret));
+            char ev[128];
+            int en = snprintf(ev, sizeof(ev),
+                "{\"target\":\"s3\",\"ok\":false,\"err\":\"%s\"}",
+                esp_err_to_name(ret));
+            ws_event_broadcast("ota.complete", ev, (size_t)en);
+            continue;
+        }
+
+        int total = esp_https_ota_get_image_size(handle);
+        if (total < 0) total = 0;
+        int last_pct = -1;
+        while (true) {
+            ret = esp_https_ota_perform(handle);
+            if (ret != ESP_ERR_HTTPS_OTA_IN_PROGRESS) break;
+            const int read_now = esp_https_ota_get_image_len_read(handle);
+            const int pct = (total > 0) ? (read_now * 100 / total) : 0;
+            // Throttle WS pushes: emit only when whole-percent crosses.
+            if (pct != last_pct) {
+                char ev[160];
+                int en = snprintf(ev, sizeof(ev),
+                    "{\"target\":\"s3\",\"offset\":%d,\"total\":%d,\"pct\":%d}",
+                    read_now, total, pct);
+                ws_event_broadcast("ota.progress", ev, (size_t)en);
+                last_pct = pct;
+            }
+        }
+
+        const bool dl_done = esp_https_ota_is_complete_data_received(handle);
+        if (ret == ESP_OK && dl_done) {
+            ret = esp_https_ota_finish(handle);
+        } else {
+            esp_https_ota_abort(handle);
+            if (ret == ESP_OK) ret = ESP_FAIL;   // download truncated
+        }
+
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "OTA complete — rebooting in 2 s");
+            char ev[96];
+            int en = snprintf(ev, sizeof(ev),
+                "{\"target\":\"s3\",\"ok\":true,\"total\":%d}", total);
+            ws_event_broadcast("ota.complete", ev, (size_t)en);
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_restart();
         } else {
             ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(ret));
+            char ev[128];
+            int en = snprintf(ev, sizeof(ev),
+                "{\"target\":\"s3\",\"ok\":false,\"err\":\"%s\"}",
+                esp_err_to_name(ret));
+            ws_event_broadcast("ota.complete", ev, (size_t)en);
         }
     }
 }
@@ -342,6 +401,11 @@ static void task_p4_ota(void*) {
 
         esp_http_client_config_t http_cfg = {};
         http_cfg.url                      = s_p4ota_url;
+        // Allow HTTPS-without-cert (self-signed test server) for parity
+        // with task_ota above. Plain HTTP works without this flag because
+        // esp_http_client is the lower-level path that doesn't require
+        // CONFIG_OTA_ALLOW_HTTP; we set it anyway for symmetry.
+        http_cfg.skip_cert_common_name_check = true;
 
         esp_http_client_handle_t client = nullptr;
         int content_len = 0;
@@ -423,6 +487,31 @@ static void task_p4_ota(void*) {
         uint32_t offset = resume_offset;
         bool download_ok = true;
 
+        // ── Backpressure + progress ─────────────────────────────────────
+        //
+        // Per-chunk 5 ms delay keeps P4's HAP RX queue drained (P4 needs
+        // ~1-2 ms per esp_ota_write). Every kChunkBatch chunks we layer a
+        // round-trip OTA_CHECKPOINT_REQ as a reliability backstop: P4's
+        // response tells us its `s_ota_expected_offset` — if that diverges
+        // from S3's expectation, the transfer aborts cleanly with a real
+        // error rather than hanging until the WiFi timeout. Each verified
+        // batch also pushes an `ota.progress` WS event so the SPA can
+        // render a progress bar driven by ground truth from P4, not by
+        // S3-side queue depth.
+        constexpr uint32_t kChunkBatch          = 32;     // ~128 KB / batch
+        constexpr uint32_t kCheckpointTimeoutMs = 5000;
+        uint32_t chunks_in_batch = 0;
+        bool     batch_failed    = false;
+
+        // Start event so the SPA can switch from "idle" to "in progress".
+        {
+            char ev[96];
+            int en = snprintf(ev, sizeof(ev),
+                "{\"target\":\"p4\",\"total\":%" PRIu32 ",\"offset\":%" PRIu32 "}",
+                total, offset);
+            ws_event_broadcast("ota.start", ev, (size_t)en);
+        }
+
         while (true) {
             int n = esp_http_client_read(client, reinterpret_cast<char*>(data_ptr), data_max);
             if (n < 0) {
@@ -439,12 +528,56 @@ static void task_p4_ota(void*) {
             memset(hdr->_pad, 0, sizeof(hdr->_pad));
 
             offset += (uint32_t)n;
+            const bool is_last = (hdr->flags & 0x01) != 0;
 
             hap_send(HapMsgType::OTA_CHUNK, chunk_buf,
                      (uint16_t)(HAP_OTA_CHUNK_HDR_SIZE + n), 0);
 
-            if (hdr->flags & 0x01) break;
+            // Per-chunk throttle (see comment block above for the
+            // chunks-dropping pathology this prevents).
+            vTaskDelay(pdMS_TO_TICKS(5));
+
+            chunks_in_batch++;
+
+            if (chunks_in_batch >= kChunkBatch || is_last) {
+                xSemaphoreTake(s_p4ota_ckpt_rsp_sem, 0);
+                hap_send(HapMsgType::OTA_CHECKPOINT_REQ, nullptr, 0, 0);
+                bool got = xSemaphoreTake(s_p4ota_ckpt_rsp_sem,
+                                          pdMS_TO_TICKS(kCheckpointTimeoutMs)) == pdTRUE;
+                if (!got) {
+                    ESP_LOGE(TAG,
+                             "P4 OTA: checkpoint timeout at offset=%" PRIu32
+                             " — aborting", offset);
+                    batch_failed = true;
+                    break;
+                }
+                if (s_p4ota_ckpt_offset != offset) {
+                    ESP_LOGW(TAG,
+                             "P4 OTA: checkpoint divergence — S3=%" PRIu32
+                             " P4=%" PRIu32 " — aborting",
+                             offset, s_p4ota_ckpt_offset);
+                    batch_failed = true;
+                    break;
+                }
+                chunks_in_batch = 0;
+
+                // Push verified progress to the SPA. `pct` is the
+                // wire-confirmed percentage (P4 has written this much
+                // to flash + acked it via checkpoint), not the S3-side
+                // optimistic counter.
+                char ev[128];
+                const uint32_t pct = total ? (offset * 100u / total) : 0;
+                int en = snprintf(ev, sizeof(ev),
+                    "{\"target\":\"p4\",\"offset\":%" PRIu32
+                    ",\"total\":%" PRIu32 ",\"pct\":%" PRIu32 "}",
+                    offset, total, pct);
+                ws_event_broadcast("ota.progress", ev, (size_t)en);
+            }
+
+            if (is_last) break;
         }
+
+        if (batch_failed) download_ok = false;
 
         if (!download_ok) {
             ESP_LOGI(TAG, "P4 OTA: interrupted at offset %" PRIu32 " — resumable", offset);
@@ -453,17 +586,41 @@ static void task_p4_ota(void*) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
 
-        if (!download_ok) continue;
+        if (!download_ok) {
+            // download_ok=false covers HTTP read errors AND checkpoint
+            // failures from the batch loop above. Tell the SPA so the
+            // progress bar flips to an error state instead of dangling.
+            char ev[160];
+            int en = snprintf(ev, sizeof(ev),
+                "{\"target\":\"p4\",\"ok\":false,\"offset\":%" PRIu32
+                ",\"total\":%" PRIu32 ",\"err\":\"%s\"}",
+                offset, total,
+                batch_failed ? "checkpoint failure" : "download interrupted");
+            ws_event_broadcast("ota.complete", ev, (size_t)en);
+            continue;
+        }
 
         bool acked = xSemaphoreTake(s_p4ota_rsp_sem, pdMS_TO_TICKS(P4_OTA_RESPONSE_TIMEOUT_MS)) == pdTRUE;
+        const char* err_msg = nullptr;
+        bool ok = false;
         if (!acked) {
             xSemaphoreTake(s_p4ota_rsp_sem, 0);
             ESP_LOGE(TAG, "P4 OTA: timeout — no OTA_STATUS from P4");
+            err_msg = "no OTA_STATUS";
         } else if (!s_p4ota_status.ok) {
             ESP_LOGE(TAG, "P4 OTA failed: %s", s_p4ota_status.err);
+            err_msg = s_p4ota_status.err;
         } else {
             ESP_LOGI(TAG, "P4 OTA success — P4 will reboot");
+            ok = true;
         }
+        char ev[160];
+        int en = snprintf(ev, sizeof(ev),
+            "{\"target\":\"p4\",\"ok\":%s,\"offset\":%" PRIu32
+            ",\"total\":%" PRIu32 ",\"err\":\"%s\"}",
+            ok ? "true" : "false", offset, total,
+            err_msg ? err_msg : "");
+        ws_event_broadcast("ota.complete", ev, (size_t)en);
     }
 }
 

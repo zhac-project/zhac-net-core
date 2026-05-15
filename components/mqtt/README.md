@@ -297,4 +297,4 @@ esp_mqtt_client_config_t config = {
 ## Related Components
 
 - **mqtt_gw** — Wraps esp-mqtt with simplified API
-- **S3 firmware** (in `firmware/s3_core/`) — Uses mqtt_gw for MQTT broker communication
+- **S3 firmware** (in `firmware/zhac-net-core/`) — Uses mqtt_gw for MQTT broker communication

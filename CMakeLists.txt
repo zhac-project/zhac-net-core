@@ -18,4 +18,4 @@ else()
 endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(zhac-main-core)
+project(zhac-net-core)

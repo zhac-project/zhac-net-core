@@ -64,3 +64,13 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # during burst REST/JSON workloads.
 CONFIG_SPIRAM_RODATA=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# Allow plain-HTTP firmware downloads for OTA. esp_https_ota refuses
+# HTTP URLs unless this flag is set, even when the http_client_config
+# has skip_cert_common_name_check enabled. ZHAC is a home-LAN
+# controller — the user typically hosts binaries via
+# `python3 -m http.server` on their workstation; forcing HTTPS would
+# require running a TLS proxy or bundling a self-signed CA on-device.
+# Production deployments wanting integrity verification should switch
+# to SHA-256 (or Secure Boot v2) rather than relying on transport TLS.
+CONFIG_OTA_ALLOW_HTTP=y

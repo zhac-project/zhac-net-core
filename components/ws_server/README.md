@@ -3,7 +3,7 @@
 Thin wrapper around ESP-IDF's `esp_http_server` that owns the boot of
 the on-device HTTP daemon, registers the `/ws` endpoint, and exposes a
 small fan-out / point-reply API. The same `httpd_handle_t` is reused by
-the REST handlers in `firmware/s3_core/main/rest_*.cpp`, so the SPA, the
+the REST handlers in `firmware/zhac-net-core/main/rest_*.cpp`, so the SPA, the
 REST API and the WS channel all share one socket pool.
 
 ## Purpose
@@ -26,20 +26,20 @@ caller-formatted JSON back out.
   `max_open_sockets=9`, `max_uri_handlers=48`, `stack_size=8192`,
   `lru_purge_enable=true`).
 - **Called by:**
-  - `firmware/s3_core/main/main.cpp:589` — `ws_server_init()` boots the
+  - `firmware/zhac-net-core/main/main.cpp:589` — `ws_server_init()` boots the
     daemon during S3 startup.
-  - `firmware/s3_core/main/main.cpp:649` — installs `on_ws_rx` as the
+  - `firmware/zhac-net-core/main/main.cpp:649` — installs `on_ws_rx` as the
     RX callback that decodes `{id,cmd,args}` envelopes.
-  - `firmware/s3_core/main/main.cpp:121` /
+  - `firmware/zhac-net-core/main/main.cpp:121` /
     `auth_rotate_token()` (`main.cpp:131`) — pushes the API token after
     NVS load and on rotation.
-  - `firmware/s3_core/main/ws_bridge.cpp:236` — `ws_event_broadcast()`
+  - `firmware/zhac-net-core/main/ws_bridge.cpp:236` — `ws_event_broadcast()`
     formats the `{event,data}` envelope, then calls
     `ws_server_broadcast()`.
-  - `firmware/s3_core/main/ws_bridge.cpp` `on_ws_rx` /
+  - `firmware/zhac-net-core/main/ws_bridge.cpp` `on_ws_rx` /
     `ws_dispatch_send_reply` — calls `ws_server_reply(fd, …)` for
     correlated command responses.
-  - `firmware/s3_core/main/rest_ops.cpp:527` —
+  - `firmware/zhac-net-core/main/rest_ops.cpp:527` —
     `ws_server_get_handle()` to register the REST URI handlers on the
     same daemon.
 - **Dependencies (`REQUIRES`):** `esp_http_server`, `freertos`.
@@ -158,7 +158,7 @@ void push_event(const char* envelope_json, size_t n) {
   `ws_server_broadcast` now snapshots the fd table under `s_mutex` and
   releases the lock before the per-fd `httpd_ws_send_frame_async`
   loop. The matching caller-side fix lives in
-  `firmware/s3_core/main/ws_bridge.cpp:ws_event_broadcast`: format the
+  `firmware/zhac-net-core/main/ws_bridge.cpp:ws_event_broadcast`: format the
   `{event,data}` envelope into the static 2 KB scratch under
   `s_evt_mutex`, copy onto the stack, release `s_evt_mutex`, then call
   `ws_server_broadcast`. A slow WS client can no longer stall TaskHAP,
@@ -176,9 +176,9 @@ void push_event(const char* envelope_json, size_t n) {
 - `docs/FINDINGS.md#web-f2`, `docs/FINDINGS.md#cc-f8` — the audit
   entries that drove today's broadcast fix and the API-token rate-limit
   follow-up.
-- `firmware/s3_core/main/ws_bridge.cpp` — envelope formatting,
+- `firmware/zhac-net-core/main/ws_bridge.cpp` — envelope formatting,
   RX dispatch table (~35 entries), `ws_event_broadcast`.
-- `firmware/s3_core/main/api_handlers.{h,cpp}` — the transport-agnostic
+- `firmware/zhac-net-core/main/api_handlers.{h,cpp}` — the transport-agnostic
   command handlers reached from both REST and WS.
 - `components/metrics/README.md` — sibling shared-infrastructure
   component.
