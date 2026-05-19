@@ -31,6 +31,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <memory>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -147,7 +148,6 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"synced\":%s"
          ",\"metrics_enabled\":%s"
          ",\"auth_enabled\":%s"
-         ",\"api_token\":\"%s\""
          ",\"p4_unresponsive\":%s"
          ",\"p4\":{"
            "\"devices\":%" PRIu16
@@ -199,11 +199,11 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         s_synced.load(std::memory_order_acquire)         ? "true" : "false",
         s_metrics_enabled                                ? "true" : "false",
         s_auth_enabled                                   ? "true" : "false",
-        // Echo the token only when auth is disabled (bootstrap aid for
-        // fresh installs). With auth enabled the endpoint is still
-        // unauthenticated, so exposing the token would let any LAN
-        // client authenticate without ever holding it.
-        s_auth_enabled ? "" : s_api_token,
+        // F-01 fix: api_token field removed — /api/status is
+        // unauthenticated, so echoing the bootstrap token here let any
+        // LAN client read it. Token now surfaces only via serial log
+        // on first boot (see auth_init in main.cpp) or via the
+        // authenticated /api/system/token (api_token_rotate).
         hap_bridge_is_p4_unresponsive()                  ? "true" : "false",
         s_p4_device_count.load(std::memory_order_relaxed),
         s_p4_uptime_s.load(std::memory_order_relaxed),
@@ -276,22 +276,21 @@ extern "C" ApiStatus api_diagnostics_unhandled_get(const char* /*body*/,
                                                      char* rsp_buf,
                                                      size_t rsp_cap,
                                                      size_t* rsp_len) {
-    if (xSemaphoreTake(s_diag_req_mutex, 0) != pdTRUE) {
-        // Channel busy — callers that need 429 handle it at the transport.
-        // Default to empty list so UI renders cleanly on contention.
+    uint8_t req_buf[4] = {};
+    uint16_t req_len = 0;
+    constexpr size_t kDiagRspCap = HAP_MAX_PAYLOAD;
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kDiagRspCap]);
+    if (!rsp) {
         size_t n = (size_t)snprintf(rsp_buf, rsp_cap, "{\"entries\":[]}");
         if (rsp_len) *rsp_len = n;
         return API_OK;
     }
-    uint8_t req_buf[4] = {};
-    uint16_t req_len = 0;
-    bool ok = hap_roundtrip(HapMsgType::DIAG_UNHANDLED_REQ, req_buf, req_len,
-                             s_diag_rsp_sem, 2000);
-    xSemaphoreGive(s_diag_req_mutex);
+    size_t got = 0;
+    bool ok = hap_roundtrip_v2(HapMsgType::DIAG_UNHANDLED_REQ, req_buf, req_len,
+                                rsp.get(), kDiagRspCap, &got, 2000);
     if (ok) {
-        size_t n = s_diag_rsp_len;
-        if (n >= rsp_cap) n = rsp_cap - 1;
-        memcpy(rsp_buf, s_diag_rsp_json, n);
+        size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+        memcpy(rsp_buf, rsp.get(), n);
         rsp_buf[n] = '\0';
         if (rsp_len) *rsp_len = n;
         return API_OK;
@@ -782,21 +781,23 @@ extern "C" ApiStatus api_zigbee_settings_set(const char* body, size_t body_len,
         return API_INTERNAL_ERROR;
     }
 
-    if (xSemaphoreTake(s_zbcfg_req_mutex, 0) != pdTRUE) {
-        // Busy-channel fallback: mirror the REST handler output shape
-        // so the UI renders a consistent response.
-        int n = snprintf(rsp_buf, rsp_cap,
-                         "{\"ok\":false,\"channel\":0,\"net_key_set\":false,"
-                         "\"applies\":\"after factory reset\"}");
-        if (rsp_len) *rsp_len = (size_t)n;
-        return API_OK;
+    char ack_buf[128];
+    size_t ack_len = 0;
+    bool got_rsp = hap_roundtrip_v2(HapMsgType::ZIGBEE_CFG_SET,
+                                     hap_buf, hap_len,
+                                     ack_buf, sizeof(ack_buf), &ack_len, 5000);
+    bool    cmd_ok      = false;
+    uint8_t rsp_channel = 11;
+    bool    rsp_key_set = false;
+    if (got_rsp && ack_len > 0) {
+        JsonDocument doc2;
+        if (deserializeJson(doc2, ack_buf, ack_len) == DeserializationError::Ok) {
+            cmd_ok      = doc2["ok"]            | false;
+            rsp_channel = (uint8_t)(doc2["channel"]     | 11);
+            rsp_key_set = doc2["net_key_set"]   | false;
+        }
     }
-    bool got_rsp = hap_roundtrip(HapMsgType::ZIGBEE_CFG_SET,
-                                  hap_buf, hap_len, s_zbcfg_rsp_sem);
-    bool ok              = got_rsp && s_zbcfg_rsp_ok;
-    uint8_t rsp_channel  = s_zbcfg_rsp_channel;
-    bool    rsp_key_set  = s_zbcfg_rsp_key_set;
-    xSemaphoreGive(s_zbcfg_req_mutex);
+    const bool ok = got_rsp && cmd_ok;
 
     int n = snprintf(rsp_buf, rsp_cap,
                      "{\"ok\":%s,\"channel\":%u,\"net_key_set\":%s,"

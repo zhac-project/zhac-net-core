@@ -85,13 +85,8 @@ static bool build_args_json(const char* body, int body_len,
 // GET /api/devices — fetch all devices from P4
 esp_err_t handle_get_devices(httpd_req_t* req) {
     REQUIRE_AUTH(req);
-    // TRY_CHANNEL equivalent lives in the api helper via xSemaphoreTake(0);
-    // the REST layer just reports API_INTERNAL_ERROR as 500 below. The
-    // original handler returned 429 on channel busy — keep that transport
-    // behaviour by peeking the mutex up front.
-    TRY_CHANNEL(req, s_devlist_req_mutex);
-    xSemaphoreGive(s_devlist_req_mutex);
-
+    // F-01 v2: hap_roundtrip_v2 admits concurrent callers up to its
+    // own waiter-slot cap; the old REST-level mutex probe is gone.
     char* buf = static_cast<char*>(malloc(16 * 1024));
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");

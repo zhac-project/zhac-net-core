@@ -72,12 +72,6 @@ extern bool s_auth_enabled;
 extern char              s_ota_url[256];
 extern SemaphoreHandle_t s_ota_sem;
 
-// ── Script request/response synchronisation ───────────────────────────────
-extern SemaphoreHandle_t s_script_req_mutex;
-extern SemaphoreHandle_t s_script_rsp_sem;
-extern char*             s_script_rsp_json;
-extern size_t            s_script_rsp_len;
-
 // ── P4 state cache ────────────────────────────────────────────────────────
 extern std::atomic<uint16_t> s_p4_device_count;
 extern std::atomic<uint32_t> s_p4_uptime_s;
@@ -127,57 +121,6 @@ extern AlertLogEntry     s_alert_log[ALERT_LOG_MAX];
 extern uint8_t           s_alert_log_head;
 extern uint8_t           s_alert_log_count;
 extern SemaphoreHandle_t s_alert_log_mutex;
-
-// ── Device-list request/response synchronisation ─────────────────────────
-extern SemaphoreHandle_t s_devlist_req_mutex;
-extern SemaphoreHandle_t s_devlist_rsp_sem;
-extern char*             s_devlist_rsp_json;
-extern size_t            s_devlist_rsp_len;
-
-// ── Device-info request/response synchronisation ─────────────────────────
-extern SemaphoreHandle_t s_devinfo_req_mutex;
-extern SemaphoreHandle_t s_devinfo_rsp_sem;
-extern char*             s_devinfo_rsp_json;
-extern size_t            s_devinfo_rsp_len;
-
-// ── Set-attribute request/response synchronisation ───────────────────────
-extern SemaphoreHandle_t s_setattr_req_mutex;
-extern SemaphoreHandle_t s_setattr_rsp_sem;
-extern bool              s_setattr_rsp_ok;
-
-// ── Bind request/response synchronisation ────────────────────────────────
-extern SemaphoreHandle_t s_bind_req_mutex;
-extern SemaphoreHandle_t s_bind_rsp_sem;
-extern bool              s_bind_rsp_ok;
-
-// ── Device-delete request/response synchronisation ───────────────────────
-extern SemaphoreHandle_t s_devdel_req_mutex;
-extern SemaphoreHandle_t s_devdel_rsp_sem;
-extern bool              s_devdel_rsp_ok;
-
-// ── Device-options-set request/response synchronisation ──────────────────
-extern SemaphoreHandle_t s_devopt_req_mutex;
-extern SemaphoreHandle_t s_devopt_rsp_sem;
-extern bool              s_devopt_rsp_ok;
-
-// ── Zigbee-config-set request/response synchronisation ───────────────────
-extern SemaphoreHandle_t s_zbcfg_req_mutex;
-extern SemaphoreHandle_t s_zbcfg_rsp_sem;
-extern bool              s_zbcfg_rsp_ok;
-extern uint8_t           s_zbcfg_rsp_channel;
-extern bool              s_zbcfg_rsp_key_set;
-
-// ── Rule request/response synchronisation ────────────────────────────────
-extern SemaphoreHandle_t s_rule_req_mutex;
-extern SemaphoreHandle_t s_rule_rsp_sem;
-extern char*             s_rule_rsp_json;
-extern size_t            s_rule_rsp_len;
-
-// ── Diagnostics (unhandled-frame ring) ───────────────────────────────────
-extern SemaphoreHandle_t s_diag_req_mutex;
-extern SemaphoreHandle_t s_diag_rsp_sem;
-extern char*             s_diag_rsp_json;
-extern size_t            s_diag_rsp_len;
 
 // ── Cached NVS handles (opened once at init, kept open — S4) ─────────────
 extern nvs_handle_t s_nvs_zhac_opt;   // "zhac_opt" — per-device options
@@ -243,8 +186,15 @@ void alert_log_schedule_persist();
 void alert_persist_task_init();
 void hap_send(HapMsgType type, const uint8_t* payload, uint16_t payload_len,
               uint8_t flags = HAP_FLAG_NO_ACK);
-bool hap_roundtrip(HapMsgType type, const uint8_t* payload, uint16_t payload_len,
-                   SemaphoreHandle_t rsp_sem, uint32_t timeout_ms = P4_ROUNDTRIP_TIMEOUT_MS);
+// Per-request-seq response correlation. Caller owns rsp_buf — no shared
+// scratch, no per-type mutex. Concurrent calls proceed in parallel up to
+// the bridge's waiter-slot cap (returns false on slot starvation within
+// timeout_ms). Returns true with `*rsp_len_out` set on success; truncates
+// + LOGW if the response payload exceeds rsp_cap.
+bool hap_roundtrip_v2(HapMsgType type,
+                      const uint8_t* req, uint16_t req_len,
+                      char* rsp_buf, size_t rsp_cap, size_t* rsp_len_out,
+                      uint32_t timeout_ms = P4_ROUNDTRIP_TIMEOUT_MS);
 void send_sync_req();
 void task_hap(void*);
 

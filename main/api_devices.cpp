@@ -27,8 +27,13 @@
 #include "esp_netif.h"
 #include "esp_heap_caps.h"
 #include "nvs.h"
+#include <memory>
 
 static const char* TAG_API = "api_devices";
+
+// Device-list cap matches the largest snapshot the P4 sends (HAP_MAX_PAYLOAD).
+static constexpr size_t kDevListRspCap = HAP_MAX_PAYLOAD;
+static constexpr size_t kDevInfoRspCap = HAP_MAX_PAYLOAD;
 
 // ── Devices ──────────────────────────────────────────────────────────────
 
@@ -39,46 +44,66 @@ static const char* TAG_API = "api_devices";
 // 1 s TTL is generous — DEVICE_LIST changes only on join/leave, and
 // push events (`device.added/removed`) refresh the cache out-of-band.
 static constexpr int64_t kDevListCacheMs = 1000;
-static int64_t           s_devlist_last_ok_ms = 0;
+static SemaphoreHandle_t s_devlist_cache_mutex = nullptr;
+static int64_t           s_devlist_last_ok_ms  = 0;
+static char*             s_devlist_cache_buf   = nullptr;
+static size_t            s_devlist_cache_len   = 0;
+
+static void devlist_cache_init() {
+    if (s_devlist_cache_mutex) return;
+    s_devlist_cache_mutex = xSemaphoreCreateMutex();
+    s_devlist_cache_buf   = static_cast<char*>(
+        heap_caps_malloc(kDevListRspCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    configASSERT(s_devlist_cache_mutex && s_devlist_cache_buf);
+}
 
 extern "C" ApiStatus api_device_list(const char* /*body*/, size_t /*body_len*/,
                                       char* rsp_buf, size_t rsp_cap,
                                       size_t* rsp_len) {
-    // Block up to slightly more than the hap_roundtrip budget (8 s) so
-    // back-to-back callers serialise instead of all racing onto SPI.
-    if (xSemaphoreTake(s_devlist_req_mutex, pdMS_TO_TICKS(8500)) != pdTRUE) {
+    devlist_cache_init();
+
+    // Cache lookup under the cache mutex. The cache exists ONLY to absorb
+    // SPA refresh bursts; v2 already permits concurrent callers, so this
+    // is no longer the only serialisation point.
+    {
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        xSemaphoreTake(s_devlist_cache_mutex, portMAX_DELAY);
+        if (s_devlist_last_ok_ms != 0 &&
+            (now_ms - s_devlist_last_ok_ms) < kDevListCacheMs &&
+            s_devlist_cache_len > 0) {
+            size_t n = s_devlist_cache_len;
+            if (n >= rsp_cap) n = rsp_cap - 1;
+            memcpy(rsp_buf, s_devlist_cache_buf, n);
+            rsp_buf[n] = '\0';
+            xSemaphoreGive(s_devlist_cache_mutex);
+            if (rsp_len) *rsp_len = n;
+            ESP_LOGD(TAG_API, "device.list cache hit age=%lldms",
+                     (long long)(now_ms - s_devlist_last_ok_ms));
+            return API_OK;
+        }
+        xSemaphoreGive(s_devlist_cache_mutex);
+    }
+
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kDevListRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::GET_DEVICES, nullptr, 0,
+                           rsp.get(), kDevListRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
 
-    const int64_t now_ms = esp_timer_get_time() / 1000;
-    if (s_devlist_last_ok_ms != 0 &&
-        (now_ms - s_devlist_last_ok_ms) < kDevListCacheMs &&
-        s_devlist_rsp_len > 0) {
-        size_t n = s_devlist_rsp_len;
-        if (n >= rsp_cap) n = rsp_cap - 1;
-        memcpy(rsp_buf, s_devlist_rsp_json, n);
-        rsp_buf[n] = '\0';
-        xSemaphoreGive(s_devlist_req_mutex);
-        if (rsp_len) *rsp_len = n;
-        ESP_LOGD(TAG_API, "device.list cache hit age=%lldms",
-                 (long long)(now_ms - s_devlist_last_ok_ms));
-        return API_OK;
-    }
+    // Refresh cache + reply. Cache write is mutex-guarded so concurrent
+    // callers see a consistent buffer.
+    xSemaphoreTake(s_devlist_cache_mutex, portMAX_DELAY);
+    const size_t cache_n = (got < kDevListRspCap) ? got : kDevListRspCap;
+    memcpy(s_devlist_cache_buf, rsp.get(), cache_n);
+    s_devlist_cache_len  = cache_n;
+    s_devlist_last_ok_ms = esp_timer_get_time() / 1000;
+    xSemaphoreGive(s_devlist_cache_mutex);
 
-    bool ok = hap_roundtrip(HapMsgType::GET_DEVICES, nullptr, 0,
-                             s_devlist_rsp_sem);
-    if (!ok) {
-        xSemaphoreTake(s_devlist_rsp_sem, 0);
-        xSemaphoreGive(s_devlist_req_mutex);
-        return API_INTERNAL_ERROR;
-    }
-
-    size_t n = s_devlist_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_devlist_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    s_devlist_last_ok_ms = now_ms;
-    xSemaphoreGive(s_devlist_req_mutex);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -114,25 +139,20 @@ extern "C" ApiStatus api_device_get(const char* body, size_t body_len,
         return API_OK;
     }
 
-    if (xSemaphoreTake(s_devinfo_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-
     uint8_t req_buf[48];
     uint16_t req_len = 0;
     hap_json_encode_get_device_req(req_buf, sizeof(req_buf), &req_len, ieee);
 
-    bool ok = hap_roundtrip(HapMsgType::GET_DEVICE_BY_ID, req_buf, req_len,
-                             s_devinfo_rsp_sem);
-    if (!ok) {
-        xSemaphoreTake(s_devinfo_rsp_sem, 0);
-        xSemaphoreGive(s_devinfo_req_mutex);
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kDevInfoRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::GET_DEVICE_BY_ID, req_buf, req_len,
+                           rsp.get(), kDevInfoRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
-
-    size_t n = s_devinfo_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_devinfo_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    xSemaphoreGive(s_devinfo_req_mutex);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -165,11 +185,18 @@ extern "C" ApiStatus api_device_bind(const char* body, size_t body_len,
         return API_INTERNAL_ERROR;
     }
 
-    if (xSemaphoreTake(s_bind_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-    bool got_rsp = hap_roundtrip(HapMsgType::BIND_REQ, hap_buf, hap_len,
-                                  s_bind_rsp_sem);
-    bool ok = got_rsp && s_bind_rsp_ok;
-    xSemaphoreGive(s_bind_req_mutex);
+    char ack_buf[64];
+    size_t ack_len = 0;
+    bool got_rsp = hap_roundtrip_v2(HapMsgType::BIND_REQ, hap_buf, hap_len,
+                                     ack_buf, sizeof(ack_buf), &ack_len, 5000);
+    bool cmd_ok = false;
+    if (got_rsp && ack_len > 0) {
+        JsonDocument doc;
+        if (deserializeJson(doc, ack_buf, ack_len) == DeserializationError::Ok) {
+            cmd_ok = doc["ok"] | false;
+        }
+    }
+    const bool ok = got_rsp && cmd_ok;
 
     const size_t n = ok ? api_write_ok(rsp_buf, rsp_cap)
                         : api_write_err(rsp_buf, rsp_cap);
@@ -197,11 +224,18 @@ extern "C" ApiStatus api_device_delete(const char* body, size_t body_len,
         return API_INTERNAL_ERROR;
     }
 
-    if (xSemaphoreTake(s_devdel_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-    bool got_rsp = hap_roundtrip(HapMsgType::DEVICE_DELETE, hap_buf, hap_len,
-                                  s_devdel_rsp_sem);
-    bool ok = got_rsp && s_devdel_rsp_ok;
-    xSemaphoreGive(s_devdel_req_mutex);
+    char ack_buf[64];
+    size_t ack_len = 0;
+    bool got_rsp = hap_roundtrip_v2(HapMsgType::DEVICE_DELETE, hap_buf, hap_len,
+                                     ack_buf, sizeof(ack_buf), &ack_len, 5000);
+    bool cmd_ok = false;
+    if (got_rsp && ack_len > 0) {
+        JsonDocument doc;
+        if (deserializeJson(doc, ack_buf, ack_len) == DeserializationError::Ok) {
+            cmd_ok = doc["ok"] | false;
+        }
+    }
+    bool ok = got_rsp && cmd_ok;
 
     if (ok) {
         char ws_msg[64];
@@ -253,19 +287,16 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
         return API_INTERNAL_ERROR;
     }
 
-    if (xSemaphoreTake(s_devinfo_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-    bool ok = hap_roundtrip(HapMsgType::DEVICE_SET_NAME, hap_buf, hap_len,
-                             s_devinfo_rsp_sem, 5000);
-    if (!ok) {
-        xSemaphoreTake(s_devinfo_rsp_sem, 0);
-        xSemaphoreGive(s_devinfo_req_mutex);
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kDevInfoRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::DEVICE_SET_NAME, hap_buf, hap_len,
+                           rsp.get(), kDevInfoRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
-    size_t n = s_devinfo_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_devinfo_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    xSemaphoreGive(s_devinfo_req_mutex);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -310,16 +341,19 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
         return API_INTERNAL_ERROR;
     }
 
-    if (xSemaphoreTake(s_setattr_req_mutex, 0) != pdTRUE) {
-        return API_INTERNAL_ERROR;
+    char ack_buf[64];
+    size_t ack_len = 0;
+    bool got_rsp = hap_roundtrip_v2(HapMsgType::SET_ATTRIBUTE,
+                                     hap_buf, hap_len,
+                                     ack_buf, sizeof(ack_buf), &ack_len, 3000);
+    if (!got_rsp) return API_INTERNAL_ERROR;
+    bool cmd_ok = false;
+    if (ack_len > 0) {
+        JsonDocument doc;
+        if (deserializeJson(doc, ack_buf, ack_len) == DeserializationError::Ok) {
+            cmd_ok = doc["ok"] | false;
+        }
     }
-    hap_send(HapMsgType::SET_ATTRIBUTE, hap_buf, hap_len, HAP_FLAG_NEEDS_ACK);
-    bool rsp_ok = xSemaphoreTake(s_setattr_rsp_sem, pdMS_TO_TICKS(3000)) == pdTRUE;
-    bool cmd_ok = s_setattr_rsp_ok;
-    if (!rsp_ok) xSemaphoreTake(s_setattr_rsp_sem, 0);
-    xSemaphoreGive(s_setattr_req_mutex);
-
-    if (!rsp_ok) return API_INTERNAL_ERROR;
     if (cmd_ok) {
         const size_t n = api_write_ok(rsp_buf, rsp_cap);
         if (rsp_len) *rsp_len = n;
@@ -381,16 +415,21 @@ extern "C" ApiStatus api_device_options_set(const char* body, size_t body_len,
         uint16_t hap_len = 0;
         if (hap_json_encode_device_options_set(hap_buf, sizeof(hap_buf),
                                                 &hap_len, ieee, occ, deb)) {
-            if (xSemaphoreTake(s_devopt_req_mutex, 0) == pdTRUE) {
-                bool got_rsp = hap_roundtrip(HapMsgType::DEVICE_OPTIONS_SET,
-                                              hap_buf, hap_len,
-                                              s_devopt_rsp_sem);
-                p4_ok = got_rsp && s_devopt_rsp_ok;
-                xSemaphoreGive(s_devopt_req_mutex);
-                forwarded = true;
-            } else {
-                p4_ok = false;
+            char ack_buf[64];
+            size_t ack_len = 0;
+            bool got_rsp = hap_roundtrip_v2(HapMsgType::DEVICE_OPTIONS_SET,
+                                             hap_buf, hap_len,
+                                             ack_buf, sizeof(ack_buf),
+                                             &ack_len, 5000);
+            bool cmd_ok = false;
+            if (got_rsp && ack_len > 0) {
+                JsonDocument ad;
+                if (deserializeJson(ad, ack_buf, ack_len) == DeserializationError::Ok) {
+                    cmd_ok = ad["ok"] | false;
+                }
             }
+            p4_ok     = got_rsp && cmd_ok;
+            forwarded = true;
         }
     }
 

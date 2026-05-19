@@ -242,7 +242,7 @@ void ws_event_broadcast(const char* name, const char* payload_json, size_t paylo
 
     // Heap-allocate the snapshot rather than putting 2 KB on stack —
     // this function gets called from the master_send dispatch chain
-    // (httpd thread -> api_rule_list -> hap_roundtrip -> SPI exchange ->
+    // (httpd thread -> api_rule_list -> hap_roundtrip_v2 -> SPI exchange ->
     //  peer BULK callback -> ws_event_broadcast -> ws_server_broadcast ->
     //  lwip_send), and the deep call chain plus a 2 KB stack local
     // tripped the stack canary on the HTTP server task.
@@ -315,26 +315,22 @@ void on_mqtt_rx(const char* topic, int topic_len,
         }
     }
 
-    // Build: {"type":"mqtt","topic":"<topic>","data":<data>}
+    // F-05 fix: always escape payload as a JSON string. The previous
+    // "splice verbatim if looks-like-JSON" path let a hostile broker or
+    // buggy publisher inject extra envelope fields (e.g. truncated `{`
+    // or `}` followed by a second key) into every WS client's stream.
+    // The SPA does JSON.parse(msg.data) regardless, so escaping costs
+    // one decode hop on the client and removes the injection vector.
     char buf[768];
     char topic_esc[256];
     char data_esc[512];
 
     json_escape(topic, topic_len, topic_esc, sizeof(topic_esc));
+    json_escape(data, data_len, data_esc, sizeof(data_esc));
 
-    bool data_is_json = (data_len > 0 && (data[0] == '{' || data[0] == '['));
-
-    int n;
-    if (data_is_json) {
-        n = snprintf(buf, sizeof(buf),
-            "{\"type\":\"mqtt\",\"topic\":\"%s\",\"data\":%.*s}",
-            topic_esc, data_len, data);
-    } else {
-        json_escape(data, data_len, data_esc, sizeof(data_esc));
-        n = snprintf(buf, sizeof(buf),
-            "{\"type\":\"mqtt\",\"topic\":\"%s\",\"data\":\"%s\"}",
-            topic_esc, data_esc);
-    }
+    int n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"mqtt\",\"topic\":\"%s\",\"data\":\"%s\"}",
+        topic_esc, data_esc);
 
     if (n > 0 && n < (int)sizeof(buf)) {
         ws_server_broadcast(buf, (size_t)n);

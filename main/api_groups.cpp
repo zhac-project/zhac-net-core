@@ -145,11 +145,6 @@ extern "C" ApiStatus api_group_cmd(const char* body, size_t body_len,
     strncpy(key_str, doc["key"] | "state", sizeof(key_str) - 1);
     int val = doc["val"] | 0;
 
-    if (xSemaphoreTake(s_setattr_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-    // Drain any stale give left over from a previous transaction so the
-    // first wait below can't be falsely satisfied.
-    xSemaphoreTake(s_setattr_rsp_sem, 0);
-
     uint8_t sent      = 0;   // members whose SET_ACK reported ok=true
     uint8_t failed    = 0;   // members whose SET_ACK reported ok=false
     uint8_t timed_out = 0;   // members whose SET_ACK never arrived
@@ -174,24 +169,25 @@ extern "C" ApiStatus api_group_cmd(const char* body, size_t body_len,
             continue;
         }
 
-        // Mirror api_device_attr_set: NEEDS_ACK so the SET_ACK handler
-        // matches by ack_seq, then count only when the ACK both arrived
-        // and decoded ok=true.
-        hap_send(HapMsgType::SET_ATTRIBUTE, hap_buf, hap_len, HAP_FLAG_NEEDS_ACK);
-        bool rsp_ok = xSemaphoreTake(s_setattr_rsp_sem, pdMS_TO_TICKS(3000)) == pdTRUE;
-        bool cmd_ok = s_setattr_rsp_ok;
+        char ack_buf[64];
+        size_t ack_len = 0;
+        bool rsp_ok = hap_roundtrip_v2(HapMsgType::SET_ATTRIBUTE,
+                                         hap_buf, hap_len,
+                                         ack_buf, sizeof(ack_buf),
+                                         &ack_len, 3000);
         if (!rsp_ok) {
             timed_out++;
-            // Drain any signal that arrived right after the timeout fired
-            // so the next member's wait doesn't see a stale wake.
-            xSemaphoreTake(s_setattr_rsp_sem, 0);
-        } else if (cmd_ok) {
-            sent++;
-        } else {
-            failed++;
+            continue;
         }
+        bool cmd_ok = false;
+        if (ack_len > 0) {
+            JsonDocument ad;
+            if (deserializeJson(ad, ack_buf, ack_len) == DeserializationError::Ok) {
+                cmd_ok = ad["ok"] | false;
+            }
+        }
+        if (cmd_ok) sent++; else failed++;
     }
-    xSemaphoreGive(s_setattr_req_mutex);
 
     const bool ok = (sent == r.member_count);
     int n = snprintf(rsp_buf, rsp_cap,

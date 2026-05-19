@@ -47,9 +47,7 @@ static bool uri_last_name(httpd_req_t* req, char* out, size_t cap) {
 
 esp_err_t handle_get_rules(httpd_req_t* req) {
     REQUIRE_AUTH(req);
-    TRY_CHANNEL(req, s_rule_req_mutex);
-    xSemaphoreGive(s_rule_req_mutex);
-
+    // F-01 v2: parallel callers admitted up to hap_bridge waiter cap.
     char* buf = static_cast<char*>(malloc(16 * 1024));
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
@@ -220,9 +218,7 @@ esp_err_t handle_put_rule_dsl(httpd_req_t* req) {
 
 esp_err_t handle_get_scripts(httpd_req_t* req) {
     REQUIRE_AUTH(req);
-    TRY_CHANNEL(req, s_script_req_mutex);
-    xSemaphoreGive(s_script_req_mutex);
-
+    // F-01 v2: parallel callers admitted up to hap_bridge waiter cap.
     char* buf = static_cast<char*>(malloc(16 * 1024));
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
@@ -369,21 +365,21 @@ esp_err_t handle_post_script(httpd_req_t* req) {
 // imports.
 esp_err_t handle_post_scripts_bulk(httpd_req_t* req) {
     REQUIRE_AUTH(req);
-    TRY_CHANNEL(req, s_script_req_mutex);
-
+    // F-01 v2: hap_roundtrip_v2 handles parallelism; this serial loop
+    // just iterates the array on the caller's thread, one v2 round-trip
+    // per entry.
     char*    body    = static_cast<char*>(malloc(HAP_MAX_PAYLOAD));
     uint8_t* hap_buf = static_cast<uint8_t*>(malloc(HAP_MAX_PAYLOAD));
-    if (!body || !hap_buf) {
-        free(body); free(hap_buf);
-        xSemaphoreGive(s_script_req_mutex);
+    char*    rsp_buf = static_cast<char*>(malloc(HAP_MAX_PAYLOAD));
+    if (!body || !hap_buf || !rsp_buf) {
+        free(body); free(hap_buf); free(rsp_buf);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;
     }
 
     int received = httpd_req_recv(req, body, HAP_MAX_PAYLOAD - 1);
     if (received <= 0) {
-        free(body); free(hap_buf);
-        xSemaphoreGive(s_script_req_mutex);
+        free(body); free(hap_buf); free(rsp_buf);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
         return ESP_OK;
     }
@@ -391,8 +387,7 @@ esp_err_t handle_post_scripts_bulk(httpd_req_t* req) {
 
     JsonDocument doc;
     if (deserializeJson(doc, body, (size_t)received)) {
-        free(body); free(hap_buf);
-        xSemaphoreGive(s_script_req_mutex);
+        free(body); free(hap_buf); free(rsp_buf);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
         return ESP_OK;
     }
@@ -411,13 +406,14 @@ esp_err_t handle_post_scripts_bulk(httpd_req_t* req) {
         if (!hap_json_encode_script_write(hap_buf, HAP_MAX_PAYLOAD, &hap_len, name, src)) {
             failed++; continue;
         }
-        bool ok = hap_roundtrip(HapMsgType::SCRIPT_WRITE, hap_buf, hap_len,
-                                 s_script_rsp_sem, 5000);
+        size_t got = 0;
+        bool ok = hap_roundtrip_v2(HapMsgType::SCRIPT_WRITE, hap_buf, hap_len,
+                                     rsp_buf, HAP_MAX_PAYLOAD, &got, 5000);
         if (ok) written++; else failed++;
     }
 
     free(hap_buf);
-    xSemaphoreGive(s_script_req_mutex);
+    free(rsp_buf);
 
     char resp[64];
     int n = snprintf(resp, sizeof(resp),

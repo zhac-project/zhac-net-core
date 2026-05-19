@@ -34,6 +34,7 @@ idf_component_register(
         nvs_flash
         esp_timer
         esp_https_ota
+        app_update
         esp_http_client
         freertos
         spiffs

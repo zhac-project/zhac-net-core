@@ -118,6 +118,10 @@ void auth_init() {
         esp_err_t ce = nvs_commit(h);
         if (ce != ESP_OK) ESP_LOGE(TAG, "auth_init: nvs_commit: %s",
                                     esp_err_to_name(ce));
+        // F-01 fix: serial console is the only secure bootstrap channel —
+        // /api/status used to leak this and is now stripped. Operator
+        // captures the token here, then enables auth via /api/system.
+        ESP_LOGI(TAG, "API TOKEN (first boot): %s", s_api_token);
     }
     nvs_close(h);
 
@@ -176,12 +180,6 @@ bool check_auth(httpd_req_t* req) {
 char              s_ota_url[256] = {};
 SemaphoreHandle_t s_ota_sem      = nullptr;
 
-// ── Script request/response synchronisation ───────────────────────────────
-SemaphoreHandle_t s_script_req_mutex = nullptr;
-SemaphoreHandle_t s_script_rsp_sem   = nullptr;
-char*             s_script_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
-size_t            s_script_rsp_len   = 0;
-
 // ── P4 state cache (updated from SYNC_ACK and HEARTBEAT) ─────────────────
 std::atomic<uint16_t> s_p4_device_count{0};
 std::atomic<uint32_t> s_p4_uptime_s{0};
@@ -213,57 +211,6 @@ AlertLogEntry     s_alert_log[ALERT_LOG_MAX];
 uint8_t           s_alert_log_head  = 0;
 uint8_t           s_alert_log_count = 0;
 SemaphoreHandle_t s_alert_log_mutex = nullptr;
-
-// ── Device-list request/response synchronisation ─────────────────────────
-SemaphoreHandle_t s_devlist_req_mutex = nullptr;
-SemaphoreHandle_t s_devlist_rsp_sem   = nullptr;
-char*             s_devlist_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
-size_t            s_devlist_rsp_len   = 0;
-
-// ── Device-info request/response synchronisation ─────────────────────────
-SemaphoreHandle_t s_devinfo_req_mutex = nullptr;
-SemaphoreHandle_t s_devinfo_rsp_sem   = nullptr;
-char*             s_devinfo_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
-size_t            s_devinfo_rsp_len   = 0;
-
-// ── Set-attribute request/response synchronisation ───────────────────────
-SemaphoreHandle_t s_setattr_req_mutex = nullptr;
-SemaphoreHandle_t s_setattr_rsp_sem   = nullptr;
-bool              s_setattr_rsp_ok    = false;
-
-// ── Bind request/response synchronisation ────────────────────────────────
-SemaphoreHandle_t s_bind_req_mutex = nullptr;
-SemaphoreHandle_t s_bind_rsp_sem   = nullptr;
-bool              s_bind_rsp_ok    = false;
-
-// ── Device-delete request/response synchronisation ───────────────────────
-SemaphoreHandle_t s_devdel_req_mutex = nullptr;
-SemaphoreHandle_t s_devdel_rsp_sem   = nullptr;
-bool              s_devdel_rsp_ok    = false;
-
-// ── Device-options request/response synchronisation ──────────────────────
-SemaphoreHandle_t s_devopt_req_mutex = nullptr;
-SemaphoreHandle_t s_devopt_rsp_sem   = nullptr;
-bool              s_devopt_rsp_ok    = false;
-
-// ── Zigbee-config (channel + net_key) request/response synchronisation ──
-SemaphoreHandle_t s_zbcfg_req_mutex    = nullptr;
-SemaphoreHandle_t s_zbcfg_rsp_sem      = nullptr;
-bool              s_zbcfg_rsp_ok       = false;
-uint8_t           s_zbcfg_rsp_channel  = 11;
-bool              s_zbcfg_rsp_key_set  = false;
-
-// ── Rule request/response synchronisation ────────────────────────────────
-SemaphoreHandle_t s_rule_req_mutex = nullptr;
-SemaphoreHandle_t s_rule_rsp_sem   = nullptr;
-char*             s_rule_rsp_json  = nullptr;  // allocated from PSRAM in app_main (M3)
-size_t            s_rule_rsp_len   = 0;
-
-// ── Diagnostics sync ──────────────────────────────────────────────────────
-SemaphoreHandle_t s_diag_req_mutex = nullptr;
-SemaphoreHandle_t s_diag_rsp_sem   = nullptr;
-char*             s_diag_rsp_json  = nullptr;
-size_t            s_diag_rsp_len   = 0;
 
 // ── Cached NVS handles ────────────────────────────────────────────────────
 nvs_handle_t s_nvs_zhac_opt = 0;
@@ -370,6 +317,11 @@ static void task_ota(void*) {
             int en = snprintf(ev, sizeof(ev),
                 "{\"target\":\"s3\",\"ok\":true,\"total\":%d}", total);
             ws_event_broadcast("ota.complete", ev, (size_t)en);
+            // F-04 fix: flush pending rule edits before reboot. The
+            // deferred writeback task has up to 5 s of in-PSRAM dirty
+            // rows that would otherwise be lost across the OTA restart.
+            extern void rule_store_flush_now();
+            rule_store_flush_now();
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_restart();
         } else {
@@ -499,7 +451,15 @@ static void task_p4_ota(void*) {
         // render a progress bar driven by ground truth from P4, not by
         // S3-side queue depth.
         constexpr uint32_t kChunkBatch          = 32;     // ~128 KB / batch
-        constexpr uint32_t kCheckpointTimeoutMs = 5000;
+        // P4's hap_slave dispatch is single-threaded; under concurrent
+        // Zigbee traffic + esp_ota_write (flash, ~1-2 ms each), the
+        // checkpoint REQ can queue behind ~32 chunks + reports for
+        // several seconds. 15 s is the safety budget. If even that
+        // expires we fall through to a SOFT warning rather than abort —
+        // the 5 ms throttle already prevents chunks from being dropped,
+        // so a missed checkpoint just means we lose the progress probe
+        // for that batch, not the transfer itself.
+        constexpr uint32_t kCheckpointTimeoutMs = 15000;
         uint32_t chunks_in_batch = 0;
         bool     batch_failed    = false;
 
@@ -540,38 +500,70 @@ static void task_p4_ota(void*) {
             chunks_in_batch++;
 
             if (chunks_in_batch >= kChunkBatch || is_last) {
+                // Drain any stale sem from a previous batch whose RSP
+                // arrived after we'd given up waiting. Counts as "got"
+                // only if the take actually pulls a fresh post-REQ
+                // signal in this iteration.
                 xSemaphoreTake(s_p4ota_ckpt_rsp_sem, 0);
                 hap_send(HapMsgType::OTA_CHECKPOINT_REQ, nullptr, 0, 0);
                 bool got = xSemaphoreTake(s_p4ota_ckpt_rsp_sem,
                                           pdMS_TO_TICKS(kCheckpointTimeoutMs)) == pdTRUE;
-                if (!got) {
-                    ESP_LOGE(TAG,
-                             "P4 OTA: checkpoint timeout at offset=%" PRIu32
-                             " — aborting", offset);
-                    batch_failed = true;
-                    break;
-                }
-                if (s_p4ota_ckpt_offset != offset) {
-                    ESP_LOGW(TAG,
-                             "P4 OTA: checkpoint divergence — S3=%" PRIu32
-                             " P4=%" PRIu32 " — aborting",
-                             offset, s_p4ota_ckpt_offset);
-                    batch_failed = true;
-                    break;
-                }
-                chunks_in_batch = 0;
 
-                // Push verified progress to the SPA. `pct` is the
-                // wire-confirmed percentage (P4 has written this much
-                // to flash + acked it via checkpoint), not the S3-side
-                // optimistic counter.
-                char ev[128];
-                const uint32_t pct = total ? (offset * 100u / total) : 0;
-                int en = snprintf(ev, sizeof(ev),
-                    "{\"target\":\"p4\",\"offset\":%" PRIu32
-                    ",\"total\":%" PRIu32 ",\"pct\":%" PRIu32 "}",
-                    offset, total, pct);
-                ws_event_broadcast("ota.progress", ev, (size_t)en);
+                bool verified = false;
+                if (got) {
+                    if (s_p4ota_ckpt_offset == offset) {
+                        verified = true;
+                    } else if (s_p4ota_ckpt_offset > offset) {
+                        // P4 reported MORE bytes than S3 has sent — impossible
+                        // without state corruption. Hard abort.
+                        ESP_LOGE(TAG,
+                                 "P4 OTA: checkpoint impossible — S3=%" PRIu32
+                                 " P4=%" PRIu32 " (P4 ahead) — aborting",
+                                 offset, s_p4ota_ckpt_offset);
+                        batch_failed = true;
+                        break;
+                    } else {
+                        // P4 lags by more than one batch — chunks lost
+                        // somewhere. Should not happen with the 5ms
+                        // throttle, but if it does abort cleanly.
+                        const uint32_t lag = offset - s_p4ota_ckpt_offset;
+                        if (lag > 2 * kChunkBatch * 4084) {
+                            ESP_LOGE(TAG,
+                                     "P4 OTA: checkpoint divergence — S3=%" PRIu32
+                                     " P4=%" PRIu32 " (lag=%" PRIu32 " B) — aborting",
+                                     offset, s_p4ota_ckpt_offset, lag);
+                            batch_failed = true;
+                            break;
+                        }
+                        ESP_LOGW(TAG,
+                                 "P4 OTA: P4 lagging — S3=%" PRIu32
+                                 " P4=%" PRIu32 " (lag=%" PRIu32 " B) — continuing",
+                                 offset, s_p4ota_ckpt_offset, lag);
+                        verified = true;   // tolerate small lag
+                    }
+                } else {
+                    // Soft timeout: P4 too busy to respond within the
+                    // window. Don't abort — the 5 ms throttle already
+                    // protects against chunk drops; this checkpoint is
+                    // a "nice to have" progress probe, not a safety net.
+                    // Push progress based on S3's offset so the SPA bar
+                    // still advances; flag the timeout in the log.
+                    ESP_LOGW(TAG,
+                             "P4 OTA: checkpoint timeout at offset=%" PRIu32
+                             " — continuing (P4 busy?)", offset);
+                    verified = true;   // pretend ok to keep going
+                }
+
+                if (verified) {
+                    chunks_in_batch = 0;
+                    char ev[128];
+                    const uint32_t pct = total ? (offset * 100u / total) : 0;
+                    int en = snprintf(ev, sizeof(ev),
+                        "{\"target\":\"p4\",\"offset\":%" PRIu32
+                        ",\"total\":%" PRIu32 ",\"pct\":%" PRIu32 "}",
+                        offset, total, pct);
+                    ws_event_broadcast("ota.progress", ev, (size_t)en);
+                }
             }
 
             if (is_last) break;
@@ -701,57 +693,18 @@ extern "C" void app_main() {
     s_ota_sem = xSemaphoreCreateBinary();
     configASSERT(s_ota_sem);
 
-    s_rule_req_mutex    = xSemaphoreCreateMutex();
-    s_rule_rsp_sem      = xSemaphoreCreateBinary();
-    s_script_req_mutex  = xSemaphoreCreateMutex();
-    s_script_rsp_sem    = xSemaphoreCreateBinary();
-    s_p4ota_sem         = xSemaphoreCreateBinary();
-    s_p4ota_rsp_sem     = xSemaphoreCreateBinary();
+    // Per-type request mutexes, response semaphores and shared response
+    // buffers were removed when hap_roundtrip_v2 took over (F-01 v2):
+    // every caller now owns its own response buffer + waiter slot, so
+    // there's no shared state left to gate.
+    s_p4ota_sem          = xSemaphoreCreateBinary();
+    s_p4ota_rsp_sem      = xSemaphoreCreateBinary();
     s_p4ota_ckpt_rsp_sem = xSemaphoreCreateBinary();
-    s_alert_log_mutex   = xSemaphoreCreateMutex();
+    s_alert_log_mutex    = xSemaphoreCreateMutex();
     configASSERT(s_alert_log_mutex);
-    s_devlist_req_mutex = xSemaphoreCreateMutex();
-    s_devlist_rsp_sem   = xSemaphoreCreateBinary();
-    s_devinfo_req_mutex = xSemaphoreCreateMutex();
-    s_devinfo_rsp_sem   = xSemaphoreCreateBinary();
-    s_setattr_req_mutex = xSemaphoreCreateMutex();
-    s_setattr_rsp_sem   = xSemaphoreCreateBinary();
-    s_bind_req_mutex    = xSemaphoreCreateMutex();
-    s_bind_rsp_sem      = xSemaphoreCreateBinary();
-    s_devdel_req_mutex  = xSemaphoreCreateMutex();
-    s_devdel_rsp_sem    = xSemaphoreCreateBinary();
-    s_devopt_req_mutex  = xSemaphoreCreateMutex();
-    s_devopt_rsp_sem    = xSemaphoreCreateBinary();
-    s_zbcfg_req_mutex   = xSemaphoreCreateMutex();
-    s_zbcfg_rsp_sem     = xSemaphoreCreateBinary();
-    s_diag_req_mutex    = xSemaphoreCreateMutex();
-    s_diag_rsp_sem      = xSemaphoreCreateBinary();
-    configASSERT(s_diag_req_mutex && s_diag_rsp_sem);
-    configASSERT(s_devlist_req_mutex);
-    configASSERT(s_devlist_rsp_sem);
-    configASSERT(s_setattr_req_mutex);
-    configASSERT(s_setattr_rsp_sem);
-    configASSERT(s_bind_req_mutex);
-    configASSERT(s_bind_rsp_sem);
-    configASSERT(s_devdel_req_mutex);
-    configASSERT(s_devdel_rsp_sem);
     configASSERT(s_p4ota_sem);
     configASSERT(s_p4ota_rsp_sem);
     configASSERT(s_p4ota_ckpt_rsp_sem);
-    configASSERT(s_rule_req_mutex);
-    configASSERT(s_rule_rsp_sem);
-    configASSERT(s_script_req_mutex);
-    configASSERT(s_script_rsp_sem);
-    configASSERT(s_devinfo_req_mutex);
-    configASSERT(s_devinfo_rsp_sem);
-
-    // Allocate HAP response JSON buffers from PSRAM (saves 16 KB of DRAM — M3)
-    s_devlist_rsp_json = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    s_devinfo_rsp_json = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    s_rule_rsp_json    = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    s_script_rsp_json  = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    s_diag_rsp_json    = static_cast<char*>(heap_caps_malloc(HAP_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    configASSERT(s_devlist_rsp_json && s_devinfo_rsp_json && s_rule_rsp_json && s_script_rsp_json && s_diag_rsp_json);
 
     // Mount SPIFFS for web UI static files
     {

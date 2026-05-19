@@ -5,6 +5,8 @@
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
+#include <atomic>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -12,6 +14,7 @@
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"
 #include "hap_master.h"
 #include "hap_session.h"
 #include "hap_json.h"
@@ -139,16 +142,76 @@ void hap_send(HapMsgType type, const uint8_t* payload, uint16_t payload_len,
     hap_session_send(f);
 }
 
-// ── Response correlation table (wire v2) ────────────────────────────────
+// ── Per-request-seq response correlation (F-01 v2) ──────────────────────
 //
-// For each response type, we record the seq of the last request that
-// expects that response. An incoming response whose ack_seq does not match
-// this table is dropped (never releases the waiter). This prevents a late
-// reply from a previously-timed-out request from unblocking the next call
-// on the same per-type semaphore.
+// Each in-flight roundtrip claims one slot from `s_waiters`. The slot
+// records the request seq, the expected response type, and the caller's
+// own response buffer + done-sem. When the receiver decodes a frame with
+// `ack_seq != 0` we look up the matching slot by seq; on match we copy
+// the payload into the caller's buffer (truncating to its cap) and give
+// the sem. No shared-buffer copy-out, no per-type single-slot table, no
+// REST-side mutex serialising rule/script mutators — concurrent rule
+// edits proceed in parallel up to kHapWaiterCount in flight.
 //
-// Legacy/unsolicited frames carry ack_seq == 0 and bypass the check.
-static std::atomic<uint16_t> s_ack_expected[256];
+// kHapWaiterCount is sized for the steady-state concurrency cap: the
+// HTTP server runs 4 worker threads, the WS dispatcher has 1, the OTA
+// flow holds at most 1, leaving headroom. Counting-sem `s_waiter_free_sem`
+// gates claim so 9th caller blocks until a slot frees.
+struct HapWaiter {
+    uint16_t           seq;            // 0 = free
+    HapMsgType         rsp_type;
+    SemaphoreHandle_t  sem;
+    char*              rsp_buf;
+    size_t             rsp_cap;
+    size_t*            rsp_len_out;
+    bool               ok;
+};
+static constexpr size_t  kHapWaiterCount = 8;
+static HapWaiter         s_waiters[kHapWaiterCount];
+static SemaphoreHandle_t s_waiter_table_mutex = nullptr;
+static SemaphoreHandle_t s_waiter_free_sem    = nullptr;
+
+// Claim one free slot under the table mutex. Caller must already have
+// decremented s_waiter_free_sem so a free slot exists — we just find it.
+static HapWaiter* waiter_claim(uint16_t seq, HapMsgType rsp_type,
+                                char* rsp_buf, size_t rsp_cap,
+                                size_t* rsp_len_out) {
+    xSemaphoreTake(s_waiter_table_mutex, portMAX_DELAY);
+    HapWaiter* w = nullptr;
+    for (auto& s : s_waiters) {
+        if (s.seq == 0) { w = &s; break; }
+    }
+    if (w) {
+        w->seq         = seq;
+        w->rsp_type    = rsp_type;
+        w->rsp_buf     = rsp_buf;
+        w->rsp_cap     = rsp_cap;
+        w->rsp_len_out = rsp_len_out;
+        w->ok          = false;
+        xSemaphoreTake(w->sem, 0);   // drain any stale signal from prior use
+    }
+    xSemaphoreGive(s_waiter_table_mutex);
+    return w;
+}
+
+static HapWaiter* waiter_find_by_seq(uint16_t seq) {
+    if (seq == 0) return nullptr;
+    xSemaphoreTake(s_waiter_table_mutex, portMAX_DELAY);
+    HapWaiter* w = nullptr;
+    for (auto& s : s_waiters) {
+        if (s.seq == seq) { w = &s; break; }
+    }
+    xSemaphoreGive(s_waiter_table_mutex);
+    return w;
+}
+
+static void waiter_release(HapWaiter* w) {
+    if (!w) return;
+    xSemaphoreTake(s_waiter_table_mutex, portMAX_DELAY);
+    w->seq = 0;
+    xSemaphoreGive(s_waiter_table_mutex);
+    xSemaphoreGive(s_waiter_free_sem);
+}
 
 static HapMsgType expected_response_for(HapMsgType req) {
     switch (req) {
@@ -176,75 +239,53 @@ static HapMsgType expected_response_for(HapMsgType req) {
     }
 }
 
-static bool hap_accept_response(HapMsgType rsp_type, uint16_t ack_seq) {
-    if (ack_seq == 0) return true;   // legacy / unsolicited frame
-    const uint16_t expected = s_ack_expected[static_cast<uint8_t>(rsp_type)]
-        .load(std::memory_order_relaxed);
-    if (expected == 0 || ack_seq == expected) return true;
-    ESP_LOGW(TAG, "stale response type=0x%02x ack_seq=%u expected=%u — dropping",
-             static_cast<uint8_t>(rsp_type), ack_seq, expected);
-    return false;
-}
+bool hap_roundtrip_v2(HapMsgType type,
+                      const uint8_t* req, uint16_t req_len,
+                      char* rsp_buf, size_t rsp_cap, size_t* rsp_len_out,
+                      uint32_t timeout_ms) {
+    if (!rsp_buf || rsp_cap == 0 || !rsp_len_out) return false;
+    *rsp_len_out = 0;
 
-bool hap_roundtrip(HapMsgType type,
-                   const uint8_t* payload, uint16_t payload_len,
-                   SemaphoreHandle_t rsp_sem,
-                   uint32_t /*timeout_ms*/) {
-    // Fixed retry schedule with mild exponential backoff. Total wall-clock
-    // budget is 1500 + 2500 + 4000 = 8000 ms. Earlier 500/750/1000 was too
-    // tight for >1 KB DEVICE_LIST / DEVICE_INFO replies on a busy P4 (JSON
-    // build + SPI transit + handler dispatch easily exceed 500 ms under
-    // concurrent interview / mqtt traffic), causing benign late replies to
-    // be dropped as stale and triggering needless re-roundtrips. Each
-    // attempt still uses a fresh seq so late replies match `ack_seq` to
-    // exactly one attempt's expected slot.
-    static constexpr uint32_t kAttemptMs[]  = { 1500, 2500, 4000 };
-    static constexpr int      kMaxAttempts  =
-        sizeof(kAttemptMs) / sizeof(kAttemptMs[0]);
+    const HapMsgType rsp_type = expected_response_for(type);
+    if (static_cast<uint8_t>(rsp_type) == 0) {
+        ESP_LOGE(TAG, "hap_roundtrip_v2: no rsp_type for req=0x%02x",
+                 static_cast<uint8_t>(type));
+        return false;
+    }
 
-    xSemaphoreTake(rsp_sem, 0);
+    // Counting-sem decrement is the slot-availability gate. Use the same
+    // timeout the caller gave us so high-load blocking respects the SLA.
+    if (xSemaphoreTake(s_waiter_free_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "hap_roundtrip_v2: no free waiter slot (req=0x%02x)",
+                 static_cast<uint8_t>(type));
+        return false;
+    }
+
+    const uint16_t seq = hap_session_next_seq();
+    HapWaiter* w = waiter_claim(seq, rsp_type, rsp_buf, rsp_cap, rsp_len_out);
+    if (!w) {
+        // Free-sem said a slot existed; if claim fails the table state
+        // diverged from the sem count — give the sem back and bail.
+        xSemaphoreGive(s_waiter_free_sem);
+        return false;
+    }
 
     HapFrame f{};
     f.type        = type;
+    f.seq         = seq;
     f.flags       = HAP_FLAG_NO_ACK;
-    f.payload     = payload;
-    f.payload_len = payload_len;
+    f.payload     = req;
+    f.payload_len = req_len;
+    hap_session_send(f);
 
-    const HapMsgType rsp_type = expected_response_for(type);
-
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        f.seq = hap_session_next_seq();
-        if (static_cast<uint8_t>(rsp_type) != 0) {
-            s_ack_expected[static_cast<uint8_t>(rsp_type)].store(
-                f.seq, std::memory_order_relaxed);
-        }
-
-        hap_session_send(f);
-
-        bool ok = xSemaphoreTake(rsp_sem,
-                                  pdMS_TO_TICKS(kAttemptMs[attempt])) == pdTRUE;
-        if (ok) {
-            if (static_cast<uint8_t>(rsp_type) != 0) {
-                s_ack_expected[static_cast<uint8_t>(rsp_type)].store(
-                    0, std::memory_order_relaxed);
-            }
-            return true;
-        }
-        // Drain any signal that arrived right after the timeout fired so
-        // the next attempt's wait doesn't see a stale wake.
-        xSemaphoreTake(rsp_sem, 0);
-        ESP_LOGW(TAG, "hap_roundtrip retry %d/%d type=0x%02x after %" PRIu32 "ms",
-                 attempt + 1, kMaxAttempts,
-                 static_cast<int>(type), kAttemptMs[attempt]);
+    const bool got = xSemaphoreTake(w->sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+    const bool ok  = got && w->ok;
+    waiter_release(w);
+    if (!got) {
+        ESP_LOGW(TAG, "hap_roundtrip_v2 timeout type=0x%02x seq=%u after %" PRIu32 "ms",
+                 static_cast<uint8_t>(type), seq, timeout_ms);
     }
-
-    // All attempts failed — clear the expected-ack slot so the next caller
-    // (or a very-late peer reply) doesn't trip the stale-response check.
-    if (static_cast<uint8_t>(rsp_type) != 0) {
-        s_ack_expected[static_cast<uint8_t>(rsp_type)].store(
-            0, std::memory_order_relaxed);
-    }
-    return false;
+    return ok;
 }
 
 void send_sync_req() {
@@ -306,13 +347,51 @@ void task_hap(void*) {
 
     TaskHandle_t hap_task_handle = xTaskGetCurrentTaskHandle();
 
-    s_p4_metrics_mutex = xSemaphoreCreateMutex();
+    s_p4_metrics_mutex   = xSemaphoreCreateMutex();
+    s_waiter_table_mutex = xSemaphoreCreateMutex();
+    s_waiter_free_sem    = xSemaphoreCreateCounting(kHapWaiterCount,
+                                                      kHapWaiterCount);
+    configASSERT(s_waiter_table_mutex && s_waiter_free_sem);
+    for (auto& w : s_waiters) {
+        w.sem = xSemaphoreCreateBinary();
+        configASSERT(w.sem);
+        w.seq = 0;
+    }
 
     hap_session_init(HapSessionCfg{
         .send         = hap_master_send,
         .on_frame     = [](const HapFrame& f) {
             _METRIC_COUNTER_INC(METRIC_HAP_RX_FRAMES_TOTAL, 1);
             _METRIC_TIMER_SCOPE(METRIC_HAP_RX_HANDLE);
+            // v2 dispatch — runs FIRST so the per-type cases below stay
+            // focused on side-effects (WS broadcast, MQTT fanout, log,
+            // cache). A response with ack_seq==0 is unsolicited (legacy
+            // push) and falls through. rsp_type mismatch on a matched
+            // seq still gives the sem so the caller doesn't hang —
+            // w->ok stays false → caller returns error.
+            if (f.ack_seq != 0) {
+                if (HapWaiter* w = waiter_find_by_seq(f.ack_seq)) {
+                    if (f.type == w->rsp_type) {
+                        const size_t n = std::min(
+                            static_cast<size_t>(f.payload_len), w->rsp_cap);
+                        memcpy(w->rsp_buf, f.payload, n);
+                        if (n < f.payload_len) {
+                            ESP_LOGW(TAG,
+                                     "hap_roundtrip_v2: truncated rsp type=0x%02x %u→%zu",
+                                     static_cast<uint8_t>(f.type),
+                                     f.payload_len, n);
+                        }
+                        *w->rsp_len_out = n;
+                        w->ok = true;
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "hap_roundtrip_v2: type mismatch seq=%u got=0x%02x want=0x%02x",
+                                 f.ack_seq, static_cast<uint8_t>(f.type),
+                                 static_cast<uint8_t>(w->rsp_type));
+                    }
+                    xSemaphoreGive(w->sem);
+                }
+            }
             switch (f.type) {
                 case HapMsgType::HEARTBEAT: {
                     HapHeartbeat hb{};
@@ -354,46 +433,17 @@ void task_hap(void*) {
                     break;
                 }
                 case HapMsgType::DEVICE_LIST: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
                     ESP_LOGI(TAG, "DEVICE_LIST received len=%d", f.payload_len);
-                    ws_event_broadcast("device.list.snapshot",
-                                        reinterpret_cast<const char*>(f.payload),
-                                        f.payload_len);
-                    size_t dl_copy = f.payload_len < HAP_MAX_PAYLOAD - 1
-                                     ? f.payload_len : HAP_MAX_PAYLOAD - 1;
-                    memcpy(s_devlist_rsp_json, f.payload, dl_copy);
-                    s_devlist_rsp_json[dl_copy] = '\0';
-                    s_devlist_rsp_len = dl_copy;
-                    // Refresh `device_count` from the payload — `s_p4_device_count`
-                    // is otherwise only seeded by the boot-time SYNC ACK and
-                    // grows stale once devices join after init. Each device
-                    // entry carries exactly one `"ieee":"0x` token in the
-                    // JSON; count occurrences as a cheap, alloc-free proxy.
-                    {
-                        uint16_t cnt = 0;
-                        const char* p = s_devlist_rsp_json;
-                        const char* end = s_devlist_rsp_json + dl_copy;
-                        while (p < end) {
-                            const char* hit = strstr(p, "\"ieee\":\"0x");
-                            if (!hit) break;
-                            ++cnt;
-                            p = hit + 10;
-                        }
-                        s_p4_device_count.store(cnt, std::memory_order_relaxed);
-                    }
-                    xSemaphoreGive(s_devlist_rsp_sem);
+                    // No SPA listener for `device.list.snapshot`. v2 hook
+                    // delivers the payload to the requesting caller via
+                    // the round-trip envelope; per-device deltas come over
+                    // `device.added` / `device.removed`. s_p4_device_count
+                    // is driven by HEARTBEAT exclusively.
                     break;
                 }
-                case HapMsgType::DEVICE_INFO: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
-                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
-                    memcpy(s_devinfo_rsp_json, f.payload, copy_len);
-                    s_devinfo_rsp_json[copy_len] = '\0';
-                    s_devinfo_rsp_len = copy_len;
-                    xSemaphoreGive(s_devinfo_rsp_sem);
+                case HapMsgType::DEVICE_INFO:
+                    // v2 dispatch handles it; no broadcast side-effect.
                     break;
-                }
                 case HapMsgType::BULK_STATE_UPDATE: {
                     // Demote from INFO to DEBUG: under heavy reporting traffic
                     // (multiple devices reporting at once) the per-frame log
@@ -401,15 +451,34 @@ void task_hap(void*) {
                     // enough to back up SPI exchanges, and hampers WS clients
                     // that subscribe to log streaming.
                     ESP_LOGD(TAG, "BULK len=%d", f.payload_len);
-                    // Append to the WS coalescer; flushed every
-                    // BULK_COALESCE_WIN_MS by the task_hap loop. If the
-                    // buffer can't fit this payload, force an early flush
-                    // and retry — never drop attrs silently.
-                    if (!bulk_append(reinterpret_cast<const char*>(f.payload),
-                                      f.payload_len)) {
+                    // F-02: a single payload >= BULK_COALESCE_CAP can never
+                    // fit, so don't even try — flush whatever was queued so
+                    // the bypass path's WS broadcast keeps ordering with
+                    // prior coalesced entries, then ship the oversize frame
+                    // directly. Without this guard the retry below would
+                    // also return false and we'd silently lose the update.
+                    const auto* bulk_pl =
+                        reinterpret_cast<const char*>(f.payload);
+                    const size_t bulk_pl_len = f.payload_len;
+                    if (bulk_pl_len + 2 > BULK_COALESCE_CAP) {
                         bulk_flush();
-                        bulk_append(reinterpret_cast<const char*>(f.payload),
-                                     f.payload_len);
+                        ESP_LOGW(TAG,
+                                 "BULK payload %u B exceeds coalescer cap %u — "
+                                 "bypassing coalescer",
+                                 (unsigned)bulk_pl_len,
+                                 (unsigned)BULK_COALESCE_CAP);
+                        ws_event_broadcast("attr.bulk", bulk_pl, bulk_pl_len);
+                    } else if (!bulk_append(bulk_pl, bulk_pl_len)) {
+                        bulk_flush();
+                        // After flush the buffer is empty and the payload
+                        // fits (size precheck above). If this still fails
+                        // we surface it as an error rather than the prior
+                        // silent drop.
+                        if (!bulk_append(bulk_pl, bulk_pl_len)) {
+                            ESP_LOGE(TAG,
+                                     "BULK append dropped after flush: len=%u",
+                                     (unsigned)bulk_pl_len);
+                        }
                     }
                     // Forward the per-attr update to MQTT on a per-device
                     // topic so subscribers can filter by IEEE without parsing
@@ -510,129 +579,9 @@ void task_hap(void*) {
                     }
                     break;
                 }
-                case HapMsgType::SET_ACK: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    bool cmd_ok = false;
-                    if (f.payload_len > 0) {
-                        JsonDocument doc;
-                        DeserializationError err = deserializeJson(
-                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
-                        cmd_ok = (err == DeserializationError::Ok) &&
-                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
-                        if (err)
-                            ESP_LOGW(TAG, "SET_ACK JSON decode error: %s", err.c_str());
-                    }
-                    s_setattr_rsp_ok = cmd_ok;
-                    xSemaphoreGive(s_setattr_rsp_sem);
-                    ESP_LOGI(TAG, "SET_ACK received ok=%d", (int)cmd_ok);
-                    break;
-                }
-                case HapMsgType::BIND_ACK: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    bool cmd_ok = false;
-                    if (f.payload_len > 0) {
-                        JsonDocument doc;
-                        DeserializationError err = deserializeJson(
-                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
-                        cmd_ok = (err == DeserializationError::Ok) &&
-                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
-                        if (err)
-                            ESP_LOGW(TAG, "BIND_ACK JSON decode error: %s", err.c_str());
-                    }
-                    s_bind_rsp_ok = cmd_ok;
-                    xSemaphoreGive(s_bind_rsp_sem);
-                    break;
-                }
-                case HapMsgType::DEVICE_DELETE_ACK: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    bool cmd_ok = false;
-                    if (f.payload_len > 0) {
-                        JsonDocument doc;
-                        DeserializationError err = deserializeJson(
-                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
-                        cmd_ok = (err == DeserializationError::Ok) &&
-                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
-                        if (err)
-                            ESP_LOGW(TAG, "DEVICE_DELETE_ACK JSON decode error: %s", err.c_str());
-                    }
-                    s_devdel_rsp_ok = cmd_ok;
-                    xSemaphoreGive(s_devdel_rsp_sem);
-                    break;
-                }
-                case HapMsgType::DEVICE_OPTIONS_SET_ACK: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    bool cmd_ok = false;
-                    if (f.payload_len > 0) {
-                        JsonDocument doc;
-                        DeserializationError err = deserializeJson(
-                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
-                        cmd_ok = (err == DeserializationError::Ok) &&
-                                 doc["ok"].is<bool>() && doc["ok"].as<bool>();
-                        if (err)
-                            ESP_LOGW(TAG, "DEVICE_OPTIONS_SET_ACK JSON decode error: %s", err.c_str());
-                    }
-                    s_devopt_rsp_ok = cmd_ok;
-                    xSemaphoreGive(s_devopt_rsp_sem);
-                    break;
-                }
-                case HapMsgType::ZIGBEE_CFG_SET_ACK: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    bool     cmd_ok   = false;
-                    uint8_t  chan_val = 11;
-                    bool     key_set  = false;
-                    if (f.payload_len > 0) {
-                        JsonDocument doc;
-                        DeserializationError err = deserializeJson(
-                            doc, f.payload, f.payload_len < 256 ? f.payload_len : 256);
-                        if (!err) {
-                            cmd_ok   = doc["ok"]          | false;
-                            chan_val = (uint8_t)(doc["channel"]     | 11);
-                            key_set  = doc["net_key_set"] | false;
-                        } else {
-                            ESP_LOGW(TAG, "ZIGBEE_CFG_SET_ACK JSON decode error: %s", err.c_str());
-                        }
-                    }
-                    s_zbcfg_rsp_ok      = cmd_ok;
-                    s_zbcfg_rsp_channel = chan_val;
-                    s_zbcfg_rsp_key_set = key_set;
-                    xSemaphoreGive(s_zbcfg_rsp_sem);
-                    break;
-                }
-                case HapMsgType::RULE_EXEC_RESULT:
-                case HapMsgType::RULE_LIST_RSP: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
-                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
-                    memcpy(s_rule_rsp_json, f.payload, copy_len);
-                    s_rule_rsp_json[copy_len] = '\0';
-                    s_rule_rsp_len = copy_len;
-                    xSemaphoreGive(s_rule_rsp_sem);
-                    ESP_LOGI(TAG, "rule response type=0x%02x len=%u",
-                             static_cast<uint8_t>(f.type), (unsigned)copy_len);
-                    break;
-                }
-                case HapMsgType::SCRIPT_ACK:
-                case HapMsgType::SCRIPT_LIST_RSP:
-                case HapMsgType::SCRIPT_CHECK_RSP: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
-                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
-                    memcpy(s_script_rsp_json, f.payload, copy_len);
-                    s_script_rsp_json[copy_len] = '\0';
-                    s_script_rsp_len = copy_len;
-                    xSemaphoreGive(s_script_rsp_sem);
-                    break;
-                }
-                case HapMsgType::DIAG_UNHANDLED_RSP: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
-                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
-                    memcpy(s_diag_rsp_json, f.payload, copy_len);
-                    s_diag_rsp_json[copy_len] = '\0';
-                    s_diag_rsp_len = copy_len;
-                    xSemaphoreGive(s_diag_rsp_sem);
-                    break;
-                }
+                // v2 dispatch handles SET/BIND/DEVICE_DELETE/DEVICE_OPTIONS/
+                // ZIGBEE_CFG/RULE/SCRIPT/DIAG responses — no per-type
+                // side-effects beyond the caller's payload copy.
                 case HapMsgType::METRICS_RSP: {
                     // Unsolicited in the sense that the /metrics
                     // scrape isn't blocking on it — the bridge loop
@@ -651,18 +600,7 @@ void task_hap(void*) {
                     }
                     break;
                 }
-                case HapMsgType::SCRIPT_READ_RSP: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
-                    size_t copy_len = f.payload_len < HAP_MAX_PAYLOAD - 1
-                                      ? f.payload_len : HAP_MAX_PAYLOAD - 1;
-                    memcpy(s_script_rsp_json, f.payload, copy_len);
-                    s_script_rsp_json[copy_len] = '\0';
-                    s_script_rsp_len = copy_len;
-                    xSemaphoreGive(s_script_rsp_sem);
-                    ESP_LOGI(TAG, "script response type=0x%02x len=%u",
-                             static_cast<uint8_t>(f.type), (unsigned)copy_len);
-                    break;
-                }
+                // SCRIPT_READ_RSP handled by v2 dispatch above.
                 case HapMsgType::MQTT_PUBLISH: {
                     HapMqttPublish msg{};
                     if (hap_json_decode_mqtt_publish(f.payload, f.payload_len, msg)) {
@@ -691,13 +629,26 @@ void task_hap(void*) {
                     if (hap_json_decode_ota_status(f.payload, f.payload_len, st)) {
                         s_p4ota_status = st;
                         xSemaphoreGive(s_p4ota_rsp_sem);
-                        ESP_LOGI(TAG, "P4 OTA_STATUS ok=%d rcvd=%" PRIu32 "/%" PRIu32,
-                                 st.ok, st.rcvd, st.total);
+                        // err[] is meaningful only when ok=false; include
+                        // it in the log so the failure cause (e.g.
+                        // ESP_ERR_NO_MEM, ESP_ERR_FLASH_OP_FAIL, offset
+                        // mismatch) is visible without the SPA UI.
+                        if (st.ok) {
+                            ESP_LOGI(TAG, "P4 OTA_STATUS ok=1 rcvd=%" PRIu32 "/%" PRIu32,
+                                     st.rcvd, st.total);
+                        } else {
+                            ESP_LOGE(TAG, "P4 OTA_STATUS ok=0 rcvd=%" PRIu32 "/%" PRIu32
+                                     " err='%s'",
+                                     st.rcvd, st.total, st.err);
+                        }
                     }
                     break;
                 }
                 case HapMsgType::OTA_CHECKPOINT_RSP: {
-                    if (!hap_accept_response(f.type, f.ack_seq)) break;
+                    // Special-case: main.cpp's OTA flow uses hap_send +
+                    // s_p4ota_ckpt_rsp_sem directly (not hap_roundtrip_v2),
+                    // so the legacy sem-give path stays. Frames carry
+                    // ack_seq==0 because the request goes via hap_send.
                     if (f.payload_len >= 8) {
                         s_p4ota_ckpt_offset =
                             (uint32_t)f.payload[0]        |
@@ -718,6 +669,21 @@ void task_hap(void*) {
                     }
                     break;
                 }
+                // Response-only types fully handled by the v2 dispatch
+                // hook at the top of this lambda — no per-type side-effect.
+                case HapMsgType::SET_ACK:
+                case HapMsgType::BIND_ACK:
+                case HapMsgType::DEVICE_DELETE_ACK:
+                case HapMsgType::DEVICE_OPTIONS_SET_ACK:
+                case HapMsgType::ZIGBEE_CFG_SET_ACK:
+                case HapMsgType::RULE_EXEC_RESULT:
+                case HapMsgType::RULE_LIST_RSP:
+                case HapMsgType::SCRIPT_ACK:
+                case HapMsgType::SCRIPT_LIST_RSP:
+                case HapMsgType::SCRIPT_CHECK_RSP:
+                case HapMsgType::SCRIPT_READ_RSP:
+                case HapMsgType::DIAG_UNHANDLED_RSP:
+                    break;
                 default:
                     ESP_LOGW(TAG, "unhandled HAP type=0x%02x",
                              static_cast<uint8_t>(f.type));
@@ -729,7 +695,27 @@ void task_hap(void*) {
             if (!hap_json_decode_sync(f.payload, f.payload_len, info)) return;
             if (!info.is_ack) return;
             s_synced.store(true, std::memory_order_release);
-            s_p4_device_count.store(info.device_count, std::memory_order_relaxed);
+#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+            // F-08: SYNC_ACK is proof the new firmware can talk to P4
+            // over SPI — the strongest health signal we have. Cancel
+            // rollback so a clean reboot won't revert. Idempotent: only
+            // fires once per boot.
+            static std::atomic<bool> s_marked_valid{false};
+            bool expected = false;
+            if (s_marked_valid.compare_exchange_strong(expected, true)) {
+                esp_err_t mv = esp_ota_mark_app_valid_cancel_rollback();
+                if (mv == ESP_OK) {
+                    ESP_LOGI(TAG, "OTA: marked image valid (SYNC_ACK)");
+                } else {
+                    ESP_LOGW(TAG, "OTA: mark_valid failed: %s",
+                             esp_err_to_name(mv));
+                }
+            }
+#endif
+            // F-10: `s_p4_device_count` is now driven exclusively by the
+            // HEARTBEAT path. The boot-time seed is harmless on its own
+            // but a third writer was the F-10 race; first HEARTBEAT
+            // arrives within ~5 s of SYNC anyway.
             {
                 const size_t cap = sizeof(s_p4_fw_ver) - 1;
                 const size_t n   = strnlen(info.fw_ver, cap);

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <memory>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -28,32 +29,28 @@
 #include "esp_heap_caps.h"
 #include "nvs.h"
 
-// Shared rule roundtrip — 5 s timeout into s_rule_rsp_sem.
-static bool rule_hap_roundtrip(HapMsgType type,
-                                const uint8_t* payload, uint16_t payload_len) {
-    return hap_roundtrip(type, payload, payload_len, s_rule_rsp_sem, 5000);
-}
+// Per-caller rule response buffer. Heap-allocated (rather than stack)
+// because HAP_MAX_PAYLOAD = 4 KB and REST handler stacks are tight.
+static constexpr size_t kRuleRspCap = HAP_MAX_PAYLOAD;
 
 // ── Rules ────────────────────────────────────────────────────────────────
 extern "C" ApiStatus api_rule_list(const char* /*body*/, size_t /*body_len*/,
                                     char* rsp_buf, size_t rsp_cap,
                                     size_t* rsp_len) {
-    if (xSemaphoreTake(s_rule_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-
     uint8_t req_buf[4];
     uint16_t req_len = 0;
     hap_json_encode_rule_list_req(req_buf, sizeof(req_buf), &req_len);
 
-    bool ok = rule_hap_roundtrip(HapMsgType::RULE_LIST_REQ, req_buf, req_len);
-    if (!ok) {
-        xSemaphoreGive(s_rule_req_mutex);
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kRuleRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::RULE_LIST_REQ, req_buf, req_len,
+                           rsp.get(), kRuleRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
-    size_t n = s_rule_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_rule_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    xSemaphoreGive(s_rule_req_mutex);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -74,38 +71,27 @@ extern "C" ApiStatus api_rule_create(const char* body, size_t body_len,
         return API_INTERNAL_ERROR;
     }
 
-    if (xSemaphoreTake(s_rule_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-    bool ok = rule_hap_roundtrip(HapMsgType::RULE_CREATE, hap_buf, hap_len);
-    if (!ok) {
-        xSemaphoreGive(s_rule_req_mutex);
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kRuleRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::RULE_CREATE, hap_buf, hap_len,
+                           rsp.get(), kRuleRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
 
     JsonDocument rd;
     bool parse_ok = true;
-    if (deserializeJson(rd, s_rule_rsp_json, (size_t)s_rule_rsp_len)
-                       == DeserializationError::Ok) {
+    if (deserializeJson(rd, rsp.get(), got) == DeserializationError::Ok) {
         parse_ok = rd["ok"] | false;
     }
-    if (!parse_ok) {
-        // Copy rule response verbatim (includes err) so caller can
-        // extract the error message for a 400 reply.
-        size_t n = s_rule_rsp_len;
-        if (n >= rsp_cap) n = rsp_cap - 1;
-        memcpy(rsp_buf, s_rule_rsp_json, n);
-        rsp_buf[n] = '\0';
-        xSemaphoreGive(s_rule_req_mutex);
-        if (rsp_len) *rsp_len = n;
-        return API_BAD_REQUEST;
-    }
 
-    size_t n = s_rule_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_rule_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    xSemaphoreGive(s_rule_req_mutex);
     if (rsp_len) *rsp_len = n;
-    return API_OK;
+    // Copy rule response verbatim either way; on parse failure caller
+    // can extract the err message for the 400 reply.
+    return parse_ok ? API_OK : API_BAD_REQUEST;
 }
 
 extern "C" ApiStatus api_rule_delete(const char* body, size_t body_len,
@@ -117,23 +103,21 @@ extern "C" ApiStatus api_rule_delete(const char* body, size_t body_len,
     uint16_t rule_id = doc["id"] | (uint16_t)0;
     if (rule_id == 0) return API_BAD_REQUEST;
 
-    if (xSemaphoreTake(s_rule_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
     uint8_t hap_buf[64];
     uint16_t hap_len = 0;
     if (!hap_json_encode_rule_delete(hap_buf, sizeof(hap_buf), &hap_len, rule_id)) {
-        xSemaphoreGive(s_rule_req_mutex);
         return API_INTERNAL_ERROR;
     }
-    bool ok = rule_hap_roundtrip(HapMsgType::RULE_DELETE, hap_buf, hap_len);
-    if (!ok) {
-        xSemaphoreGive(s_rule_req_mutex);
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kRuleRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::RULE_DELETE, hap_buf, hap_len,
+                           rsp.get(), kRuleRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
-    size_t n = s_rule_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_rule_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    xSemaphoreGive(s_rule_req_mutex);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -148,24 +132,22 @@ extern "C" ApiStatus api_rule_enable(const char* body, size_t body_len,
     if (rule_id == 0) return API_BAD_REQUEST;
     bool enabled = doc["enabled"] | false;
 
-    if (xSemaphoreTake(s_rule_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
     uint8_t hap_buf[64];
     uint16_t hap_len = 0;
     if (!hap_json_encode_rule_update(hap_buf, sizeof(hap_buf), &hap_len,
                                       rule_id, enabled)) {
-        xSemaphoreGive(s_rule_req_mutex);
         return API_INTERNAL_ERROR;
     }
-    bool ok = rule_hap_roundtrip(HapMsgType::RULE_UPDATE, hap_buf, hap_len);
-    if (!ok) {
-        xSemaphoreGive(s_rule_req_mutex);
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kRuleRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::RULE_UPDATE, hap_buf, hap_len,
+                           rsp.get(), kRuleRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
-    size_t n = s_rule_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_rule_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    xSemaphoreGive(s_rule_req_mutex);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -189,18 +171,16 @@ extern "C" ApiStatus api_rule_update(const char* body, size_t body_len,
                                            rule_id, name, dsl)) {
         return API_INTERNAL_ERROR;
     }
-
-    if (xSemaphoreTake(s_rule_req_mutex, 0) != pdTRUE) return API_INTERNAL_ERROR;
-    bool ok = rule_hap_roundtrip(HapMsgType::RULE_UPDATE_DSL, hap_buf, hap_len);
-    if (!ok) {
-        xSemaphoreGive(s_rule_req_mutex);
+    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kRuleRspCap]);
+    if (!rsp) return API_INTERNAL_ERROR;
+    size_t got = 0;
+    if (!hap_roundtrip_v2(HapMsgType::RULE_UPDATE_DSL, hap_buf, hap_len,
+                           rsp.get(), kRuleRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
-    size_t n = s_rule_rsp_len;
-    if (n >= rsp_cap) n = rsp_cap - 1;
-    memcpy(rsp_buf, s_rule_rsp_json, n);
+    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
+    memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
-    xSemaphoreGive(s_rule_req_mutex);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
