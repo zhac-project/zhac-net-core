@@ -1,4 +1,4 @@
 [submodule "www-spa"]
 	path = www-spa
 	url = https://github.com/zhac-project/www-spa.git
-	branch = main
+	branch = master
