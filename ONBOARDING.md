@@ -110,8 +110,9 @@ idf.py build
 With local sibling checkouts:
 
 ```bash
-export IDF_COMPONENT_OVERRIDE_PATH=$HOME/webapp/zhac/zhac-components/components
-export EMBEDDED_ZHC_PATH=$HOME/webapp/zhac/embedded-zhc
+export ZHAC_PATH=${ZHAC_PATH:-$HOME/zhac}   # dir holding the cloned ZHAC repos
+export IDF_COMPONENT_OVERRIDE_PATH=$ZHAC_PATH/zhac-components/components
+export EMBEDDED_ZHC_PATH=$ZHAC_PATH/embedded-zhc
 idf.py build
 ```
 
