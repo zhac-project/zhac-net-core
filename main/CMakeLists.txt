@@ -1,20 +1,28 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
+set(srcs
+    "main.cpp" "groups_store.cpp"
+    "api_system.cpp"
+    "api_devices.cpp"
+    "api_rules.cpp"
+    "api_scripts.cpp"
+    "api_groups.cpp"
+    "hap_bridge.cpp"
+    "log_ring.cpp"
+    "rest_devices.cpp"
+    "rest_rules.cpp"
+    "rest_ops.cpp"
+    "ws_bridge.cpp"
+    "wifi_mgr.cpp"
+    "metrics_mqtt.cpp"
+)
+
+if(CONFIG_ZHAC_REMOTE_CLIENT_ENABLE)
+    list(APPEND srcs "api_remote.cpp")
+endif()
+
 idf_component_register(
-    SRCS "main.cpp" "groups_store.cpp"
-         "api_system.cpp"
-         "api_devices.cpp"
-         "api_rules.cpp"
-         "api_scripts.cpp"
-         "api_groups.cpp"
-         "hap_bridge.cpp"
-         "log_ring.cpp"
-         "rest_devices.cpp"
-         "rest_rules.cpp"
-         "rest_ops.cpp"
-         "ws_bridge.cpp"
-         "wifi_mgr.cpp"
-         "metrics_mqtt.cpp"
+    SRCS ${srcs}
     INCLUDE_DIRS "."
     REQUIRES
         hap_protocol
@@ -39,6 +47,7 @@ idf_component_register(
         freertos
         spiffs
         driver
+        remote_client
 )
 
 spiffs_create_partition_image(spiffs ../www-spa/dist FLASH_IN_PROJECT)

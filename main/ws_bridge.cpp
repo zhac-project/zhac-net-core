@@ -12,6 +12,7 @@
 #include "hap_json.h"
 #include "hap_protocol.h"
 #include "ws_server.h"
+#include "remote_client.h"  // remote_client_publish_event (inline no-op when Kconfig off)
 #include "mqtt_gw.h"
 #include "ArduinoJson.h"
 #include "api_handlers.h"
@@ -258,6 +259,13 @@ void ws_event_broadcast(const char* name, const char* payload_json, size_t paylo
     xSemaphoreGive(s_evt_mutex);
 
     if (local && send_len > 0) ws_server_broadcast(local, send_len);
+
+    // Mirror to remote channel if enabled + allow-listed.
+    // The call is an inline no-op when ZHAC_REMOTE_CLIENT_ENABLE is off,
+    // and an atomic-load + branch when on but not READY. Hot-path
+    // overhead is below measurement noise on the LAN-only build.
+    remote_client_publish_event(name, payload_json, payload_len);
+
     if (local) free(local);
 }
 
@@ -352,3 +360,17 @@ void on_mqtt_rx(const char* topic, int topic_len,
         hap_send(HapMsgType::MQTT_MSG_IN, mqtt_fwd_buf, mqtt_fwd_len);
     }
 }
+
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+// Exposed wrapper for the remote_client component. Delegates to the
+// file-static dispatch_envelope above. Lives here (and not in
+// remote_client) because dispatch_envelope's compile unit owns the
+// ws envelope contract and we don't want to leak the static symbol.
+//
+// The matching decl is provided in s3_internal.h (and forward-declared
+// directly inside remote_client.cpp to avoid a cross-component header
+// reach into `main/`'s private headers).
+extern "C" void dispatch_envelope_for_remote(int fd, JsonDocument& doc) {
+    dispatch_envelope(fd, doc);
+}
+#endif // CONFIG_ZHAC_REMOTE_CLIENT_ENABLE

@@ -116,6 +116,12 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
     char p4_fw_ver[16] = {};
     hap_bridge_copy_p4_fw_ver(p4_fw_ver, sizeof(p4_fw_ver));
 
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+    const bool remote_available = true;
+#else
+    const bool remote_available = false;
+#endif
+
     int n = snprintf(rsp_buf, rsp_cap,
         "{\"heap\":%" PRIu32
          ",\"heap_min\":%" PRIu32
@@ -136,6 +142,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"mqtt_connected\":%s"
          ",\"mqtt_active\":%s"
          ",\"mqtt_enabled\":%s"
+         ",\"remote_available\":%s"
          ",\"mqtt_broker\":\"%s\""
          ",\"mqtt_root_topic\":\"%s\""
          ",\"mqtt_client_id\":\"%s\""
@@ -187,6 +194,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         mqtt_gw_is_connected()                           ? "true" : "false",
         mqtt_gw_is_active()                              ? "true" : "false",
         mqtt_enabled_nvs                                 ? "true" : "false",
+        remote_available                                 ? "true" : "false",
         mqtt_broker_nvs,
         mqtt_root_nvs,
         mqtt_cid_nvs,

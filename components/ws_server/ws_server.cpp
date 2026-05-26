@@ -17,6 +17,12 @@ static char              s_api_token[33] = {};
 static int s_fds[MAX_WS_CLIENTS];
 static int s_fd_count = 0;
 
+// Single-entry hook table. Suitable while there's only one
+// non-httpd transport (remote_client). Easy to extend to a small
+// array if a second transport needs the same plumbing.
+static int          s_hook_fd   = 0;       // 0 = unused (legal httpd fd value)
+static WsReplyHook  s_hook_func = nullptr;
+
 static void add_fd(int fd) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
@@ -168,6 +174,13 @@ void ws_server_set_api_token(const char* token) {
     s_api_token[sizeof(s_api_token) - 1] = '\0';
 }
 
+void ws_server_register_reply_hook(int sentinel_fd, WsReplyHook hook) {
+    // No mutex needed: registration happens once at init, before
+    // any traffic reaches ws_server_reply.
+    s_hook_fd   = sentinel_fd;
+    s_hook_func = hook;
+}
+
 int ws_server_client_count() {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     int n = s_fd_count;
@@ -202,6 +215,13 @@ void ws_server_broadcast(const char* json, size_t len) {
 }
 
 void ws_server_reply(int fd, const char* json, size_t len) {
+    // Sentinel-fd fast path: route the reply to a registered hook
+    // (e.g. remote_client) instead of the local httpd send. The
+    // sentinel is chosen outside the legal httpd fd range.
+    if (s_hook_func && fd == s_hook_fd) {
+        s_hook_func(json, len);
+        return;
+    }
     if (!s_server || fd < 0) return;
     httpd_ws_frame_t pkt{};
     pkt.type    = HTTPD_WS_TYPE_TEXT;

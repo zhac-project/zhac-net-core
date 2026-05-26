@@ -232,6 +232,16 @@ ApiStatus api_group_delete(const char* body, size_t body_len,
 ApiStatus api_group_cmd(const char* body, size_t body_len,
                          char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
+// ── Remote (premium feature, Kconfig-gated) ──────────────────────────────
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+ApiStatus api_remote_status(const char* body, size_t body_len,
+                             char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+ApiStatus api_remote_connect(const char* body, size_t body_len,
+                              char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+ApiStatus api_remote_disconnect(const char* body, size_t body_len,
+                                 char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

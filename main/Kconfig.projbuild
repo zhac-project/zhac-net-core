@@ -41,3 +41,39 @@ config ZHAC_CORS_WILDCARD
         the device).
 
 endmenu
+
+menu "ZHAC Remote"
+
+config ZHAC_REMOTE_CLIENT_ENABLE
+    bool "Enable Remote WSS client (premium feature)"
+    default n
+    help
+        Compile + link the remote_client component. Premium pay
+        feature. OFF (default): zero flash + zero RAM contribution.
+        The mirror call in ws_event_broadcast compiles to nothing.
+
+config ZHAC_REMOTE_RX_BUF_KB
+    int "Remote RX buffer (KB, PSRAM)"
+    depends on ZHAC_REMOTE_CLIENT_ENABLE
+    default 8
+    range 4 32
+
+config ZHAC_REMOTE_TX_QUEUE_DEPTH
+    int "Remote TX queue depth (events)"
+    depends on ZHAC_REMOTE_CLIENT_ENABLE
+    default 16
+    range 4 64
+
+config ZHAC_REMOTE_PING_INTERVAL_S
+    int "WSS ping interval (s)"
+    depends on ZHAC_REMOTE_CLIENT_ENABLE
+    default 20
+    range 5 120
+
+config ZHAC_REMOTE_BACKOFF_MAX_S
+    int "Reconnect backoff cap (s)"
+    depends on ZHAC_REMOTE_CLIENT_ENABLE
+    default 60
+    range 5 600
+
+endmenu

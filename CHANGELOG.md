@@ -7,6 +7,49 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added — Premium feature (Remote WSS client)
+
+- **remote_client** (new component, `components/remote_client/`):
+  opt-in outbound WSS client to a user-configured remote service.
+  Default-disabled at both build time
+  (`CONFIG_ZHAC_REMOTE_CLIENT_ENABLE=n`) and run time (NVS
+  `enabled=false`); the LAN-only firmware pays zero flash + zero RAM
+  for the feature. When active, one outbound `esp_websocket_client`
+  instance hosts a six-state machine (DISABLED / IDLE_NO_WIFI /
+  CONNECTING / AUTHENTICATING / READY / BACKOFF), authenticates
+  in-band with a user-pasted token (first frame is `remote.auth`;
+  mid-session re-auth challenges supported), and reuses the existing
+  transport-agnostic `api_*` handler set via a
+  `ws_server_register_reply_hook` plumbing addition. Cloud-originating
+  commands and device-originating push events are gated by static
+  allow-lists (`cmd` + `event`) in `remote_allow.cpp` — the
+  `wifi.connect` / `wifi.disconnect` / `remote.*` admin commands are
+  permanently excluded. The `ws_event_broadcast` hot path gains a
+  one-atomic-load mirror call to `remote_client_publish_event`; below
+  measurement noise on free-tier builds. Three new admin commands
+  `remote.connect / .disconnect / .status` live in
+  `main/api_remote.cpp` under the same Kconfig guard. Host tests
+  under `components/remote_client/test/` cover the allow-lists,
+  backoff math, state-machine transitions, and NVS round-trip.
+  Integration smoke server at `extra/tools/mock_remote.mjs`. Design
+  spec at
+  `docs/superpowers/specs/2026-05-19-remote-client-design.md`,
+  implementation plan at
+  `docs/superpowers/plans/2026-05-19-remote-client-plan.md`.
+
+- **ws_server**: new public API
+  `ws_server_register_reply_hook(sentinel_fd, hook)` — single-slot
+  table for routing `ws_server_reply` calls on a reserved fd
+  (REMOTE_VIRTUAL_FD = -32768) through a registered callback instead
+  of the local httpd send. The sentinel-fd fast path sits as the
+  first statement of `ws_server_reply`; normal httpd fds are
+  unaffected.
+
+- **main**: `api_status_get` gains `remote_available` field
+  (compile-time boolean from `CONFIG_ZHAC_REMOTE_CLIENT_ENABLE`) so
+  the SPA can show/hide the cloud-settings panel without an extra
+  round-trip.
+
 ### Fixed — Critical (regression follow-up)
 
 - **hap_bridge**: remove the `device.list.snapshot` WS broadcast from

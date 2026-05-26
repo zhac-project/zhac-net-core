@@ -87,4 +87,11 @@ ZHAC_API_ROUTE("group.update",               api_group_update,                PO
 ZHAC_API_ROUTE("group.delete",               api_group_delete,                POST, "/api/group/delete")
 ZHAC_API_ROUTE("group.cmd",                  api_group_cmd,                   POST, "/api/group/cmd")
 
+// ── Remote (premium feature) ─────────────────────────────────────────
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+ZHAC_API_ROUTE("remote.status",     api_remote_status,     GET,  "/api/remote/status")
+ZHAC_API_ROUTE("remote.connect",    api_remote_connect,    POST, "/api/remote/connect")
+ZHAC_API_ROUTE("remote.disconnect", api_remote_disconnect, POST, "/api/remote/disconnect")
+#endif
+
 #undef ZHAC_API_ROUTE

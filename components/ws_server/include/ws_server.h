@@ -19,3 +19,16 @@ httpd_handle_t   ws_server_get_handle();
 void             ws_server_set_rx_callback(WsRxCallback cb);
 void             ws_server_set_api_token(const char* token);
 int              ws_server_client_count();
+
+// ── Reply hook for sentinel fds ─────────────────────────────────────────
+//
+// Some callers (e.g. remote_client) deliver responses over a different
+// transport than the local httpd. They register a hook against a
+// reserved sentinel fd (outside the legal httpd range, e.g. < 0).
+//
+// When ws_server_reply() is called with a fd that matches a registered
+// sentinel, the hook is invoked instead of httpd_ws_send_frame_async.
+//
+// Single-slot table; latest registration wins. Pass nullptr to unregister.
+typedef void (*WsReplyHook)(const char* json, size_t len);
+void ws_server_register_reply_hook(int sentinel_fd, WsReplyHook hook);

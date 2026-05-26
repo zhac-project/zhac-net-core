@@ -38,6 +38,7 @@
 #include "nvs_helpers.h"
 #include "log_ring.h"
 #include "task_stacks.h"
+#include "remote_client.h"  // inline no-op when Kconfig off
 
 static const char* TAG = "s3_main";
 
@@ -818,6 +819,28 @@ extern "C" void app_main() {
     xTaskCreate(             task_ota,    "TaskOTA",   zhac::stack::kOta, nullptr, 2, nullptr);
     xTaskCreate(             task_p4_ota, "TaskP4OTA", zhac::stack::kP4Ota, nullptr, 2, nullptr);
     xTaskCreate(             task_stack_mon,"TaskStackMon", zhac::stack::kStackMonS3, nullptr, 1, nullptr);
+
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+    // Bridge wifi events to remote_client's event group so the task
+    // can transition IDLE_NO_WIFI ↔ CONNECTING / BACKOFF as the
+    // network state changes. Bit positions match the EVB_WIFI_UP
+    // (1<<2) and EVB_WIFI_DOWN (1<<3) constants in remote_client.cpp.
+    extern EventGroupHandle_t s_remote_evt;
+    esp_event_handler_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP,
+        [](void*, esp_event_base_t, int32_t, void*) {
+            if (s_remote_evt) xEventGroupSetBits(s_remote_evt, 1 << 2);
+        },
+        nullptr);
+    esp_event_handler_register(
+        WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+        [](void*, esp_event_base_t, int32_t, void*) {
+            if (s_remote_evt) xEventGroupSetBits(s_remote_evt, 1 << 3);
+        },
+        nullptr);
+#endif
+
+    remote_client_init();
 
     vTaskDelete(nullptr);
 }

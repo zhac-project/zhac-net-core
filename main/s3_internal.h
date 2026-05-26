@@ -255,3 +255,12 @@ void on_mqtt_rx(const char* topic, int topic_len, const char* data, int data_len
 // fragment of valid JSON (object, array, or scalar). Used by the SPA's
 // signal stores to react without polling. Cheap; runs in caller task.
 void ws_event_broadcast(const char* name, const char* payload_json, size_t payload_len);
+
+#ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
+// Implemented in ws_bridge.cpp as a thin wrapper around the file-static
+// dispatch_envelope. Lets the remote_client component reuse the same
+// envelope dispatch as the local /ws path. ArduinoJson is on the
+// component's REQUIRES list so the JsonDocument type is reachable.
+#include "ArduinoJson.h"
+extern "C" void dispatch_envelope_for_remote(int fd, JsonDocument& doc);
+#endif
