@@ -65,7 +65,7 @@ zhac-net-core/
 │   ├── hap_bridge.cpp           (SPI master glue to P4)
 │   ├── log_ring.cpp             (vprintf hook → ring buffer → MQTT / WS)
 │   ├── metrics_mqtt.cpp · wifi_mgr.{h,cpp} · groups_store.{h,cpp}
-│   ├── idf_component.yml        (10 shared component deps)
+│   ├── idf_component.yml        (shared zhac-components deps)
 │   └── CMakeLists.txt
 ├── components/
 │   ├── ws_server/               (WebSocket server, envelope parser)
@@ -310,8 +310,8 @@ of both.
   `zhac-components/components/hap_protocol/README.md`.
 - **ZCL attribute flow**:
   `zhac-components/components/device_shadow/README.md`.
-- **Knowledge graph** (legacy monorepo): `graphify-out/graph.json`
-  (old monorepo, internal) — query with `/graphify query "..."` if available.
+- **Knowledge graph** *(maintainer-only; not part of the public split)*:
+  `graphify-out/graph.json` from the pre-split monorepo.
 
 ---
 
