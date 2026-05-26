@@ -366,7 +366,7 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
 }
 
 // WS `device.options.set` — args {ieee, occupancy_timeout?, debounce_ms?,
-// flood_protection?}. Stores the body to NVS verbatim; P4 is notified
+// flood_protection?, throttle_ms?}. Stores the body to NVS verbatim; P4 is notified
 // via DEVICE_OPTIONS_SET only when one of the forwarded fields is set.
 // The REST wrapper passes the raw original body under `__raw` so the
 // stored NVS blob stays byte-identical to the pre-migration handler.
@@ -396,8 +396,10 @@ extern "C" ApiStatus api_device_options_set(const char* body, size_t body_len,
     bool forwarded = false;
     int32_t  occ_raw = -1;
     int32_t  deb_raw = -1;
+    int32_t  thr_raw = -1;
     const int32_t* occ = nullptr;
     const int32_t* deb = nullptr;
+    const int32_t* thr = nullptr;
     if (doc["occupancy_timeout"].is<int>()) {
         occ_raw = doc["occupancy_timeout"].as<int32_t>();
         occ = &occ_raw;
@@ -409,12 +411,16 @@ extern "C" ApiStatus api_device_options_set(const char* body, size_t body_len,
         deb_raw = doc["flood_protection"].as<bool>() ? 500 : 0;
         deb = &deb_raw;
     }
+    if (doc["throttle_ms"].is<int>()) {
+        thr_raw = doc["throttle_ms"].as<int32_t>();
+        thr = &thr_raw;
+    }
 
-    if (occ || deb) {
-        uint8_t hap_buf[96];
+    if (occ || deb || thr) {
+        uint8_t hap_buf[160];   // 3 optional fields + ieee; matches SET_ATTRIBUTE
         uint16_t hap_len = 0;
         if (hap_json_encode_device_options_set(hap_buf, sizeof(hap_buf),
-                                                &hap_len, ieee, occ, deb)) {
+                                                &hap_len, ieee, occ, deb, thr)) {
             char ack_buf[64];
             size_t ack_len = 0;
             bool got_rsp = hap_roundtrip_v2(HapMsgType::DEVICE_OPTIONS_SET,
@@ -430,6 +436,11 @@ extern "C" ApiStatus api_device_options_set(const char* body, size_t body_len,
             }
             p4_ok     = got_rsp && cmd_ok;
             forwarded = true;
+        } else {
+            // Encode failure (e.g. payload would overflow hap_buf) must not
+            // masquerade as success — fail the request rather than fall
+            // through to the !forwarded "ok" path below.
+            p4_ok = false;
         }
     }
 

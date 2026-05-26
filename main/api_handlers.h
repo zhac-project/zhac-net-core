@@ -149,7 +149,7 @@ ApiStatus api_device_attr_set(const char* body, size_t body_len,
                                char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
 // WS device.options.set / PUT /api/devices/{ieee} with sub="options" —
-// args {ieee, occupancy_timeout?, debounce_ms?, flood_protection?}.
+// args {ieee, occupancy_timeout?, debounce_ms?, flood_protection?, throttle_ms?}.
 ApiStatus api_device_options_set(const char* body, size_t body_len,
                                   char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 

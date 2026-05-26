@@ -7,6 +7,15 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added — Per-device flood control
+
+- **device.options.set**: now accepts `throttle_ms` (per-device report
+  rate-limit, milliseconds) and forwards it to P4 via `DEVICE_OPTIONS_SET`. Set
+  e.g. `30000` on chatty Tuya-DP air-quality monitors to cap the update flood at
+  one per 30 s. The `DEVICE_OPTIONS_SET` encode buffer was bumped 96→160 B for
+  the 3-field payload, and an encode failure now returns an error instead of a
+  false success. (#84)
+
 ### Added — Premium feature (Remote WSS client)
 
 - **remote_client** (new component, `components/remote_client/`):
