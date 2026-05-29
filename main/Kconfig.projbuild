@@ -76,4 +76,16 @@ config ZHAC_REMOTE_BACKOFF_MAX_S
     default 60
     range 5 600
 
+config ZHAC_REMOTE_ALLOW_PRIVILEGED
+    bool "Allow the cloud channel to invoke privileged commands"
+    depends on ZHAC_REMOTE_CLIENT_ENABLE
+    default n
+    help
+        FINDINGS.md F9. When OFF (default) the remote/cloud channel cannot
+        invoke firmware flash (ota.s3/ota.p4), network reset (zigbee.reset),
+        arbitrary Lua (script.run/script.write), device deletion, settings
+        changes, or token rotation — a compromised or spoofed cloud peer is
+        limited to reads + recoverable device/rule/group operations. Enable
+        ONLY if you fully trust the cloud endpoint and transport.
+
 endmenu

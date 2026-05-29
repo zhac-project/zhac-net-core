@@ -87,7 +87,7 @@ esp_err_t handle_get_devices(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     // F-01 v2: hap_roundtrip_v2 admits concurrent callers up to its
     // own waiter-slot cap; the old REST-level mutex probe is gone.
-    char* buf = static_cast<char*>(malloc(16 * 1024));
+    char* buf = static_cast<char*>(rest_big_alloc(16 * 1024));   // F33: PSRAM
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;
@@ -121,7 +121,7 @@ esp_err_t handle_get_device_by_id(httpd_req_t* req) {
         return ESP_OK;
     }
 
-    char* buf = static_cast<char*>(malloc(8 * 1024));
+    char* buf = static_cast<char*>(rest_big_alloc(8 * 1024));   // F33: PSRAM
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;
@@ -156,8 +156,8 @@ esp_err_t handle_post_device_bind(httpd_req_t* req) {
     bool is_unbind = (strcmp(sub, "unbind") == 0);
 
     char body[256];
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
+    int received = rest_body_recv(req, body, sizeof(body));   // F33: 413 on oversize body
+    if (received < 0) return ESP_OK;                           // helper already replied
     body[received] = '\0';
 
     char args[384];
@@ -286,7 +286,7 @@ esp_err_t handle_put_device(httpd_req_t* req) {
         }
     }
 
-    char* buf = static_cast<char*>(malloc(8 * 1024));
+    char* buf = static_cast<char*>(rest_big_alloc(8 * 1024));   // F33: PSRAM
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;

@@ -48,7 +48,7 @@ static bool uri_last_name(httpd_req_t* req, char* out, size_t cap) {
 esp_err_t handle_get_rules(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     // F-01 v2: parallel callers admitted up to hap_bridge waiter cap.
-    char* buf = static_cast<char*>(malloc(16 * 1024));
+    char* buf = static_cast<char*>(rest_big_alloc(16 * 1024));   // F33: PSRAM
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;
@@ -69,12 +69,8 @@ esp_err_t handle_get_rules(httpd_req_t* req) {
 esp_err_t handle_post_rules(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     char body[512] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
-    body[received] = '\0';
+    int received = rest_body_recv(req, body, sizeof(body));   // F33: 413 on oversize body
+    if (received < 0) return ESP_OK;                          // helper already replied
 
     char* buf = static_cast<char*>(malloc(4 * 1024));
     if (!buf) {
@@ -219,7 +215,7 @@ esp_err_t handle_put_rule_dsl(httpd_req_t* req) {
 esp_err_t handle_get_scripts(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     // F-01 v2: parallel callers admitted up to hap_bridge waiter cap.
-    char* buf = static_cast<char*>(malloc(16 * 1024));
+    char* buf = static_cast<char*>(rest_big_alloc(16 * 1024));   // F33: PSRAM
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;
@@ -313,12 +309,8 @@ esp_err_t handle_post_script(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;
     }
-    int received = httpd_req_recv(req, src_buf, HAP_SCRIPT_MAX_SRC);
-    if (received <= 0) {
-        free(src_buf);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, src_buf, HAP_SCRIPT_MAX_SRC + 1);   // F33: 413 on oversize
+    if (received < 0) { free(src_buf); return ESP_OK; }
     src_buf[received] = '\0';
 
     // Build args JSON: {"name":"...","src":"..."}.
@@ -377,12 +369,8 @@ esp_err_t handle_post_scripts_bulk(httpd_req_t* req) {
         return ESP_OK;
     }
 
-    int received = httpd_req_recv(req, body, HAP_MAX_PAYLOAD - 1);
-    if (received <= 0) {
-        free(body); free(hap_buf); free(rsp_buf);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, HAP_MAX_PAYLOAD);   // F33: 413 on oversize
+    if (received < 0) { free(body); free(hap_buf); free(rsp_buf); return ESP_OK; }
     body[received] = '\0';
 
     JsonDocument doc;

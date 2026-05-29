@@ -29,7 +29,10 @@ esp_timer_handle_t s_timer = nullptr;
 char               s_buf[kBufLen];
 
 void on_tick(void*) {
-    if (!mqtt_gw_is_connected()) return;
+    // F45 (FINDINGS.md): the snapshot carries internal metrics + heap layout.
+    // Only publish over a verified-TLS broker — never broadcast it broker-wide
+    // in cleartext where anyone subscribed can read it (compounds Finding 10).
+    if (!mqtt_gw_is_connected() || !mqtt_gw_is_secure()) return;
     metrics::update_memory_snapshot();
     const size_t n = metrics::mqtt_format_snapshot_json(s_buf, sizeof(s_buf));
     if (n == 0) return;

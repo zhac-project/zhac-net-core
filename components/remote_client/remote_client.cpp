@@ -56,6 +56,8 @@ static const char* TAG = "remote_client";
 static std::atomic<bool>           s_running{false};      // hot-path gate
 static std::atomic<RemoteState>    s_state{REMOTE_STATE_DISABLED};
 static uint8_t                     s_attempt = 0;          // backoff counter
+static uint32_t                    s_auth_id = 0;          // F22: id of the in-flight auth request (0 = none pending)
+static uint32_t                    s_auth_enter_ms = 0;    // F22: tick (ms) we entered AUTHENTICATING
 static esp_websocket_client_handle_t s_ws = nullptr;
 static TaskHandle_t                s_task = nullptr;
 static QueueHandle_t               s_tx_queue = nullptr;
@@ -208,11 +210,17 @@ static void ws_event_handler(void* /*arg*/, esp_event_base_t /*base*/,
 // ── Auth frame send ──────────────────────────────────────────────────────
 
 static void send_auth_frame() {
+    // F22 (FINDINGS.md): use a fresh, unpredictable id per auth attempt. The
+    // server echoes the request id back (spec §3 "the id field is opaque to
+    // the device; the device echoes it back"), so handle_rx_frame can bind the
+    // reply to *this* request and reject stale / replayed / unsolicited frames.
+    s_auth_id = esp_random() & 0x7FFFFFFFu;   // positive JSON int range
+    if (s_auth_id == 0) s_auth_id = 1;
     char buf[256];
     int n = snprintf(buf, sizeof(buf),
-        "{\"id\":1,\"cmd\":\"remote.auth\","
+        "{\"id\":%u,\"cmd\":\"remote.auth\","
         "\"args\":{\"token\":\"%s\",\"device_id\":\"%s\",\"fw_version\":\"%s\"}}",
-        s_cfg.token, s_cfg.devid, "vDEV");
+        (unsigned)s_auth_id, s_cfg.token, s_cfg.devid, "vDEV");
     if (n > 0 && (size_t)n < sizeof(buf) && s_ws) {
         esp_websocket_client_send_text(s_ws, buf, n, pdMS_TO_TICKS(2000));
     }
@@ -234,19 +242,25 @@ static void handle_rx_frame(const char* data, size_t len) {
         return;
     }
 
-    // Auth response path (id == 1, in AUTHENTICATING).
+    // Auth response path — only while AUTHENTICATING, and only for the id we
+    // actually sent (F22). Any other frame in this state is ignored: we are
+    // not authenticated yet, so it must not reach command dispatch.
     RemoteState st_rx = s_state.load(std::memory_order_acquire);
     if (st_rx == REMOTE_STATE_AUTHENTICATING) {
-        int id = doc["id"] | 0;
-        if (id == 1) {
+        uint32_t id = doc["id"] | 0u;
+        if (s_auth_id != 0 && id == s_auth_id) {
             bool ok = doc["ok"] | false;
+            s_auth_id = 0;   // consume — one reply per request
             if (ok) xEventGroupSetBits(s_remote_evt, EVB_AUTH_OK);
             else {
                 s_auth_fails.fetch_add(1);
                 xEventGroupSetBits(s_remote_evt, EVB_AUTH_FAIL);
             }
-            return;
+        } else {
+            ESP_LOGW(TAG, "auth-state frame id=%u (want %u) — ignored",
+                     (unsigned)id, (unsigned)s_auth_id);
         }
+        return;
     }
 
     // READY path — dispatch by cmd.
@@ -374,21 +388,28 @@ static void task_remote_body(void*) {
                 break;
 
             case REMOTE_STATE_AUTHENTICATING:
-                // Send auth frame exactly once per entry into this state.
-                if (just_entered_auth) send_auth_frame();
+                // Send auth frame exactly once per entry into this state and
+                // arm the timeout window (F22).
+                if (just_entered_auth) {
+                    s_auth_enter_ms = esp_log_timestamp();
+                    send_auth_frame();
+                }
                 if (bits & EVB_AUTH_OK) {
                     step(REMOTE_EV_AUTH_OK);
-                }
-                if (bits & EVB_AUTH_FAIL) {
-                    step(REMOTE_EV_AUTH_FAIL);
-                    s_attempt++;  // doubled penalty for bad token
-                }
-                if (bits & EVB_WSS_EVENT &&
-                    s_ws && !esp_websocket_client_is_connected(s_ws)) {
+                } else if (bits & EVB_AUTH_FAIL) {
+                    step(REMOTE_EV_AUTH_FAIL);   // F45: s_attempt is bumped once, in BACKOFF
+                } else if (bits & EVB_WSS_EVENT &&
+                           s_ws && !esp_websocket_client_is_connected(s_ws)) {
                     step(REMOTE_EV_WSS_ERROR);
+                } else if ((esp_log_timestamp() - s_auth_enter_ms) >= 5000) {
+                    // F22 (FINDINGS.md) + spec §7 #3: bounded 5 s auth timeout.
+                    // A server that stalls after the TLS handshake no longer
+                    // pins us in AUTHENTICATING forever — close + BACKOFF.
+                    // (Subtraction is tick-wrap safe.)
+                    ESP_LOGW(TAG, "auth timeout (5s) — no valid reply, backing off");
+                    s_auth_id = 0;   // F45: BACKOFF bumps s_attempt — don't double-count here
+                    step(REMOTE_EV_AUTH_TIMEOUT);
                 }
-                // (Auth timeout is handled by the 1 s tick loop +
-                //  a static elapsed counter — simplified for v1.)
                 break;
 
             case REMOTE_STATE_READY: {

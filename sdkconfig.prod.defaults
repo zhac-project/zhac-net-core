@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Production hardening overlay — ESP32-S3 net core   (FINDINGS.md F2 + F15)
+# ─────────────────────────────────────────────────────────────────────────
+# This file is NOT applied to normal/dev builds. Layer it ON TOP of the
+# base config for RELEASE images:
+#
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.prod.defaults" \
+#          fullclean build
+#
+# WARNING — irreversible on hardware:
+#   * Secure Boot v2 and Flash Encryption (release mode) burn eFuses on the
+#     first boot of the flashed device and CANNOT be undone. Provision a
+#     signing key, read Espressif's "Secure Boot V2" + "Flash Encryption"
+#     guides, and validate on a sacrificial unit before a production run.
+#   * Anti-rollback permanently refuses images with a lower secure_version.
+#
+# Rationale: without these, NVS (WiFi password, Zigbee network key, API
+# token, MQTT/Telegram creds) and the app image sit in plaintext flash,
+# readable/cloneable over JTAG/UART, and OTA accepts unsigned images.
+
+# ── Secure Boot v2 — verified, signed application images ─────────────────
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+# Provide the signing key per build (do NOT commit the private key):
+#   CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+
+# ── Flash Encryption — release mode (NVS + app ciphertext at rest) ───────
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+
+# ── Anti-rollback — pairs with signed OTA (F3) ───────────────────────────
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y
+CONFIG_BOOTLOADER_APP_SECURE_VERSION=1
+
+# ── Debug surface lock-down (F15) ────────────────────────────────────────
+# Secure Boot disables the JTAG eFuse pad automatically. Also quiet the
+# logs (they reach the /api/logs ring) and drop OCD awareness.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2
+CONFIG_LOG_MAXIMUM_LEVEL_WARN=y
+CONFIG_LOG_MAXIMUM_LEVEL=2
+CONFIG_ESP_DEBUG_OCDAWARE=n
+# Coredump-to-flash captures RAM (incl. secrets). It is acceptable ONLY
+# because Flash Encryption above renders the partition ciphertext. If you
+# ship WITHOUT flash encryption, also disable it:
+#   CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=n

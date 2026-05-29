@@ -428,8 +428,10 @@ extern "C" ApiStatus api_wifi_connect(const char* body, size_t body_len,
     nvs_commit(h);
     nvs_close(h);
 
-    ESP_LOGI(TAG_API, "WiFi credentials updated: ssid=\"%s\" — rebooting in 1 s",
-             ssid);
+    // F11 (FINDINGS.md): do not log the SSID value — it lands in the
+    // /api/logs ring. Log only that credentials changed.
+    ESP_LOGI(TAG_API, "WiFi credentials updated (ssid len=%u) — rebooting in 1 s",
+             (unsigned)strlen(ssid));
 
     // Actually schedule the reboot. The message above used to be a
     // lie — nothing was kicking esp_restart, so the device kept
@@ -709,6 +711,10 @@ extern "C" ApiStatus api_zigbee_permit_join(const char* body, size_t body_len,
         if (deserializeJson(doc, body, body_len)) return API_BAD_REQUEST;
     }
     uint8_t duration = doc["duration"] | (uint8_t)254;
+    // F21 (FINDINGS.md): clamp to ≤254 s. 255 is the Zigbee "open
+    // indefinitely" value, which would leave the network permanently
+    // joinable; force a finite, re-armable window instead.
+    if (duration > 254) duration = 254;
 
     uint8_t hap_buf[48];
     uint16_t hap_len = 0;

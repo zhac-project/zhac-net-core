@@ -20,27 +20,36 @@
 namespace {
 
 constexpr const char* kRemoteAllowedCmds[] = {
-    // Status / system
+    // Status / system (reads only)
     "status.get", "alerts.get", "logs.get", "diagnostics.unhandled.get",
-    "settings.set", "system.token.rotate",
     // WiFi reads only (mutators excluded — see comment above)
     "wifi.status", "wifi.scan",
-    // OTA
-    "ota.s3", "ota.p4",
-    // Zigbee
-    "zigbee.permit_join", "zigbee.permit_join.status", "zigbee.reset",
-    // Devices
-    "device.list", "device.get", "device.bind", "device.delete",
+    // Zigbee — open the join window + read; network reset is privileged
+    "zigbee.permit_join", "zigbee.permit_join.status",
+    // Devices — recoverable mutations; device.delete is privileged
+    "device.list", "device.get", "device.bind",
     "device.rename", "device.attr.set", "device.options.set",
     "device.reinterview", "device.configure",
     // Rules
     "rule.list", "rule.create", "rule.delete", "rule.enable", "rule.update",
-    // Scripts
-    "script.list", "script.read", "script.delete", "script.write",
-    "script.run", "script.check",
+    // Scripts — list/read/delete/check; run + write are privileged (RCE)
+    "script.list", "script.read", "script.delete", "script.check",
     // Groups
     "group.list", "group.create", "group.get", "group.update",
     "group.delete", "group.cmd",
+};
+
+// F9 (FINDINGS.md): privileged ops the cloud channel must NOT reach by
+// default — firmware flash (ota.*), network wipe (zigbee.reset), arbitrary
+// Lua execution (script.run/write), device removal, and auth/config changes.
+// A compromised or spoofed cloud peer (or anyone holding the bearer token)
+// would otherwise gain RCE-equivalent control. Exposed only when
+// CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED is set, for operators who explicitly
+// trust the cloud endpoint.
+constexpr const char* kRemotePrivilegedCmds[] = {
+    "ota.s3", "ota.p4", "zigbee.reset",
+    "script.run", "script.write",
+    "device.delete", "settings.set", "system.token.rotate",
 };
 
 constexpr const char* kRemoteAllowedEvents[] = {
@@ -53,6 +62,7 @@ constexpr const char* kRemoteAllowedEvents[] = {
 };
 
 constexpr size_t kCmdCount   = sizeof(kRemoteAllowedCmds)   / sizeof(kRemoteAllowedCmds[0]);
+constexpr size_t kPrivCount  = sizeof(kRemotePrivilegedCmds)/ sizeof(kRemotePrivilegedCmds[0]);
 constexpr size_t kEventCount = sizeof(kRemoteAllowedEvents) / sizeof(kRemoteAllowedEvents[0]);
 
 } // namespace
@@ -62,6 +72,14 @@ extern "C" bool remote_cmd_allowed(const char* cmd) {
     for (size_t i = 0; i < kCmdCount; i++) {
         if (std::strcmp(cmd, kRemoteAllowedCmds[i]) == 0) return true;
     }
+#ifdef CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED
+    // F9: only reachable when the operator explicitly trusts the cloud peer.
+    for (size_t i = 0; i < kPrivCount; i++) {
+        if (std::strcmp(cmd, kRemotePrivilegedCmds[i]) == 0) return true;
+    }
+#else
+    (void)kPrivCount;
+#endif
     return false;
 }
 

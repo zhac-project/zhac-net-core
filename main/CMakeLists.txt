@@ -50,4 +50,8 @@ idf_component_register(
         remote_client
 )
 
+# F17 (FINDINGS.md): warnings-as-errors for first-party app code (warning-free
+# here at IDF's default level). Extending to the rest is a mechanical follow-up.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Werror)
+
 spiffs_create_partition_image(spiffs ../www-spa/dist FLASH_IN_PROJECT)

@@ -26,6 +26,47 @@
 
 static const char* TAG = "rest_ops";
 
+// F33 (FINDINGS.md): per-request large buffers (device/rule list + export
+// responses, 8–16 KB) routed to PSRAM so repeated big allocations don't churn
+// the tight internal DRAM heap — a fragmentation DoS under request floods.
+// Falls back to the default heap if PSRAM is unavailable. Pair with plain
+// free() (ESP-IDF's free() handles PSRAM allocations).
+void* rest_big_alloc(size_t n) {
+    void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = malloc(n);
+    return p;
+}
+
+// F33 (FINDINGS.md): body read with an early Content-Length cap. Rejects an
+// oversized body with 413 *before* reading it (rather than truncating into a
+// fixed buffer and failing the JSON parse later) and 400s an empty/failed
+// recv. On any error it sends the response and returns -1, so callers just
+// do `if (n < 0) return ESP_OK;`. `cap` is the buffer size including the NUL
+// slot; at most cap-1 bytes are read. Returns bytes read on success.
+int rest_body_recv(httpd_req_t* req, char* buf, size_t cap) {
+    if (!buf || cap == 0) return -1;
+    if (req->content_len >= cap) {
+        ESP_LOGW(TAG, "body %u B exceeds cap %u — 413",
+                 (unsigned)req->content_len, (unsigned)cap);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "request body too large");
+        return -1;
+    }
+    int total = 0;
+    while ((size_t)total < cap - 1) {
+        int r = httpd_req_recv(req, buf + total, (size_t)(cap - 1 - (size_t)total));
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) break;
+        total += r;
+        if (req->content_len && (size_t)total >= req->content_len) break;
+    }
+    if (total <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+        return -1;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
 // Call api_fn, map its status to an HTTP response, send. Used by every
 // REST handler that just forwards body → api_fn → JSON back.
 esp_err_t rest_api_reply(httpd_req_t* req, ApiHandlerFn fn,

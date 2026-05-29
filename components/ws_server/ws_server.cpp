@@ -14,8 +14,9 @@ static WsRxCallback      s_rx_cb  = nullptr;
 static char              s_api_token[33] = {};
 
 #define MAX_WS_CLIENTS 3
-static int s_fds[MAX_WS_CLIENTS];
-static int s_fd_count = 0;
+static int  s_fds[MAX_WS_CLIENTS];
+static bool s_fd_authed[MAX_WS_CLIENTS] = {};   // F18: per-fd WS auth state
+static int  s_fd_count = 0;
 
 // Single-entry hook table. Suitable while there's only one
 // non-httpd transport (remote_client). Easy to extend to a small
@@ -23,14 +24,16 @@ static int s_fd_count = 0;
 static int          s_hook_fd   = 0;       // 0 = unused (legal httpd fd value)
 static WsReplyHook  s_hook_func = nullptr;
 
-static void add_fd(int fd) {
+static void add_fd(int fd, bool authed) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
-        if (s_fds[i] == fd) { xSemaphoreGive(s_mutex); return; }
+        if (s_fds[i] == fd) { s_fd_authed[i] = authed; xSemaphoreGive(s_mutex); return; }
     }
     if (s_fd_count < MAX_WS_CLIENTS) {
-        s_fds[s_fd_count++] = fd;
-        ESP_LOGI(TAG, "WS client added fd=%d total=%d", fd, s_fd_count);
+        s_fds[s_fd_count]       = fd;
+        s_fd_authed[s_fd_count] = authed;
+        s_fd_count++;
+        ESP_LOGI(TAG, "WS client added fd=%d authed=%d total=%d", fd, authed, s_fd_count);
     } else {
         ESP_LOGW(TAG, "WS client limit reached, rejecting fd=%d", fd);
     }
@@ -41,7 +44,9 @@ static void remove_fd(int fd) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
         if (s_fds[i] == fd) {
-            s_fds[i] = s_fds[--s_fd_count];
+            --s_fd_count;
+            s_fds[i]       = s_fds[s_fd_count];
+            s_fd_authed[i] = s_fd_authed[s_fd_count];   // F18: keep auth state aligned
             ESP_LOGI(TAG, "WS client removed fd=%d total=%d", fd, s_fd_count);
             break;
         }
@@ -49,14 +54,36 @@ static void remove_fd(int fd) {
     xSemaphoreGive(s_mutex);
 }
 
+// F18: per-fd auth state for first-message WS authentication.
+bool ws_server_fd_is_authed(int fd) {
+    bool authed = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_fd_count; i++) {
+        if (s_fds[i] == fd) { authed = s_fd_authed[i]; break; }
+    }
+    xSemaphoreGive(s_mutex);
+    return authed;
+}
+void ws_server_fd_set_authed(int fd) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_fd_count; i++) {
+        if (s_fds[i] == fd) { s_fd_authed[i] = true; break; }
+    }
+    xSemaphoreGive(s_mutex);
+}
+
 static esp_err_t ws_handler(httpd_req_t* req) {
     int fd = httpd_req_to_sockfd(req);
     if (req->method == HTTP_GET) {
-        // WS handshake upgrade — require the API token if one is configured.
-        // Accept either the `X-Api-Key` header (for non-browser clients) or
-        // a `?token=` query parameter (required for browser WebSocket API,
-        // which does not allow custom handshake headers).
-        if (s_api_token[0] != '\0') {
+        // F18 (FINDINGS.md): the socket may OPEN unauthenticated; auth is
+        // enforced per-message in the dispatch layer. If the client presents a
+        // valid token at handshake (X-Api-Key header, or the legacy ?token=
+        // query) we mark it authed now — back-compat for non-browser clients,
+        // which set headers without any URL leak. Browsers connect WITHOUT a
+        // URL token and authenticate via a first {"cmd":"auth"} message,
+        // keeping the long-lived token out of proxy/access logs.
+        bool authed = (s_api_token[0] == '\0');   // no token configured → auth off
+        if (!authed) {
             char key[64] = {};
             bool got_key = false;
             if (httpd_req_get_hdr_value_str(req, "X-Api-Key", key,
@@ -72,23 +99,15 @@ static esp_err_t ws_handler(httpd_req_t* req) {
                     }
                 }
             }
-            if (!got_key || strlen(key) != 32) {
-                httpd_resp_set_status(req, "401 Unauthorized");
-                httpd_resp_sendstr(req, "unauthorized");
-                return ESP_OK;
-            }
-            // Constant-time compare: XOR-accumulate all 32 bytes so the loop
-            // never short-circuits. Prevents timing side-channel attacks.
-            uint8_t diff = 0;
-            for (int i = 0; i < 32; i++)
-                diff |= (uint8_t)key[i] ^ (uint8_t)s_api_token[i];
-            if (diff != 0) {
-                httpd_resp_set_status(req, "401 Unauthorized");
-                httpd_resp_sendstr(req, "unauthorized");
-                return ESP_OK;
+            if (got_key && strlen(key) == 32) {
+                // Constant-time compare: XOR-accumulate all 32 bytes.
+                uint8_t diff = 0;
+                for (int i = 0; i < 32; i++)
+                    diff |= (uint8_t)key[i] ^ (uint8_t)s_api_token[i];
+                authed = (diff == 0);
             }
         }
-        add_fd(fd);
+        add_fd(fd, authed);
         return ESP_OK;
     }
     uint8_t buf[256] = {};
@@ -152,6 +171,10 @@ void ws_server_init() {
     cfg.keep_alive_idle     = 10;
     cfg.keep_alive_interval = 5;
     cfg.keep_alive_count    = 3;
+    // F33 (FINDINGS.md): bound slow / half-open clients (slowloris) so a few
+    // trickle connections can't pin the small (9) socket pool indefinitely.
+    cfg.recv_wait_timeout   = 10;
+    cfg.send_wait_timeout   = 10;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");

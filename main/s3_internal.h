@@ -139,6 +139,13 @@ esp_err_t rest_api_reply(httpd_req_t* req, ApiHandlerFn fn,
                           const char* body, size_t body_len,
                           char* buf, size_t cap, const char* err_label);
 
+// F33 (FINDINGS.md): PSRAM-preferred allocation for per-request large buffers
+// (free() with free()), and body read with an early Content-Length 413 cap.
+// rest_body_recv returns bytes read, or -1 after itself sending 413/400 —
+// callers then just `return ESP_OK`. See rest_ops.cpp for full contracts.
+void* rest_big_alloc(size_t n);
+int   rest_body_recv(httpd_req_t* req, char* buf, size_t cap);
+
 // ── Macros shared across files ────────────────────────────────────────────
 
 #define REQUIRE_AUTH(req) \
@@ -178,6 +185,7 @@ esp_err_t rest_api_reply(httpd_req_t* req, ApiHandlerFn fn,
 // ── Functions defined in main.cpp used elsewhere ─────────────────────────
 uint64_t parse_ieee(const char* s);
 bool     check_auth(httpd_req_t* req);
+bool     auth_check_token(const char* token);   // F18: WS first-message auth
 void     auth_init();
 
 // ── Functions defined in hap_bridge.cpp ──────────────────────────────────

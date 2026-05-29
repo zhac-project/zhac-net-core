@@ -20,6 +20,12 @@ void             ws_server_set_rx_callback(WsRxCallback cb);
 void             ws_server_set_api_token(const char* token);
 int              ws_server_client_count();
 
+// F18: per-fd auth state for first-message WS authentication. A socket may
+// open unauthenticated when a token is configured; the dispatch layer permits
+// only the `auth` command until ws_server_fd_set_authed() is called for it.
+bool             ws_server_fd_is_authed(int fd);
+void             ws_server_fd_set_authed(int fd);
+
 // ── Reply hook for sentinel fds ─────────────────────────────────────────
 //
 // Some callers (e.g. remote_client) deliver responses over a different

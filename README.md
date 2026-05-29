@@ -76,6 +76,53 @@ idf.py -p /dev/ttyUSB0 flash monitor
 idf.py -p /dev/ttyUSB0 spiffs-flash   # SPIFFS only (after SPA rebuild)
 ```
 
+## API authentication
+
+> **TODO — revisit before production.** Auth currently defaults **OFF**
+> (`auth_init()` in `main/main.cpp`, `auth_en = 0`). While off, **any client on
+> the LAN/Wi-Fi can drive the controller unauthenticated** — REST, WebSocket,
+> OTA, Zigbee reset, and arbitrary Lua via `script.run`. This is FINDINGS.md
+> **A1 / F1**, deliberately left open for zero-config development. Re-enable
+> (set `auth_en = 1`, or build a hardened image) before shipping.
+
+The enforcement machinery is already in place and activates the moment auth is
+enabled — only the default is off.
+
+### How it works
+
+- A random 128-bit token is generated on first boot and persisted in NVS
+  (`zhac_auth/token`). Auth on/off lives in `zhac_auth/enabled`.
+- **REST**: every mutating route is gated by `REQUIRE_AUTH` and checks the
+  `X-Api-Key` header with a constant-time compare. A sliding-window lockout
+  throttles failed attempts.
+- **WebSocket**: the `/ws` handshake requires the token as a `?token=` query
+  param (browsers can't set WS headers). With auth off, `/ws` is open.
+- `GET /api/status` and the static SPA assets stay unauthenticated so the UI
+  can always load.
+
+### Enabling auth
+
+1. **Get the token.** When auth is enabled the token is printed to the
+   **serial console on every boot** (never to `/api/logs`):
+   `*** ZHAC API auth ENABLED — token (serial-only): <hex> ***`
+2. **Enable it** — either from the UI (**Settings → "Auth (bearer token)"**
+   toggle, persists `enabled=1`) or by flipping the default in `auth_init()`
+   for a hardened build.
+3. **Give the browser the token** — **Settings → "This browser's token"**,
+   paste, Save (writes `localStorage.zhac_token`, reconnects). For a browser
+   without the UI field yet, DevTools console:
+   `localStorage.setItem('zhac_token','<hex>'); location.reload()`.
+4. Token rotation is available via `/api/system` (`system.token.rotate`).
+
+### Known hardening gaps (tracked in FINDINGS.md)
+
+- **A1 / F1** — auth defaults off (above).
+- **F18 / A9** — the WS token travels in the URL query string (leaks to proxy
+  / access logs); a `Sec-WebSocket-Protocol` token or short-lived ticket is the
+  planned replacement.
+- **F2** — the token (and all NVS secrets) sit in plaintext flash unless Secure
+  Boot + Flash Encryption are enabled; see `sdkconfig.prod.defaults`.
+
 ## License
 
 GNU AGPL v3 or later. See `LICENSE`.

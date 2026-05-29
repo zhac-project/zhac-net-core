@@ -14,6 +14,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_sntp.h"
@@ -28,7 +29,11 @@ static const char* TAG = "wifi_mgr";
 // ── Internal state ───────────────────────────────────────────────────────
 static bool            s_ap_mode       = false;
 static int             s_retry_count   = 0;
-static constexpr int   MAX_STA_RETRIES = 5;  // after N fails, clear NVS creds; AP stays up
+// F38 (FINDINGS.md): raised 5 → 20 so a transient AP/handshake blip can't
+// wipe valid credentials. Only sustained failure (~160 s given the backoff
+// below) clears them, and the AP stays up for manual re-provision regardless.
+// NO_AP_FOUND / BEACON_TIMEOUT never trigger a wipe (see credential_error).
+static constexpr int   MAX_STA_RETRIES = 20;  // sustained-failure threshold; AP stays up
 static char            s_ap_ssid[16]   = {};
 static char            s_ip_str[20]    = "0.0.0.0";
 
@@ -164,17 +169,50 @@ static void clear_sta_creds(void) {
     }
 }
 
+// F12/A5 (FINDINGS.md): random per-device WPA2 PSK for the provisioning AP,
+// persisted in NVS. Random (NOT MAC-derived) because the AP BSSID == MAC is
+// broadcast in every beacon; a derived key would be trivially recoverable.
+// 12 hex chars (>= the WPA2 8-char minimum). Printed to serial on bring-up.
+static char s_ap_pass[16] = {};
+static void load_or_gen_ap_pass(void) {
+    if (s_ap_pass[0]) return;
+    nvs_handle_t h;
+    if (nvs_open("sys_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        size_t len = sizeof(s_ap_pass);
+        if (nvs_get_str(h, "ap_pass", s_ap_pass, &len) != ESP_OK || !s_ap_pass[0]) {
+            uint8_t r[6];
+            esp_fill_random(r, sizeof(r));
+            for (int i = 0; i < 6; i++) snprintf(s_ap_pass + i * 2, 3, "%02x", r[i]);
+            nvs_set_str(h, "ap_pass", s_ap_pass);
+            nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    if (!s_ap_pass[0]) strncpy(s_ap_pass, "zhacsetup", sizeof(s_ap_pass) - 1);
+}
+
 static void configure_ap(void) {
     build_ap_ssid();
+    load_or_gen_ap_pass();
     if (!s_netif_ap) s_netif_ap = esp_netif_create_default_wifi_ap();
 
     wifi_config_t ap_cfg = {};
     strncpy(reinterpret_cast<char*>(ap_cfg.ap.ssid), s_ap_ssid, sizeof(ap_cfg.ap.ssid) - 1);
     ap_cfg.ap.ssid_len       = (uint8_t)strlen(s_ap_ssid);
     ap_cfg.ap.channel        = 1;
-    ap_cfg.ap.authmode       = WIFI_AUTH_OPEN;
+    // F12/A5 (FINDINGS.md): WPA2-protect the provisioning AP (was OPEN — any
+    // RF-adjacent client could join the captive portal and drive setup). PSK
+    // is the random, NVS-persisted per-device value from load_or_gen_ap_pass.
+    ap_cfg.ap.authmode       = WIFI_AUTH_WPA2_PSK;
+    strncpy(reinterpret_cast<char*>(ap_cfg.ap.password), s_ap_pass,
+            sizeof(ap_cfg.ap.password) - 1);
     ap_cfg.ap.max_connection = 4;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    // Serial/label is the out-of-band channel for the operator to learn the
+    // PSK (same model as the API token).
+    printf("\n*** ZHAC provisioning AP (WPA2): SSID=%s  password=%s ***\n\n",
+           s_ap_ssid, s_ap_pass);
+    fflush(stdout);
 }
 
 static void configure_sta(const char* ssid, const char* pass) {
@@ -191,7 +229,11 @@ static void configure_sta(const char* ssid, const char* pass) {
         const size_t n   = strnlen(pass, cap);
         memcpy(sta_cfg.sta.password, pass, n);
     }
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    // F12 (FINDINGS.md): pin the STA minimum auth level so the device won't
+    // associate to a rogue OPEN AP advertising the saved SSID (evil-twin /
+    // downgrade). Open only when no password was provisioned.
+    sta_cfg.sta.threshold.authmode =
+        (pass && pass[0]) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
 }
 

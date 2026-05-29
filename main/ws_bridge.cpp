@@ -76,6 +76,29 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
         send_envelope_error(fd, id_var, "missing cmd");
         return;
     }
+    // F18/A2 (FINDINGS.md): when auth is enabled, a real WS socket (fd >= 0)
+    // must authenticate with a first {"cmd":"auth","args":{"token":"..."}}
+    // message before any other command runs — the token rides a WS frame, not
+    // the URL. The remote/cloud sentinel fd (< 0) has its own auth + allow-list
+    // and bypasses this gate.
+    if (s_auth_enabled && fd >= 0 && !ws_server_fd_is_authed(fd)) {
+        if (strcmp(cmd, "auth") == 0) {
+            if (auth_check_token(doc["args"]["token"] | "")) {
+                ws_server_fd_set_authed(fd);
+                char ok[96];
+                int n = id_var.is<const char*>()
+                    ? snprintf(ok, sizeof(ok), "{\"id\":\"%s\",\"ok\":true}",
+                               id_var.as<const char*>())
+                    : snprintf(ok, sizeof(ok), "{\"id\":null,\"ok\":true}");
+                if (n > 0 && (size_t)n < sizeof(ok)) ws_server_reply(fd, ok, (size_t)n);
+            } else {
+                send_envelope_error(fd, id_var, "auth failed");
+            }
+            return;
+        }
+        send_envelope_error(fd, id_var, "auth required");
+        return;
+    }
     const WsCmd* entry = ws_lookup(cmd);
     if (!entry) {
         send_envelope_error(fd, id_var, "unknown cmd");

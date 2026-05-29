@@ -530,11 +530,11 @@ void task_hap(void*) {
                         xSemaphoreGive(s_alert_log_mutex);
                         alert_log_schedule_persist();
                     }
-                    ws_event_broadcast("alert.fired",
-                                        reinterpret_cast<const char*>(f.payload),
-                                        f.payload_len);
-                    // SPA alerts store subscribes to this so new entries
-                    // appear without polling `alerts.get`.
+                    // F48 (FINDINGS.md): the legacy "alert.fired" broadcast had
+                    // zero consumers (the SPA listens to "alert.added"; cloud +
+                    // MQTT get the bare "alert" topic below) — removed as dead
+                    // weight. SPA alerts store subscribes to "alert.added" so
+                    // new entries appear without polling `alerts.get`.
                     ws_event_broadcast("alert.added",
                                         reinterpret_cast<const char*>(f.payload),
                                         f.payload_len);

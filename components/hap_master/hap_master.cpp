@@ -105,7 +105,7 @@ void hap_master_init() {
 
     s_spi_mutex = xSemaphoreCreateMutex();
     configASSERT(s_spi_mutex);
-    ESP_LOGI(TAG, "hap_master init OK — SPI2 master 10 MHz, DRDY GPIO%d", PIN_DRDY);
+    ESP_LOGI(TAG, "hap_master init OK — SPI2 master 8 MHz, DRDY GPIO%d", PIN_DRDY);  // F48: matches clock_speed_hz (was a stale "10 MHz")
 }
 
 static void do_two_stage_exchange(const HapFrame& my_frame) {
