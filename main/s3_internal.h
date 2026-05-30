@@ -256,6 +256,9 @@ void      task_http(void*);
 
 // ── Functions defined in ws_bridge.cpp ───────────────────────────────────
 void on_ws_rx(int fd, const char* data, size_t len);
+// F33: start the WS broadcast TX worker (decouples event producers from the
+// per-client fan-out). Call once at boot before RX can trigger broadcasts.
+void ws_bridge_tx_init();
 void on_mqtt_rx(const char* topic, int topic_len, const char* data, int data_len);
 
 // Broadcast a server-initiated event to every connected WS client as

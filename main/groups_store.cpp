@@ -25,20 +25,29 @@ static uint32_t grp_get_bmp(nvs_handle_t h) {
 // Write a JSON-escaped string into buf[pos..cap), returning bytes written.
 // Handles: backslash, double-quote, control chars (\n, \r, \t), and other <0x20 as \u00XX.
 static size_t json_write_str(const char* s, char* buf, size_t pos, size_t cap) {
+    // DS14/Q14 (findings): the previous loop guarded only `pos < cap` at the top
+    // but the 2-byte escapes below write TWO bytes — a 1-byte overflow past `cap`
+    // when pos == cap-1 on an escaped char at the boundary. Check the exact byte
+    // count needed per character before writing.
     size_t start = pos;
-    for (const char* p = s; *p && pos < cap; p++) {
+    for (const char* p = s; *p; p++) {
         unsigned char c = *p;
-        if (c == '"')       { buf[pos++] = '\\'; buf[pos++] = '"';  }
-        else if (c == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
-        else if (c == '\n') { buf[pos++] = '\\'; buf[pos++] = 'n';  }
-        else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r';  }
-        else if (c == '\t') { buf[pos++] = '\\'; buf[pos++] = 't';  }
-        else if (c < 0x20)  {
+        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
+            if (pos + 2 > cap) break;
+            buf[pos++] = '\\';
+            buf[pos++] = (c == '"')  ? '"' :
+                         (c == '\\') ? '\\' :
+                         (c == '\n') ? 'n' :
+                         (c == '\r') ? 'r' : 't';
+        } else if (c < 0x20) {
+            if (pos + 6 > cap) break;   // \u00XX = 6 bytes
             int n = snprintf(buf + pos, cap - pos, "\\u%04x", c);
-            if (n < 0 || (size_t)n > cap - pos) break;
+            if (n < 0) break;
             pos += (size_t)n;
+        } else {
+            if (pos + 1 > cap) break;
+            buf[pos++] = (char)c;
         }
-        else { buf[pos++] = c; }
     }
     return pos - start;
 }

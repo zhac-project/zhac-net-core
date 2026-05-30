@@ -3,9 +3,16 @@
 #include "ws_server.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <cstring>
+#include <cstdlib>
+
+// DS10 (DS_FINDINGS): cap on an inbound WS text frame. Covers rule DSL +
+// script.check Lua source; frames beyond this are dropped (a misbehaving/hostile
+// client can't force a huge per-frame allocation).
+#define WS_RX_MAX (8 * 1024)
 
 static const char*       TAG      = "ws_server";
 static httpd_handle_t    s_server = nullptr;
@@ -71,6 +78,13 @@ void ws_server_fd_set_authed(int fd) {
     }
     xSemaphoreGive(s_mutex);
 }
+// Q48 (QWEN_FINDINGS triage): drop all per-fd auth so a token rotation actually
+// invalidates live sessions — old-token sockets must re-auth with the new token.
+void ws_server_fd_deauth_all() {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_fd_count; i++) s_fd_authed[i] = false;
+    xSemaphoreGive(s_mutex);
+}
 
 static esp_err_t ws_handler(httpd_req_t* req) {
     int fd = httpd_req_to_sockfd(req);
@@ -110,18 +124,32 @@ static esp_err_t ws_handler(httpd_req_t* req) {
         add_fd(fd, authed);
         return ESP_OK;
     }
-    uint8_t buf[256] = {};
+    // DS10 (DS_FINDINGS): the old fixed 256-byte stack buffer truncated/rejected
+    // any WS frame larger than 255 bytes (rule DSL, script.check Lua source) and
+    // a 2 KB+ stack buffer would risk the httpd task's canary on its deep call
+    // chains. Probe the length (max_len=0, no copy), then read the whole frame
+    // into a right-sized PSRAM buffer.
     httpd_ws_frame_t pkt{};
-    pkt.payload = buf;
-    esp_err_t ret = httpd_ws_recv_frame(req, &pkt, sizeof(buf));
-    if (ret != ESP_OK || pkt.type == HTTPD_WS_TYPE_CLOSE) {
-        remove_fd(fd);
-        return ret;
+    esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
+    if (ret != ESP_OK) { remove_fd(fd); return ret; }
+    if (pkt.type == HTTPD_WS_TYPE_CLOSE) { remove_fd(fd); return ESP_OK; }
+    if (pkt.type != HTTPD_WS_TYPE_TEXT || pkt.len == 0 || !s_rx_cb) return ESP_OK;
+    if (pkt.len > WS_RX_MAX) {
+        ESP_LOGW(TAG, "ws frame %u B exceeds cap %u — dropped",
+                 (unsigned)pkt.len, (unsigned)WS_RX_MAX);
+        return ESP_OK;
     }
-    if (pkt.type == HTTPD_WS_TYPE_TEXT && pkt.len > 0 && s_rx_cb) {
-        buf[pkt.len < sizeof(buf) ? pkt.len : sizeof(buf) - 1] = '\0';
+    uint8_t* buf = static_cast<uint8_t*>(
+        heap_caps_malloc(pkt.len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!buf) buf = static_cast<uint8_t*>(malloc(pkt.len + 1));
+    if (!buf) return ESP_ERR_NO_MEM;
+    pkt.payload = buf;
+    ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
+    if (ret == ESP_OK) {
+        buf[pkt.len] = '\0';
         s_rx_cb(fd, reinterpret_cast<const char*>(buf), pkt.len);
     }
+    free(buf);
     return ret;
 }
 

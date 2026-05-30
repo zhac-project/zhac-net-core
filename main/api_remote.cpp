@@ -52,6 +52,10 @@ extern "C" ApiStatus api_remote_connect(const char* body, size_t body_len,
     const char* devid = doc["device_id"] | "";
 
     if (!url[0] || !token[0]) return API_BAD_REQUEST;
+    // DS9 (DS_FINDINGS): require a TLS WebSocket scheme. A ws:// URL would carry
+    // the bearer token + the full device-control surface in cleartext — the
+    // esp_crt_bundle server-cert verification only applies to wss://.
+    if (strncmp(url, "wss://", 6) != 0) return API_BAD_REQUEST;
     if (strlen(url) >= REMOTE_NVS_URL_MAX) return API_BAD_REQUEST;
     if (strlen(token) >= REMOTE_NVS_TOKEN_MAX) return API_BAD_REQUEST;
 

@@ -181,7 +181,13 @@ extern "C" bool auth_rotate_token(char* out, size_t out_cap) {
         return false;
     }
     memcpy(s_api_token, fresh, sizeof(fresh));
-    if (s_auth_enabled) ws_server_set_api_token(s_api_token);
+    if (s_auth_enabled) {
+        ws_server_set_api_token(s_api_token);
+        // Q48 (QWEN_FINDINGS triage): force sockets that authed with the OLD
+        // token to re-authenticate — otherwise rotation doesn't invalidate live
+        // sessions (the per-fd authed flags from F18 would persist).
+        ws_server_fd_deauth_all();
+    }
     memcpy(out, fresh, sizeof(fresh));
     ESP_LOGW(TAG, "API token rotated");
     return true;
@@ -860,6 +866,7 @@ extern "C" void app_main() {
     xTaskCreatePinnedToCore(task_hap,   "TaskHAP",   zhac::stack::kHapS3, nullptr, 5, nullptr, 1);
     xTaskCreate(             task_http, "TaskHTTP",  zhac::stack::kHttp, nullptr, 3, nullptr);
     alert_persist_task_init();
+    ws_bridge_tx_init();   // F33: WS broadcast TX worker (before RX can trigger events)
     ws_server_set_rx_callback(on_ws_rx);
     {
         // Wire the MQTT rx callback unconditionally. The subscribe

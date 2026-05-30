@@ -188,7 +188,15 @@ static void load_or_gen_ap_pass(void) {
         }
         nvs_close(h);
     }
-    if (!s_ap_pass[0]) strncpy(s_ap_pass, "zhacsetup", sizeof(s_ap_pass) - 1);
+    if (!s_ap_pass[0]) {
+        // Q61 (QWEN_FINDINGS triage): NVS unavailable (open failed above) — fall
+        // back to a random per-boot PSK, never the well-known "zhacsetup". Not
+        // persisted (NVS is down) so it differs each boot, but it's serial-printed
+        // below, so the operator still learns it — and it's never guessable.
+        uint8_t r[6];
+        esp_fill_random(r, sizeof(r));
+        for (int i = 0; i < 6; i++) snprintf(s_ap_pass + i * 2, 3, "%02x", r[i]);
+    }
 }
 
 static void configure_ap(void) {

@@ -25,6 +25,9 @@ int              ws_server_client_count();
 // only the `auth` command until ws_server_fd_set_authed() is called for it.
 bool             ws_server_fd_is_authed(int fd);
 void             ws_server_fd_set_authed(int fd);
+// Q48: clear every client's authed flag (e.g. on token rotation) so sockets that
+// authenticated with the now-stale token must re-auth with the new one.
+void             ws_server_fd_deauth_all();
 
 // ── Reply hook for sentinel fds ─────────────────────────────────────────
 //

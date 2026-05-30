@@ -6,6 +6,9 @@
 #include <cstdio>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include <atomic>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
@@ -237,6 +240,36 @@ static void evt_mutex_init_once() {
     }
 }
 
+// F33 (FINDINGS.md): dedicated WS-TX worker. ws_server_broadcast loops
+// httpd_ws_send_frame_async per fd; that call queues work onto the single httpd
+// task, and when a slow client backs that queue up it blocks the CALLER. Running
+// it on the producer task (TaskHAP, log pipeline, alerts, event_bus drain) is
+// the head-of-line landmine F33 flags. Producers now format a snapshot, hand it
+// to this bounded queue, and return; the worker owns the fan-out + frees the
+// snapshot. Overflow drops (rather than blocks a producer) — counted, not logged.
+struct WsTxItem { char* json; size_t len; };
+static constexpr int     WS_TX_QUEUE_DEPTH = 24;
+static QueueHandle_t          s_ws_tx_q     = nullptr;
+static std::atomic<uint32_t>  s_ws_tx_drops{0};   // best-effort drop counter (multi-producer)
+
+static void ws_tx_worker(void*) {
+    WsTxItem item;
+    for (;;) {
+        if (xQueueReceive(s_ws_tx_q, &item, portMAX_DELAY) == pdTRUE && item.json) {
+            ws_server_broadcast(item.json, item.len);
+            free(item.json);
+        }
+    }
+}
+
+void ws_bridge_tx_init() {
+    if (s_ws_tx_q) return;   // boot-time, single-threaded — idempotent guard
+    s_ws_tx_q = xQueueCreate(WS_TX_QUEUE_DEPTH, sizeof(WsTxItem));
+    if (s_ws_tx_q) {
+        xTaskCreate(ws_tx_worker, "ws_tx", 3072, nullptr, 4, nullptr);
+    }
+}
+
 void ws_event_broadcast(const char* name, const char* payload_json, size_t payload_len) {
     evt_mutex_init_once();
     if (xSemaphoreTake(s_evt_mutex, portMAX_DELAY) != pdTRUE) return;
@@ -281,15 +314,25 @@ void ws_event_broadcast(const char* name, const char* payload_json, size_t paylo
     }
     xSemaphoreGive(s_evt_mutex);
 
-    if (local && send_len > 0) ws_server_broadcast(local, send_len);
+    // F33: hand the local fan-out to the WS-TX worker so a slow socket can't
+    // back up this producer. Ownership of `local` transfers to the queue; the
+    // worker frees it. On a full / not-yet-started queue, drop + free rather than
+    // block — and NO ESP_LOG here (this path runs on the log pipeline; logging
+    // would recurse).
+    if (local && send_len > 0) {
+        WsTxItem item{ local, send_len };
+        if (!s_ws_tx_q || xQueueSend(s_ws_tx_q, &item, 0) != pdTRUE) {
+            s_ws_tx_drops.fetch_add(1, std::memory_order_relaxed);
+            free(local);
+        }
+    } else if (local) {
+        free(local);
+    }
 
-    // Mirror to remote channel if enabled + allow-listed.
-    // The call is an inline no-op when ZHAC_REMOTE_CLIENT_ENABLE is off,
-    // and an atomic-load + branch when on but not READY. Hot-path
-    // overhead is below measurement noise on the LAN-only build.
+    // Mirror to remote channel if enabled + allow-listed. Non-blocking
+    // (atomic-load + branch when on but not READY; inline no-op when the remote
+    // feature is compiled out) — stays inline.
     remote_client_publish_event(name, payload_json, payload_len);
-
-    if (local) free(local);
 }
 
 // Called from httpd task context — keep work minimal, no blocking calls.
