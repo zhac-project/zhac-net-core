@@ -53,6 +53,11 @@ constexpr const char* kRemotePrivilegedCmds[] = {
 };
 
 constexpr const char* kRemoteAllowedEvents[] = {
+    // NOTE: these must match the names hap_bridge.cpp actually broadcasts. The live attribute
+    // stream is "attr.bulk" (the ~100 ms coalescer) — without it the cloud shadow never sees
+    // on/off / sensor changes and can only refresh on reconnect. "device.attribute_change" below
+    // is not currently emitted (kept for forward-compat).
+    "attr.bulk",
     "device.added", "device.removed", "device.attribute_change",
     "device.online", "device.offline", "device.renamed",
     "device.configure_progress", "device.bound", "device.unbound",
