@@ -32,6 +32,7 @@
 #include "esp_random.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "ArduinoJson.h"
@@ -325,6 +326,17 @@ static void drain_tx_queue() {
     }
 }
 
+// True when the STA interface currently holds a non-zero IPv4 lease. Used to self-heal a missed
+// EVB_WIFI_UP edge (see the IDLE_NO_WIFI case): app_main posts EVB_WIFI_UP on IP_EVENT_STA_GOT_IP,
+// but if got-IP fired before this task processed EVB_ENABLE the one-shot bit is lost and we would
+// otherwise sit in IDLE_NO_WIFI forever despite a live STA.
+static bool sta_has_ip() {
+    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta == nullptr) return false;
+    esp_netif_ip_info_t ip{};
+    return esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0;
+}
+
 static void task_remote_body(void*) {
     // Initial event: ENABLE if cfg says so, otherwise stay DISABLED.
     if (s_cfg.enabled && s_cfg.url[0] && s_cfg.token[0]) {
@@ -379,6 +391,11 @@ static void task_remote_body(void*) {
             case REMOTE_STATE_IDLE_NO_WIFI:
                 s_running.store(false);
                 stop_ws_client();
+                // Self-heal a missed EVB_WIFI_UP edge: if the STA already has an IP (got-IP fired
+                // before we processed EVB_ENABLE, so the one-shot bit was lost), promote to
+                // CONNECTING. This case re-runs every ~1 s on the wait-bits timeout, so recovery
+                // is bounded to ~1 s without relying on a fresh wifi event.
+                if (sta_has_ip()) step(REMOTE_EV_WIFI_UP);
                 break;
 
             case REMOTE_STATE_CONNECTING:
