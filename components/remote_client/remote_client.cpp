@@ -298,6 +298,12 @@ static void start_ws_client() {
     cfg.network_timeout_ms = 10 * 1000;
     cfg.disable_auto_reconnect = true;  // we run our own backoff
     cfg.crt_bundle_attach  = esp_crt_bundle_attach;
+    // The TLS handshake — including X.509 chain verification (RSA bignum, up to the RSA-4096
+    // ISRG root for a Let's Encrypt cert) — runs in the esp_websocket_client task. The default
+    // WEBSOCKET_TASK_STACK_SIZE (~4 KiB) overflows there: a plaintext endpoint bails before any
+    // cert math, but a real wss:// chain triggers a "Stack canary watchpoint (websocket_task)"
+    // panic. 10 KiB gives the verify path comfortable headroom.
+    cfg.task_stack         = 10 * 1024;
 
     s_ws = esp_websocket_client_init(&cfg);
     if (!s_ws) { ESP_LOGE(TAG, "ws_client_init failed"); return; }
