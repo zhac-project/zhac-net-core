@@ -252,8 +252,18 @@ static void handle_rx_frame(const char* data, size_t len) {
         if (s_auth_id != 0 && id == s_auth_id) {
             bool ok = doc["ok"] | false;
             s_auth_id = 0;   // consume — one reply per request
-            if (ok) xEventGroupSetBits(s_remote_evt, EVB_AUTH_OK);
-            else {
+            if (ok) {
+                // Enter READY here, not on the next main-loop pass. The cloud pipelines the first
+                // command (reconcile's device.list) right behind the auth ack, and both frames are
+                // commonly drained in THIS same rx pass — so the very next handle_rx_frame() must see
+                // READY or it would drop device.list as an unexpected auth-state frame (→ the cloud
+                // waits out its 10 s request timeout and reconcile fails). The main loop still runs
+                // the READY-entry side effects (s_running / connected_since / TX drain) when it
+                // observes EVB_AUTH_OK. handle_rx_frame() only ever runs on the main task, so this
+                // store does not race the step() writer.
+                s_state.store(REMOTE_STATE_READY, std::memory_order_release);
+                xEventGroupSetBits(s_remote_evt, EVB_AUTH_OK);
+            } else {
                 s_auth_fails.fetch_add(1);
                 xEventGroupSetBits(s_remote_evt, EVB_AUTH_FAIL);
             }
