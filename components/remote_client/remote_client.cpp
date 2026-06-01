@@ -87,6 +87,7 @@ static constexpr EventBits_t EVB_WSS_EVENT    = 1 << 4;
 static constexpr EventBits_t EVB_AUTH_OK      = 1 << 5;
 static constexpr EventBits_t EVB_AUTH_FAIL    = 1 << 6;
 static constexpr EventBits_t EVB_BACKOFF_DONE = 1 << 7;
+static constexpr EventBits_t EVB_TX           = 1 << 8; // RX/TX frame pending — wake the loop to drain the queues now
 
 // Persistent config (loaded from NVS, refreshed on _enable()).
 struct RemoteCfg {
@@ -157,6 +158,10 @@ extern "C" void remote_client_publish_event(const char* name,
             s_tx_drops.fetch_add(1);
         }
     }
+    // Wake the remote task so it drains + sends this frame promptly. Without this it sleeps in
+    // xEventGroupWaitBits until the 1 s timeout, adding up to ~1 s of latency to every forwarded
+    // event (e.g. the attr.bulk live-state stream to the cloud).
+    if (s_remote_evt) xEventGroupSetBits(s_remote_evt, EVB_TX);
 }
 
 extern "C" void remote_client_get_status(RemoteStatusSnap* out) {
@@ -202,6 +207,10 @@ static void ws_event_handler(void* /*arg*/, esp_event_base_t /*base*/,
                 if (xQueueSend(s_rx_queue, &item, 0) != pdTRUE) {
                     heap_caps_free(copy);
                 }
+                // Wake the remote task to drain + dispatch RX now, instead of waiting out the 1 s
+                // xEventGroupWaitBits timeout — that delay is why cloud commands/reconcile felt
+                // ~1 s slow while the local ws_server path (no queue) is instant.
+                xEventGroupSetBits(s_remote_evt, EVB_TX);
             }
             break;
         default: break;
@@ -361,7 +370,7 @@ static void task_remote_body(void*) {
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_remote_evt,
             EVB_ENABLE | EVB_DISABLE | EVB_WIFI_UP | EVB_WIFI_DOWN |
-            EVB_WSS_EVENT | EVB_AUTH_OK | EVB_AUTH_FAIL | EVB_BACKOFF_DONE,
+            EVB_WSS_EVENT | EVB_AUTH_OK | EVB_AUTH_FAIL | EVB_BACKOFF_DONE | EVB_TX,
             pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
 
         // Map bits -> RemoteEvent and step state machine.
