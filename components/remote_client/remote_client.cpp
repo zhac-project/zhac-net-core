@@ -455,6 +455,15 @@ static void task_remote_body(void*) {
                 break;
 
             case REMOTE_STATE_READY: {
+                // Detect a dropped socket EVERY tick, not only when a WSS event happens to be set.
+                // A silent drop — or a DISCONNECTED event whose is_connected race we missed — would
+                // otherwise pin us in READY, retrying sends into a dead socket forever ("Websocket
+                // client is not connected") and forcing a manual remote.disconnect/connect. The
+                // ~1 s wait-bits timeout re-runs this, bounding recovery → BACKOFF → auto-reconnect.
+                if (s_ws && !esp_websocket_client_is_connected(s_ws)) {
+                    step(REMOTE_EV_WSS_ERROR);
+                    break;   // don't drain TX into a dead socket
+                }
                 s_running.store(true);
                 s_attempt = 0;
                 if (s_connected_since.load() == 0) {
@@ -467,10 +476,6 @@ static void task_remote_body(void*) {
                         esp_websocket_client_send_text(s_ws, tx.json, tx.len, pdMS_TO_TICKS(2000));
                     }
                     heap_caps_free(tx.json);
-                }
-                if (bits & EVB_WSS_EVENT &&
-                    s_ws && !esp_websocket_client_is_connected(s_ws)) {
-                    step(REMOTE_EV_WSS_ERROR);
                 }
                 break;
             }
