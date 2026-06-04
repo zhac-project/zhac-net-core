@@ -171,6 +171,13 @@ static HapWaiter         s_waiters[kHapWaiterCount];
 static SemaphoreHandle_t s_waiter_table_mutex = nullptr;
 static SemaphoreHandle_t s_waiter_free_sem    = nullptr;
 
+// Data requests are sent HAP_FLAG_NO_ACK, so the window/retransmit-based
+// on_link_dead never fires for them. Track consecutive roundtrip timeouts as
+// an independent data-link liveness signal: a streak ⇒ presume the link dead
+// and force a re-SYNC (see hap_roundtrip_v2 tail).
+static std::atomic<uint8_t>   s_roundtrip_dead_streak{0};
+static constexpr uint8_t      HAP_ROUNDTRIP_DEAD_STREAK = 3; // consecutive timeouts ⇒ link presumed dead
+
 // Claim one free slot under the table mutex. Caller must already have
 // decremented s_waiter_free_sem so a free slot exists — we just find it.
 static HapWaiter* waiter_claim(uint16_t seq, HapMsgType rsp_type,
@@ -281,9 +288,24 @@ bool hap_roundtrip_v2(HapMsgType type,
     const bool got = xSemaphoreTake(w->sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     const bool ok  = got && w->ok;
     waiter_release(w);
-    if (!got) {
+    if (got) {
+        // A reply arrived ⇒ the data link is alive; clear the dead-link streak.
+        s_roundtrip_dead_streak.store(0, std::memory_order_relaxed);
+    } else {
         ESP_LOGW(TAG, "hap_roundtrip_v2 timeout type=0x%02x seq=%u after %" PRIu32 "ms",
                  static_cast<uint8_t>(type), seq, timeout_ms);
+        // Data requests are NO_ACK, so the window-based on_link_dead never fires for them.
+        // Repeated roundtrip timeouts while heartbeats still flow = a half-dead link (P4 tore
+        // its session down and is awaiting SYNC). Force a re-SYNC to recover — clearing s_synced
+        // makes the hap_task loop resend SYNC_REQ. exchange() so we only act on the true→false edge.
+        const uint8_t streak = static_cast<uint8_t>(
+            s_roundtrip_dead_streak.fetch_add(1, std::memory_order_relaxed) + 1);
+        if (streak >= HAP_ROUNDTRIP_DEAD_STREAK &&
+            s_synced.exchange(false, std::memory_order_acq_rel)) {
+            ESP_LOGE(TAG, "HAP data link dead — %u consecutive roundtrip timeouts, forcing re-SYNC",
+                     streak);
+            s_roundtrip_dead_streak.store(0, std::memory_order_relaxed);
+        }
     }
     return ok;
 }
