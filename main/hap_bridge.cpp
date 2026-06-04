@@ -290,7 +290,7 @@ bool hap_roundtrip_v2(HapMsgType type,
     waiter_release(w);
     if (got) {
         // A reply arrived ⇒ the data link is alive; clear the dead-link streak.
-        s_roundtrip_dead_streak.store(0, std::memory_order_relaxed);
+        s_roundtrip_dead_streak.store(0, std::memory_order_release);
     } else {
         ESP_LOGW(TAG, "hap_roundtrip_v2 timeout type=0x%02x seq=%u after %" PRIu32 "ms",
                  static_cast<uint8_t>(type), seq, timeout_ms);
@@ -299,12 +299,12 @@ bool hap_roundtrip_v2(HapMsgType type,
         // its session down and is awaiting SYNC). Force a re-SYNC to recover — clearing s_synced
         // makes the hap_task loop resend SYNC_REQ. exchange() so we only act on the true→false edge.
         const uint8_t streak = static_cast<uint8_t>(
-            s_roundtrip_dead_streak.fetch_add(1, std::memory_order_relaxed) + 1);
+            s_roundtrip_dead_streak.fetch_add(1, std::memory_order_release) + 1);
         if (streak >= HAP_ROUNDTRIP_DEAD_STREAK &&
             s_synced.exchange(false, std::memory_order_acq_rel)) {
             ESP_LOGE(TAG, "HAP data link dead — %u consecutive roundtrip timeouts, forcing re-SYNC",
                      streak);
-            s_roundtrip_dead_streak.store(0, std::memory_order_relaxed);
+            s_roundtrip_dead_streak.store(0, std::memory_order_release);
         }
     }
     return ok;
