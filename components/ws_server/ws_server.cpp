@@ -322,7 +322,9 @@ void ws_server_broadcast(const char* json, size_t len) {
     esp_err_t failed_err[MAX_WS_CLIENTS];
     int       n_failed = 0;
 
+    configASSERT(s_broadcast_task.load(std::memory_order_acquire) == nullptr); // single-broadcaster invariant (TX worker only)
     s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+    // NOTE: no early returns between the guard stores — in_broadcast must clear.
     for (int i = 0; i < count; i++) {
         esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &pkt);
         if (ret != ESP_OK) {
