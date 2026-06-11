@@ -9,8 +9,10 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -29,7 +31,14 @@ static const char* TAG = "wifi_mgr";
 
 // ── Internal state ───────────────────────────────────────────────────────
 static bool            s_ap_mode       = false;
-static int             s_retry_count   = 0;
+// T16 (FINDINGS §5.1): retry counter is touched from the esp_event task
+// (incremented in STA_DISCONNECTED, reset in STA_GOT_IP) and read nowhere
+// else after the backoff was moved off the loop — the reconnect timer cb
+// no longer inspects it. std::atomic is kept as a defensive belt: the
+// timer arming and the handler both run as short, non-overlapping critical
+// regions, so there is no torn read, but atomicity costs nothing here and
+// documents the cross-context intent.
+static std::atomic<int> s_retry_count{0};
 // F38 (FINDINGS.md): raised 5 → 20 so a transient AP/handshake blip can't
 // wipe valid credentials. Only sustained failure (~160 s given the backoff
 // below) clears them, and the AP stays up for manual re-provision regardless.
@@ -43,8 +52,26 @@ static esp_netif_t*    s_netif_ap      = nullptr;
 
 // Scan results — PSRAM: ~1.6 KB, written once per user-triggered scan
 // (esp_wifi_scan_get_ap_records runs in task context, never ISR/DMA).
+// T16 (FINDINGS §5.2): wifi.scan is remote-allow-listed, so the local httpd
+// task and the remote-client task can both drive a scan concurrently. The
+// trigger+write and the snapshot read are serialised under s_scan_mtx so a
+// concurrent scan can't tear the array out from under a reader.
 EXT_RAM_BSS_ATTR static wifi_ap_record_t s_scan_results[20];
-static uint16_t         s_scan_count = 0;
+static uint16_t           s_scan_count = 0;
+static SemaphoreHandle_t  s_scan_mtx   = nullptr;
+
+// T16 (FINDINGS §5.1): one-shot reconnect timer. The STA_DISCONNECTED handler
+// runs in the default esp_event task and must NEVER sleep — a vTaskDelay there
+// stalls IP/AP events, MQTT bring-up and remote_client wifi bits for the whole
+// backoff (up to 60 s). Instead the handler arms this timer with the computed
+// backoff and returns; the callback (esp_timer task, NOT an ISR) issues the
+// reconnect.
+static esp_timer_handle_t s_reconnect_timer = nullptr;
+
+// T16 (FINDINGS §5.3): shared across both AP-start paths AND the DNS task so
+// the task can clear it on clean exit and a later AP-enable can respawn it.
+// Was two independent function-local statics (could never re-arm correctly).
+static bool               s_dns_started = false;
 
 // ── Forward declarations ─────────────────────────────────────────────────
 static void start_ap_mode(void);
@@ -54,6 +81,8 @@ static void task_dns_captive(void*);
 static void task_gpio_reset(void*);
 static bool load_ap_disabled(void);
 static void clear_sta_creds(void);
+static void reconnect_timer_cb(void*);
+static void arm_reconnect_timer(uint32_t backoff_ms);
 
 // ── Event handler ────────────────────────────────────────────────────────
 static void wifi_event_handler(void*, esp_event_base_t base,
@@ -62,7 +91,7 @@ static void wifi_event_handler(void*, esp_event_base_t base,
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_connected.store(false, std::memory_order_release);
-        s_retry_count++;
+        const int retry = s_retry_count.fetch_add(1, std::memory_order_acq_rel) + 1;
         auto* ev = static_cast<wifi_event_sta_disconnected_t*>(event_data);
         uint8_t reason = ev ? ev->reason : 0;
         const char* reason_str;
@@ -91,22 +120,28 @@ static void wifi_event_handler(void*, esp_event_base_t base,
         const bool credential_error =
             (reason == WIFI_REASON_AUTH_FAIL ||
              reason == WIFI_REASON_HANDSHAKE_TIMEOUT);
-        if (credential_error && s_retry_count > MAX_STA_RETRIES) {
+        if (credential_error && retry > MAX_STA_RETRIES) {
             ESP_LOGE(TAG, "STA failed after %d retries (last: %s, code=%u) — clearing credentials, AP stays up", MAX_STA_RETRIES, reason_str, reason);
             clear_sta_creds();
             // Keep AP running; don't restart WiFi stack (avoids httpd socket churn)
             return;
         }
-        ESP_LOGW(TAG, "STA disconnected %d: %s (code=%u)", s_retry_count, reason_str, reason);
+        ESP_LOGW(TAG, "STA disconnected %d: %s (code=%u)", retry, reason_str, reason);
         // Backoff: 2 s for the first 5 retries, 10 s for 5..30, 60 s thereafter.
+        // T16 (FINDINGS §5.1): schedule the reconnect via a one-shot timer
+        // instead of sleeping here — this handler runs in the esp_event task.
+        // Schedule is unchanged; only WHERE the wait happens moved.
         uint32_t backoff_ms = 2000;
-        if      (s_retry_count > 30) backoff_ms = 60000;
-        else if (s_retry_count >  5) backoff_ms = 10000;
-        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-        esp_wifi_connect();
+        if      (retry > 30) backoff_ms = 60000;
+        else if (retry >  5) backoff_ms = 10000;
+        arm_reconnect_timer(backoff_ms);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         auto* ev = static_cast<ip_event_got_ip_t*>(event_data);
-        s_retry_count = 0;
+        s_retry_count.store(0, std::memory_order_release);
+        // A reconnect may have been queued just before the link came up;
+        // cancel it so a stale timer can't fire esp_wifi_connect() on a
+        // healthy link (harmless but avoids a spurious disconnect churn).
+        if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
         s_wifi_connected.store(true, std::memory_order_release);
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&ev->ip_info.ip));
         ESP_LOGI(TAG, "STA connected — IP: %s", s_ip_str);
@@ -139,6 +174,44 @@ static void wifi_event_handler(void*, esp_event_base_t base,
         auto* ev = static_cast<wifi_event_ap_stadisconnected_t*>(event_data);
         ESP_LOGI(TAG, "AP: station " MACSTR " left (aid=%d)",
                  MAC2STR(ev->mac), ev->aid);
+    }
+}
+
+// ── Reconnect backoff (off the event loop) ─────────────────────────────────
+// T16 (FINDINGS §5.1): runs in the esp_timer task (task dispatch, NOT an ISR),
+// so calling esp_wifi_connect() here is safe. Keep it short.
+static void reconnect_timer_cb(void*) {
+    esp_wifi_connect();
+}
+
+// Arm the one-shot reconnect timer with @p backoff_ms. esp_timer_start_once
+// rejects an already-running timer, so stop it first (idempotent if idle).
+// Lazily created on first use.
+static void arm_reconnect_timer(uint32_t backoff_ms) {
+    if (!s_reconnect_timer) {
+        const esp_timer_create_args_t args = {
+            .callback              = &reconnect_timer_cb,
+            .arg                   = nullptr,
+            .dispatch_method       = ESP_TIMER_TASK,
+            .name                  = "wifi_reconnect",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &s_reconnect_timer) != ESP_OK) {
+            // Defensive: timer unavailable — fall back to an immediate
+            // reconnect so the STA still retries (no backoff, but never
+            // sleeps the event loop).
+            ESP_LOGE(TAG, "reconnect timer create failed — reconnecting now");
+            esp_wifi_connect();
+            return;
+        }
+    }
+    esp_timer_stop(s_reconnect_timer);  // no-op if not running
+    esp_err_t err = esp_timer_start_once(s_reconnect_timer,
+                                         (uint64_t)backoff_ms * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "reconnect timer start failed (%s) — reconnecting now",
+                 esp_err_to_name(err));
+        esp_wifi_connect();
     }
 }
 
@@ -259,7 +332,6 @@ static void start_ap_mode(void) {
     snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
     ESP_LOGI(TAG, "AP mode started — SSID: %s  IP: %s", s_ap_ssid, s_ip_str);
 
-    static bool s_dns_started = false;
     if (!s_dns_started) {
         s_dns_started = true;
         xTaskCreate(task_dns_captive, "TaskDNS", 3072, nullptr, 3, nullptr);
@@ -269,7 +341,7 @@ static void start_ap_mode(void) {
 // STA concurrent with AP (captive portal stays alive during connect attempts)
 static void start_sta_mode(const char* ssid, const char* pass) {
     s_ap_mode = true;  // AP stays up alongside STA
-    s_retry_count = 0;
+    s_retry_count.store(0, std::memory_order_release);
 
     configure_ap();
     configure_sta(ssid, pass);
@@ -280,7 +352,6 @@ static void start_sta_mode(const char* ssid, const char* pass) {
     snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
     ESP_LOGI(TAG, "APSTA started — AP: %s  connecting to STA: \"%s\"", s_ap_ssid, ssid);
 
-    static bool s_dns_started = false;
     if (!s_dns_started) {
         s_dns_started = true;
         xTaskCreate(task_dns_captive, "TaskDNS", 3072, nullptr, 3, nullptr);
@@ -295,9 +366,16 @@ static void task_dns_captive(void*) {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         ESP_LOGE(TAG, "DNS socket failed");
+        s_dns_started = false;  // allow a later AP-enable to respawn
         vTaskDelete(nullptr);
         return;
     }
+
+    // T16 (FINDINGS §5.3): bound the recv so the loop can poll s_ap_mode and
+    // exit promptly after AP-stop instead of blocking forever (leaking the
+    // socket + ~3 KB stack and wedging s_dns_started until a stray packet).
+    struct timeval rcv_to = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
 
     struct sockaddr_in saddr = {};
     saddr.sin_family      = AF_INET;
@@ -307,6 +385,7 @@ static void task_dns_captive(void*) {
     if (bind(sock, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
         ESP_LOGE(TAG, "DNS bind failed");
         close(sock);
+        s_dns_started = false;  // allow a later AP-enable to respawn
         vTaskDelete(nullptr);
         return;
     }
@@ -321,6 +400,10 @@ static void task_dns_captive(void*) {
     while (s_ap_mode) {
         clen = sizeof(caddr);
         int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr*)&caddr, &clen);
+        // Recv timeout (no packet within 1 s): re-check s_ap_mode and loop.
+        // EAGAIN/EWOULDBLOCK is the timeout; anything else is also non-fatal
+        // here — just re-poll the AP flag. The 1 s timeout paces the spin.
+        if (n < 0) continue;
         if (n < 12) continue;  // too short for DNS header
 
         // Build response: copy query, set response flags, append answer
@@ -359,7 +442,9 @@ static void task_dns_captive(void*) {
         sendto(sock, buf, off, 0, (struct sockaddr*)&caddr, clen);
     }
 
+    // AP was disabled — tear down cleanly so a later AP-enable can respawn.
     close(sock);
+    s_dns_started = false;
     ESP_LOGI(TAG, "DNS captive portal stopped");
     vTaskDelete(nullptr);
 }
@@ -410,6 +495,11 @@ static void task_gpio_reset(void*) {
 
 void wifi_mgr_init(void) {
     ESP_LOGI(TAG, "Initialising WiFi manager");
+
+    // T16 (FINDINGS §5.2): guards the shared scan-results array against
+    // concurrent local-httpd / remote-client scans. Created before any task
+    // that could trigger a scan is spawned.
+    if (!s_scan_mtx) s_scan_mtx = xSemaphoreCreateMutex();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -479,28 +569,42 @@ uint16_t wifi_mgr_scan(void) {
     wifi_scan_config_t scan_cfg = {};
     scan_cfg.show_hidden = true;
 
+    // T16 (FINDINGS §5.2): the blocking scan_start runs OUTSIDE the mutex —
+    // esp_wifi's scan engine is single-instance, so a concurrent caller's
+    // scan_start simply errors out (handled below) rather than corrupting
+    // shared state. The mutex is held only around the (non-blocking) results
+    // read-back and count store, which is the actual torn-data window.
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);  // blocking
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Scan start failed: %s", esp_err_to_name(err));
-        s_scan_count = 0;
         return 0;
     }
 
-    s_scan_count = sizeof(s_scan_results) / sizeof(s_scan_results[0]);
-    err = esp_wifi_scan_get_ap_records(&s_scan_count, s_scan_results);
+    uint16_t got = sizeof(s_scan_results) / sizeof(s_scan_results[0]);
+    if (s_scan_mtx) xSemaphoreTake(s_scan_mtx, portMAX_DELAY);
+    err = esp_wifi_scan_get_ap_records(&got, s_scan_results);
+    s_scan_count = (err == ESP_OK) ? got : 0;
+    const uint16_t count = s_scan_count;
+    if (s_scan_mtx) xSemaphoreGive(s_scan_mtx);
+
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Scan get results failed: %s", esp_err_to_name(err));
-        s_scan_count = 0;
         return 0;
     }
 
-    ESP_LOGI(TAG, "Scan complete: %u APs found", s_scan_count);
-    return s_scan_count;
+    ESP_LOGI(TAG, "Scan complete: %u APs found", count);
+    return count;
 }
 
-const wifi_ap_record_t* wifi_mgr_get_scan_results(uint16_t* count_out) {
-    if (count_out) *count_out = s_scan_count;
-    return s_scan_results;
+uint16_t wifi_mgr_get_scan_results(wifi_ap_record_t* out, uint16_t max) {
+    if (!out || max == 0) return 0;
+    // T16 (FINDINGS §5.2): copy a stable snapshot under the lock so a
+    // concurrent scan can't overwrite the array while the caller iterates.
+    if (s_scan_mtx) xSemaphoreTake(s_scan_mtx, portMAX_DELAY);
+    uint16_t n = s_scan_count < max ? s_scan_count : max;
+    memcpy(out, s_scan_results, (size_t)n * sizeof(s_scan_results[0]));
+    if (s_scan_mtx) xSemaphoreGive(s_scan_mtx);
+    return n;
 }
 
 void wifi_mgr_forget_and_reboot(void) {

@@ -7,6 +7,38 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Fixed — High / Medium / Low (P2 findings review, T16 wifi_mgr event-loop unblock)
+
+- **wifi_mgr** (High): the STA reconnect backoff did `vTaskDelay` (up to 60 s)
+  INSIDE the `WIFI_EVENT_STA_DISCONNECTED` handler, which runs in the default
+  `esp_event` loop task. Sleeping there stalled ALL system event dispatch for
+  the whole STA-down window — IP got-IP, AP join/leave, the MQTT bring-up
+  triggered off got-IP, and the remote_client wifi bits — and risked
+  event-queue overflow. The handler now computes the backoff and arms a
+  one-shot `esp_timer` (`wifi_reconnect`), then returns immediately; the timer
+  callback (esp_timer task, not an ISR) issues `esp_wifi_connect()`. The
+  backoff schedule is unchanged (2 s ≤5 retries, 10 s 6..30, 60 s after) — only
+  WHERE the wait happens moved. The retry counter is now `std::atomic<int>`
+  (defensive; still single-producer in the esp_event task) and got-IP cancels
+  any pending reconnect. (FINDINGS §5.1, :103)
+- **wifi_mgr** (Medium): `s_scan_results` / `s_scan_count` were unsynchronised
+  statics reachable concurrently from the local httpd task and `task_remote`
+  (`wifi.scan` is remote-allow-listed), so a concurrent scan could tear the
+  array out from under a reader. Added `s_scan_mtx`; the results read-back +
+  count store in `wifi_mgr_scan` is now mutex-guarded (the blocking
+  `esp_wifi_scan_start` stays outside the lock — esp_wifi's scan engine is
+  single-instance, so a concurrent start just errors), and
+  `wifi_mgr_get_scan_results` was changed to copy a stable snapshot into a
+  caller-owned buffer under the lock instead of returning the live pointer.
+  Caller (`api_wifi_scan`) updated to the snapshot API. (FINDINGS §5.2, :487)
+- **wifi_mgr** (Low): the captive-DNS task only re-checked `s_ap_mode` AFTER a
+  blocking `recvfrom`, so after AP-disable it lingered (socket + ~3 KB stack)
+  until a stray packet arrived, and the start guard then blocked respawn. The
+  socket now carries `SO_RCVTIMEO` (1 s); the recv loop re-checks `s_ap_mode`
+  each timeout and, on AP-stop, closes the socket, clears the (now file-scope)
+  `s_dns_started`, and deletes the task so a later AP-enable respawns it. The
+  1 s timeout paces the poll (no busy-spin). (FINDINGS §5.3, :319)
+
 ### Fixed — High / Medium (P2 findings review, T14 HAP correlation edges)
 
 - **hap_bridge** (High): the per-request-seq WAITER table (`hap_roundtrip_v2`)

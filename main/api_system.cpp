@@ -368,8 +368,13 @@ extern "C" ApiStatus api_wifi_scan(const char* /*body*/, size_t /*body_len*/,
                                     char* rsp_buf, size_t rsp_cap,
                                     size_t* rsp_len) {
     wifi_mgr_scan();
-    uint16_t count = 0;
-    const wifi_ap_record_t* results = wifi_mgr_get_scan_results(&count);
+    // T16 (FINDINGS §5.2): copy a stable snapshot of the scan results — the
+    // underlying array is shared with the remote-client task (wifi.scan is
+    // remote-allow-listed) and could be overwritten by a concurrent scan if
+    // we iterated the live static. Buffer matches the internal capacity (20).
+    static constexpr uint16_t kMaxAps = 20;
+    wifi_ap_record_t results[kMaxAps];
+    uint16_t count = wifi_mgr_get_scan_results(results, kMaxAps);
 
     int pos = 0;
     pos += snprintf(rsp_buf + pos, rsp_cap - pos, "{\"networks\":[");
