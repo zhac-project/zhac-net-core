@@ -74,6 +74,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   path: queue full / not started / snapshot alloc failure) so slow-client
   drop pressure is observable.
 
+**NEEDS HARDWARE TEST** — PING/PONG keepalive, RST slot reclaim via the
+httpd `close_fn`, and auth-gated broadcast filtering need on-device
+verification.
+
 ### Added — Per-device flood control
 
 - **device.options.set**: now accepts `throttle_ms` (per-device report
@@ -255,4 +259,3 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   image rolled back on every subsequent boot when rollback was
   enabled. `app_update` added to the main component REQUIRES for
   explicitness (transitively pulled by `esp_https_ota` already). (F-08)
-</content>
