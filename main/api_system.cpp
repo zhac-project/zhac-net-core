@@ -371,8 +371,8 @@ extern "C" ApiStatus api_wifi_scan(const char* /*body*/, size_t /*body_len*/,
     // T16 (FINDINGS §5.2): copy a stable snapshot of the scan results — the
     // underlying array is shared with the remote-client task (wifi.scan is
     // remote-allow-listed) and could be overwritten by a concurrent scan if
-    // we iterated the live static. Buffer matches the internal capacity (20).
-    static constexpr uint16_t kMaxAps = 20;
+    // we iterated the live static. Buffer matches the internal capacity.
+    static constexpr uint16_t kMaxAps = WIFI_MGR_MAX_SCAN;
     wifi_ap_record_t results[kMaxAps];
     uint16_t count = wifi_mgr_get_scan_results(results, kMaxAps);
 

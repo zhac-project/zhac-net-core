@@ -39,6 +39,13 @@ void wifi_mgr_get_ip_str(char* buf, size_t len);
 const char* wifi_mgr_get_ap_ssid(void);
 
 /**
+ * Maximum number of AP records retained by a single scan. The internal scan
+ * buffer and any caller-side snapshot buffer share this bound. Defined as a
+ * macro (not a constexpr) so this C-compatible header stays usable from C TUs.
+ */
+#define WIFI_MGR_MAX_SCAN 20
+
+/**
  * Perform a blocking WiFi scan and return the number of APs found.
  * After this call, use wifi_mgr_get_scan_results() to access the records.
  * Returns 0 on error.

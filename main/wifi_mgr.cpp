@@ -56,7 +56,7 @@ static esp_netif_t*    s_netif_ap      = nullptr;
 // task and the remote-client task can both drive a scan concurrently. The
 // trigger+write and the snapshot read are serialised under s_scan_mtx so a
 // concurrent scan can't tear the array out from under a reader.
-EXT_RAM_BSS_ATTR static wifi_ap_record_t s_scan_results[20];
+EXT_RAM_BSS_ATTR static wifi_ap_record_t s_scan_results[WIFI_MGR_MAX_SCAN];
 static uint16_t           s_scan_count = 0;
 static SemaphoreHandle_t  s_scan_mtx   = nullptr;
 
@@ -66,6 +66,7 @@ static SemaphoreHandle_t  s_scan_mtx   = nullptr;
 // backoff (up to 60 s). Instead the handler arms this timer with the computed
 // backoff and returns; the callback (esp_timer task, NOT an ISR) issues the
 // reconnect.
+// Never esp_timer_delete'd — process-lifetime singleton, reused per disconnect.
 static esp_timer_handle_t s_reconnect_timer = nullptr;
 
 // T16 (FINDINGS §5.3): shared across both AP-start paths AND the DNS task so
