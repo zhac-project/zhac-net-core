@@ -7,6 +7,53 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Fixed — WebSocket subsystem hardening (P1)
+
+- **ws_server**: broadcasts now skip sockets that opened `/ws` but never
+  authenticated (when a token is configured) — previously an unauthed socket
+  passively received every event: device states, alerts, log lines. The
+  `{"cmd":"auth"}` handshake reply is a targeted `ws_server_reply` and is
+  unaffected.
+- **ws_server**: send-failure handling in `ws_server_broadcast` no longer
+  logs inside the send loop. Failures are collected, the dead fd is removed
+  FIRST, and the warning logged after — with the WS log sink enabled the old
+  order re-entered the log pipeline against the same dead fd and recursed to
+  stack overflow. A per-task re-entry guard (`ws_server_in_broadcast`)
+  additionally drops WS-sink fan-out of any line logged from inside the
+  broadcast path. `ws_server_reply` gets the same remove-then-log ordering.
+- **log_ring**: the WS log sink no longer calls `ws_server_broadcast` from
+  the logging task (which stalled arbitrary tasks behind a slow client and
+  formed the recursion pair above) — it enqueues to the F33 WS-TX worker via
+  the new `ws_bridge_broadcast_enqueue()`, which never blocks and never logs
+  (drops are counted).
+- **ws_bridge**: event envelope was 2048 B while hap_bridge's attr.bulk
+  coalescer emits up to 4096 B — coalesced batches >~2 KB were silently
+  replaced with `data:null`, losing live updates under load.
+  `BULK_COALESCE_CAP` moved to `s3_internal.h`; the (PSRAM) envelope is now
+  sized `BULK_COALESCE_CAP + 128` with an ESP_LOGW on the now-unreachable
+  truncation fallback.
+- **ws_bridge**: `on_mqtt_rx` MQTT→WS mirroring and the `device_deleted`
+  event (api_devices) route through the WS-TX worker queue instead of
+  fanning out on the esp-mqtt / httpd task. `ws_server_broadcast` is now
+  called exclusively by the TX worker.
+- **ws_server**: registered an httpd `close_fn` — abnormal disconnects
+  (TCP RST, keepalive death, LRU purge) never hit `remove_fd`, leaking one
+  of the 3 client-table slots until a later send happened to fail. The hook
+  fires for every terminated session; `remove_fd` no-ops for non-WS fds.
+- **ws_server**: a `/ws` open beyond the 3-client table is now actively
+  closed (`httpd_sess_trigger_close` + warn) instead of staying half-alive
+  (could send commands, never received broadcasts).
+- **ws_server**: WS PING frames are answered with PONG again —
+  `handle_ws_control_frames` flipped to `false` so esp_http_server
+  auto-replies PONG/CLOSE per RFC 6455 (the old handler swallowed PING);
+  CLOSE teardown lands in the new `close_fn`.
+- **ws_bridge**: inbound envelope `args` larger than the 2 KB serialize
+  buffer were silently truncated into corrupt JSON — now measured first and
+  rejected with `err:"args too large"`.
+- **main**: `status.get` gains `ws_tx_drops` (frames dropped on the WS-TX
+  path: queue full / not started / snapshot alloc failure) so slow-client
+  drop pressure is observable.
+
 ### Added — Per-device flood control
 
 - **device.options.set**: now accepts `throttle_ms` (per-device report

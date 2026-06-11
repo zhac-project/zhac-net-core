@@ -6,8 +6,11 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
+#include <unistd.h>
 
 // DS10 (DS_FINDINGS): cap on an inbound WS text frame. Covers rule DSL +
 // script.check Lua source; frames beyond this are dropped (a misbehaving/hostile
@@ -31,20 +34,24 @@ static int  s_fd_count = 0;
 static int          s_hook_fd   = 0;       // 0 = unused (legal httpd fd value)
 static WsReplyHook  s_hook_func = nullptr;
 
-static void add_fd(int fd, bool authed) {
+// Returns false when the client table is full (caller closes the socket —
+// a slot-less socket would stay open, accept commands, yet never receive a
+// single broadcast: a half-functional zombie).
+static bool add_fd(int fd, bool authed) {
+    bool added = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
-        if (s_fds[i] == fd) { s_fd_authed[i] = authed; xSemaphoreGive(s_mutex); return; }
+        if (s_fds[i] == fd) { s_fd_authed[i] = authed; xSemaphoreGive(s_mutex); return true; }
     }
     if (s_fd_count < MAX_WS_CLIENTS) {
         s_fds[s_fd_count]       = fd;
         s_fd_authed[s_fd_count] = authed;
         s_fd_count++;
+        added = true;
         ESP_LOGI(TAG, "WS client added fd=%d authed=%d total=%d", fd, authed, s_fd_count);
-    } else {
-        ESP_LOGW(TAG, "WS client limit reached, rejecting fd=%d", fd);
     }
     xSemaphoreGive(s_mutex);
+    return added;
 }
 
 static void remove_fd(int fd) {
@@ -121,7 +128,13 @@ static esp_err_t ws_handler(httpd_req_t* req) {
                 authed = (diff == 0);
             }
         }
-        add_fd(fd, authed);
+        if (!add_fd(fd, authed)) {
+            // Table full: close the socket instead of leaving it half-alive
+            // (it could send commands but would never see a broadcast).
+            ESP_LOGW(TAG, "WS client limit (%d) reached, closing fd=%d",
+                     MAX_WS_CLIENTS, fd);
+            httpd_sess_trigger_close(s_server, fd);
+        }
         return ESP_OK;
     }
     // DS10 (DS_FINDINGS): the old fixed 256-byte stack buffer truncated/rejected
@@ -132,7 +145,10 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     httpd_ws_frame_t pkt{};
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
     if (ret != ESP_OK) { remove_fd(fd); return ret; }
-    if (pkt.type == HTTPD_WS_TYPE_CLOSE) { remove_fd(fd); return ESP_OK; }
+    // Control frames (PING/PONG/CLOSE) never reach this handler:
+    // handle_ws_control_frames is false, so httpd answers PING with PONG and
+    // replies to CLOSE itself (RFC 6455 5.5.1/5.5.2), then tears the session
+    // down — our close_fn does the table cleanup.
     if (pkt.type != HTTPD_WS_TYPE_TEXT || pkt.len == 0 || !s_rx_cb) return ESP_OK;
     if (pkt.len > WS_RX_MAX) {
         ESP_LOGW(TAG, "ws frame %u B exceeds cap %u — dropped",
@@ -159,9 +175,26 @@ static const httpd_uri_t s_ws_uri = {
     .handler                  = ws_handler,
     .user_ctx                 = nullptr,
     .is_websocket             = true,
-    .handle_ws_control_frames = true,
+    // false → httpd auto-replies PONG to PING and CLOSE to CLOSE (the old
+    // `true` setting claimed control-frame handling but swallowed PING
+    // without ever sending a PONG, so keepalive-probing clients timed out).
+    // Session teardown after CLOSE runs through close_fn below.
+    .handle_ws_control_frames = false,
     .supported_subprotocol    = nullptr,
 };
+
+// Registered as httpd_config_t::close_fn — fires on EVERY terminated session
+// (plain HTTP and WS alike; graceful CLOSE, TCP RST, keepalive death, LRU
+// purge). Without it an abnormal disconnect never reached remove_fd and the
+// 3-slot client table leaked until a later broadcast send happened to fail.
+// remove_fd() is a no-op for fds that never joined the WS table, so plain
+// HTTP sockets pass straight through. With a custom close_fn installed the
+// server no longer close()s the socket itself — we must do it here.
+static void ws_httpd_close_fn(httpd_handle_t hd, int sockfd) {
+    (void)hd;
+    remove_fd(sockfd);
+    close(sockfd);
+}
 
 void ws_server_init() {
     s_mutex = xSemaphoreCreateMutex();
@@ -203,6 +236,8 @@ void ws_server_init() {
     // trickle connections can't pin the small (9) socket pool indefinitely.
     cfg.recv_wait_timeout   = 10;
     cfg.send_wait_timeout   = 10;
+    // Slot cleanup on ANY socket close (see ws_httpd_close_fn above).
+    cfg.close_fn            = ws_httpd_close_fn;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");
@@ -239,16 +274,39 @@ int ws_server_client_count() {
     return n;
 }
 
+// Task currently inside ws_server_broadcast()'s send loop, nullptr when none.
+// The log pipeline checks this (ws_server_in_broadcast) and drops its WS-sink
+// fan-out for lines logged from within the broadcast path — defence-in-depth
+// against TX-path re-entry (e.g. esp_http_server's own ESP_LOG* inside
+// httpd_ws_send_frame_async). Single writer: only the ws_bridge TX worker
+// calls ws_server_broadcast.
+static std::atomic<TaskHandle_t> s_broadcast_task{nullptr};
+
+bool ws_server_in_broadcast() {
+    return s_broadcast_task.load(std::memory_order_acquire) ==
+           xTaskGetCurrentTaskHandle();
+}
+
 void ws_server_broadcast(const char* json, size_t len) {
     if (!s_server || !s_mutex) return;
 
     // Snapshot fd list outside the send loop so we don't hold the mutex
-    // while calling potentially blocking httpd API
+    // while calling potentially blocking httpd API.
+    //
+    // Auth gate: when a token is configured (token set ⇔ auth enabled — main
+    // clears it via ws_server_set_api_token(nullptr) on disable), sockets that
+    // opened /ws but never authenticated must NOT passively receive events
+    // (device states, alerts, log lines). The auth handshake reply itself is a
+    // targeted ws_server_reply(), never a broadcast, so gating here cannot
+    // break the {"cmd":"auth"} exchange.
     int  fds[MAX_WS_CLIENTS];
     int  count = 0;
+    const bool auth_on = (s_api_token[0] != '\0');
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    count = s_fd_count;
-    memcpy(fds, s_fds, count * sizeof(int));
+    for (int i = 0; i < s_fd_count; i++) {
+        if (auth_on && !s_fd_authed[i]) continue;
+        fds[count++] = s_fds[i];
+    }
     xSemaphoreGive(s_mutex);
 
     httpd_ws_frame_t pkt{};
@@ -256,12 +314,30 @@ void ws_server_broadcast(const char* json, size_t len) {
     pkt.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(json));
     pkt.len     = len;
 
+    // NO ESP_LOG inside the send loop — with the WS log sink enabled a log
+    // line re-enters the WS TX path, and logging a failure against a dead fd
+    // used to recurse (log → sink → broadcast → fail → log → …) until stack
+    // overflow. Collect failures, remove the dead fds FIRST, then log.
+    int       failed_fd[MAX_WS_CLIENTS];
+    esp_err_t failed_err[MAX_WS_CLIENTS];
+    int       n_failed = 0;
+
+    s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
     for (int i = 0; i < count; i++) {
         esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &pkt);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "ws_broadcast: send failed fd=%d err=%d", fds[i], ret);
-            remove_fd(fds[i]);
+            failed_fd[n_failed]  = fds[i];
+            failed_err[n_failed] = ret;
+            n_failed++;
         }
+    }
+    s_broadcast_task.store(nullptr, std::memory_order_release);
+
+    for (int i = 0; i < n_failed; i++) {
+        remove_fd(failed_fd[i]);   // cleanup first…
+        ESP_LOGW(TAG, "ws_broadcast: send failed fd=%d err=%d (removed)",
+                 failed_fd[i], failed_err[i]);   // …log after — bounded: the
+        // fd is already gone, so a re-broadcast of this line can't re-fail.
     }
 }
 
@@ -280,7 +356,9 @@ void ws_server_reply(int fd, const char* json, size_t len) {
     pkt.len     = len;
     esp_err_t ret = httpd_ws_send_frame_async(s_server, fd, &pkt);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "ws_reply: send failed fd=%d err=%d", fd, ret);
+        // Same ordering rule as the broadcast loop: drop the fd before
+        // touching the log pipeline.
         remove_fd(fd);
+        ESP_LOGW(TAG, "ws_reply: send failed fd=%d err=%d (removed)", fd, ret);
     }
 }

@@ -242,7 +242,9 @@ extern "C" ApiStatus api_device_delete(const char* body, size_t body_len,
         snprintf(ws_msg, sizeof(ws_msg),
                  "{\"event\":\"device_deleted\",\"ieee\":\"0x%016llX\"}",
                  (unsigned long long)ieee);
-        ws_server_broadcast(ws_msg, strlen(ws_msg));
+        // Via the WS-TX worker queue — ws_server_broadcast is reserved for
+        // the worker itself (single-caller invariant, see s3_internal.h).
+        ws_bridge_broadcast_enqueue(ws_msg, strlen(ws_msg));
     }
 
     const size_t n = ok ? api_write_ok(rsp_buf, rsp_cap)

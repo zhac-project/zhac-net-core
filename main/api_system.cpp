@@ -152,6 +152,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"log_ws_level\":\"%c\""
          ",\"ap_disabled\":%s"
          ",\"ws_clients\":%d"
+         ",\"ws_tx_drops\":%" PRIu32
          ",\"synced\":%s"
          ",\"metrics_enabled\":%s"
          ",\"auth_enabled\":%s"
@@ -204,6 +205,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         log_sinks_get_ws_level(),
         s_ap_disabled                                    ? "true" : "false",
         ws_server_client_count(),
+        ws_bridge_tx_drops(),
         s_synced.load(std::memory_order_acquire)         ? "true" : "false",
         s_metrics_enabled                                ? "true" : "false",
         s_auth_enabled                                   ? "true" : "false",

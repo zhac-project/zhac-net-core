@@ -33,6 +33,13 @@ static constexpr uint32_t P4_OTA_RESPONSE_TIMEOUT_MS = 30000;  // wait for P4 OT
 static constexpr uint32_t HAP_HEARTBEAT_INTERVAL_MS  = 5000;   // S3→P4 heartbeat cadence
 static constexpr uint32_t STACK_MON_INITIAL_DELAY_MS = 15000;  // let all tasks start before first HWM log
 
+// ── Shared buffer sizing ──────────────────────────────────────────────────
+// Cap of hap_bridge.cpp's attr.bulk coalescer (largest single event payload
+// the bridge ever emits). Exported so ws_bridge can size its event envelope
+// to fit a maximal coalesced batch — a smaller envelope silently replaced
+// big batches with `data:null`, losing live updates under load.
+static constexpr size_t BULK_COALESCE_CAP = 4096;
+
 // ── CORS ──────────────────────────────────────────────────────────────────
 // Default: same-origin only (no Access-Control-Allow-Origin emitted →
 // browsers block cross-origin requests). The WebUI is served from the
@@ -266,6 +273,17 @@ void on_mqtt_rx(const char* topic, int topic_len, const char* data, int data_len
 // fragment of valid JSON (object, array, or scalar). Used by the SPA's
 // signal stores to react without polling. Cheap; runs in caller task.
 void ws_event_broadcast(const char* name, const char* payload_json, size_t payload_len);
+
+// Copy `json` and hand it to the WS-TX worker queue for fan-out. The ONLY
+// sanctioned way to broadcast a pre-formatted frame from an arbitrary task:
+// never blocks, never logs (log-pipeline-safe — overflow/OOM drops are
+// counted in ws_bridge_tx_drops()). ws_server_broadcast itself must only
+// ever be called by the TX worker.
+void ws_bridge_broadcast_enqueue(const char* json, size_t len);
+
+// Frames dropped on the WS-TX path (queue full, queue not started, or
+// snapshot alloc failure). Surfaced in the status.get payload.
+uint32_t ws_bridge_tx_drops();
 
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
 // Implemented in ws_bridge.cpp as a thin wrapper around the file-static

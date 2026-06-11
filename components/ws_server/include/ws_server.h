@@ -19,6 +19,10 @@ httpd_handle_t   ws_server_get_handle();
 void             ws_server_set_rx_callback(WsRxCallback cb);
 void             ws_server_set_api_token(const char* token);
 int              ws_server_client_count();
+// True when the CALLING task is currently inside ws_server_broadcast()'s
+// send loop. The WS log sink uses this to drop fan-out of log lines emitted
+// from within the broadcast path itself (TX-path re-entry guard).
+bool             ws_server_in_broadcast();
 
 // F18: per-fd auth state for first-message WS authentication. A socket may
 // open unauthenticated when a token is configured; the dispatch layer permits

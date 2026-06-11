@@ -334,7 +334,8 @@ void send_sync_req() {
 // frame callback fires from task_hap, the flush is the loop-tail timer
 // check); no mutex needed. If another task ever needs to drive these,
 // add a lock here.
-static constexpr size_t   BULK_COALESCE_CAP    = 4096;
+// BULK_COALESCE_CAP itself lives in s3_internal.h — ws_bridge sizes its
+// event envelope from it so a maximal coalesced batch always fits the frame.
 static constexpr uint32_t BULK_COALESCE_WIN_MS = 100;
 
 static char        s_bulk_buf[BULK_COALESCE_CAP];

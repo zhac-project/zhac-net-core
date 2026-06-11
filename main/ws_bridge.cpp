@@ -110,10 +110,17 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     ESP_LOGI(TAG, "ws dispatch cmd=%s", cmd);
 
     // Serialize args object to a string body so the api_* helper sees
-    // the same input it would from a REST POST/PUT.
+    // the same input it would from a REST POST/PUT. measureJson first:
+    // serializeJson silently truncates at the buffer cap, which turned an
+    // oversized args object into corrupt JSON for the handler — reject it
+    // with an explicit error instead.
     char args_buf[2048];
     size_t args_len = 0;
     if (doc["args"].is<JsonObjectConst>()) {
+        if (measureJson(doc["args"]) >= sizeof(args_buf)) {
+            send_envelope_error(fd, id_var, "args too large");
+            return;
+        }
         args_len = serializeJson(doc["args"], args_buf, sizeof(args_buf));
     }
 
@@ -226,12 +233,18 @@ static size_t json_escape(const char* src, int src_len, char* out, size_t out_ca
 //
 // Wraps `payload_json` in `{"event":"<name>","data":<payload>}` and
 // fans it out to every connected WS client. The scratch buffer is a
-// file-static 2 KB slab protected by a mutex — callers come from
-// arbitrary tasks (log pipeline, hap_bridge, etc.), some of which
+// file-static PSRAM slab protected by a mutex — callers come from
+// arbitrary tasks (hap_bridge, OTA paths, etc.), some of which
 // (TaskGPIORst, TaskAlertPrst) have tight stacks where a 1 KB local
 // was enough to trip the canary watchpoint.
+//
+// Sized to fit the largest payload any producer emits: hap_bridge's
+// attr.bulk coalescer batches up to BULK_COALESCE_CAP (4096) bytes, and the
+// old 2048 B slab silently replaced coalesced batches >~2020 B with
+// `data:null` — live updates lost exactly when traffic was heaviest.
+// +128 covers the `{"event":"...","data":}` framing.
 static SemaphoreHandle_t s_evt_mutex = nullptr;
-EXT_RAM_BSS_ATTR static char s_evt_buf[2048];
+EXT_RAM_BSS_ATTR static char s_evt_buf[BULK_COALESCE_CAP + 128];
 
 static void evt_mutex_init_once() {
     if (!s_evt_mutex) {
@@ -270,6 +283,37 @@ void ws_bridge_tx_init() {
     }
 }
 
+// Queue a heap frame for the TX worker, taking ownership of `buf` (the
+// worker frees it; on drop we free it here). Never blocks, NEVER logs —
+// this runs on the log pipeline among other places, and any ESP_LOG here
+// would re-enter it.
+static void tx_enqueue_owned(char* buf, size_t len) {
+    WsTxItem item{ buf, len };
+    if (!s_ws_tx_q || xQueueSend(s_ws_tx_q, &item, 0) != pdTRUE) {
+        s_ws_tx_drops.fetch_add(1, std::memory_order_relaxed);
+        free(buf);
+    }
+}
+
+void ws_bridge_broadcast_enqueue(const char* json, size_t len) {
+    if (!json || len == 0) return;
+    // PSRAM-preferred snapshot: queue depth (24) × frame size would otherwise
+    // nibble at tight internal DRAM under bursts.
+    char* copy = static_cast<char*>(
+        heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!copy) copy = static_cast<char*>(malloc(len));
+    if (!copy) {
+        s_ws_tx_drops.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    memcpy(copy, json, len);
+    tx_enqueue_owned(copy, len);
+}
+
+uint32_t ws_bridge_tx_drops() {
+    return s_ws_tx_drops.load(std::memory_order_relaxed);
+}
+
 void ws_event_broadcast(const char* name, const char* payload_json, size_t payload_len) {
     evt_mutex_init_once();
     if (xSemaphoreTake(s_evt_mutex, portMAX_DELAY) != pdTRUE) return;
@@ -293,6 +337,11 @@ void ws_event_broadcast(const char* name, const char* payload_json, size_t paylo
                      "{\"event\":\"%s\",\"data\":null}", name);
     }
     if (n <= 0 || (size_t)n >= sizeof(s_evt_buf)) {
+        // Now-unreachable safety: the slab fits BULK_COALESCE_CAP, the largest
+        // payload any producer emits. Logging here is fine — this function is
+        // no longer on the log pipeline (the WS log sink enqueues directly).
+        ESP_LOGW(TAG, "event '%s' payload %u B overflows %u B envelope — data:null",
+                 name, (unsigned)payload_len, (unsigned)sizeof(s_evt_buf));
         n = snprintf(s_evt_buf, sizeof(s_evt_buf),
                      "{\"event\":\"%s\",\"data\":null,\"trunc\":true}", name);
     }
@@ -316,18 +365,9 @@ void ws_event_broadcast(const char* name, const char* payload_json, size_t paylo
 
     // F33: hand the local fan-out to the WS-TX worker so a slow socket can't
     // back up this producer. Ownership of `local` transfers to the queue; the
-    // worker frees it. On a full / not-yet-started queue, drop + free rather than
-    // block — and NO ESP_LOG here (this path runs on the log pipeline; logging
-    // would recurse).
-    if (local && send_len > 0) {
-        WsTxItem item{ local, send_len };
-        if (!s_ws_tx_q || xQueueSend(s_ws_tx_q, &item, 0) != pdTRUE) {
-            s_ws_tx_drops.fetch_add(1, std::memory_order_relaxed);
-            free(local);
-        }
-    } else if (local) {
-        free(local);
-    }
+    // worker frees it. On a full / not-yet-started queue, drop + count rather
+    // than block (tx_enqueue_owned never logs).
+    if (local) tx_enqueue_owned(local, send_len);
 
     // Mirror to remote channel if enabled + allow-listed. Non-blocking
     // (atomic-load + branch when on but not READY; inline no-op when the remote
@@ -407,7 +447,10 @@ void on_mqtt_rx(const char* topic, int topic_len,
         topic_esc, data_esc);
 
     if (n > 0 && n < (int)sizeof(buf)) {
-        ws_server_broadcast(buf, (size_t)n);
+        // Runs on the esp-mqtt event task — enqueue to the WS-TX worker
+        // instead of fanning out here, so a slow WS client can't stall the
+        // MQTT event loop.
+        ws_bridge_broadcast_enqueue(buf, (size_t)n);
         ESP_LOGD(TAG, "MQTT→WS topic=%s len=%d", topic_esc, n);
     }
 
