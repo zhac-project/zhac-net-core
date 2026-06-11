@@ -5,6 +5,7 @@
 #include "hap_protocol_decode.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -175,7 +176,10 @@ static void do_two_stage_exchange(const HapFrame& my_frame) {
     // call holds s_spi_mutex; the callback runs synchronously between
     // mutex release and function return, after which the buffer is free
     // for the next exchange.
-    static uint8_t s_dispatch_buf[HAP_MAX_PAYLOAD];
+    // PSRAM (EXT_RAM_BSS_ATTR): this is the post-DMA copy target only —
+    // it is NEVER handed to the SPI driver. The actual DMA buffers
+    // (s_tx_buf/s_rx_buf) must stay internal/DMA-capable and do.
+    EXT_RAM_BSS_ATTR static uint8_t s_dispatch_buf[HAP_MAX_PAYLOAD];
 
     if (s2_len > 0) {
         memset(s_tx_buf, 0, s2_len);

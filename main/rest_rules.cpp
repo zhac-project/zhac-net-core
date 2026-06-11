@@ -458,7 +458,8 @@ esp_err_t handle_get_groups(httpd_req_t* req) {
 // POST /api/groups — create: {"name":"...","members":[...]}
 esp_err_t handle_post_groups(httpd_req_t* req) {
     REQUIRE_AUTH(req);
-    static char body[1024];
+    // PSRAM — safe: single httpd worker task serialises handlers.
+    EXT_RAM_BSS_ATTR static char body[1024];
     int received = httpd_req_recv(req, body, sizeof(body) - 1);
     if (received <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
     body[received] = '\0';
@@ -506,12 +507,13 @@ esp_err_t handle_get_group_by_id(httpd_req_t* req) {
 esp_err_t handle_put_group(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     uint16_t id = uri_group_id(req, false);
-    static char body[1024];
+    // PSRAM — safe: single httpd worker task serialises handlers.
+    EXT_RAM_BSS_ATTR static char body[1024];
     int received = httpd_req_recv(req, body, sizeof(body) - 1);
     if (received <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
     body[received] = '\0';
 
-    static char args[1200];
+    EXT_RAM_BSS_ATTR static char args[1200];
     int args_len = make_group_args(body, received, id, args, sizeof(args));
     if (args_len < 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");

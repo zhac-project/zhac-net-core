@@ -9,6 +9,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -40,8 +41,9 @@ static char            s_ip_str[20]    = "0.0.0.0";
 static esp_netif_t*    s_netif_sta     = nullptr;
 static esp_netif_t*    s_netif_ap      = nullptr;
 
-// Scan results
-static wifi_ap_record_t s_scan_results[20];
+// Scan results — PSRAM: ~1.6 KB, written once per user-triggered scan
+// (esp_wifi_scan_get_ap_records runs in task context, never ISR/DMA).
+EXT_RAM_BSS_ATTR static wifi_ap_record_t s_scan_results[20];
 static uint16_t         s_scan_count = 0;
 
 // ── Forward declarations ─────────────────────────────────────────────────

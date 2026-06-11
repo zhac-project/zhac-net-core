@@ -11,6 +11,7 @@
 
 #if CONFIG_METRICS_ENABLED && CONFIG_METRICS_ENABLE_MQTT_EXPORTER
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "metrics/metrics.h"
@@ -26,7 +27,9 @@ constexpr const char* kTopic  = "metrics/snapshot";
 constexpr size_t      kBufLen = 2048;
 
 esp_timer_handle_t s_timer = nullptr;
-char               s_buf[kBufLen];
+// PSRAM: 2 KB snapshot scratch, touched once per publish interval from the
+// esp_timer task (never ISR) — cold path, no reason to burn internal DRAM.
+EXT_RAM_BSS_ATTR char s_buf[kBufLen];
 
 void on_tick(void*) {
     // F45 (FINDINGS.md): the snapshot carries internal metrics + heap layout.

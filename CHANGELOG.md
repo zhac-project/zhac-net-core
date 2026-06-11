@@ -7,6 +7,26 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Changed — DRAM→PSRAM static buffer sweep (P1, T12)
+
+- Routed cold/warm static buffers to PSRAM via `EXT_RAM_BSS_ATTR`
+  (`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y`): `hap_bridge` attr.bulk
+  coalescer (4 KB), `wifi_mgr` scan results (1.8 KB), `metrics_mqtt` snapshot
+  scratch (2 KB), `api_groups` group-list records (9.5 KB — the single largest
+  dram0 .bss symbol), `main` alert ring (3.5 KB), `rest_rules` group-handler
+  scratch (3.2 KB), and `hap_master`'s frame dispatch buffer (4 KB — the
+  post-DMA copy only; the actual SPI DMA buffers `s_tx_buf`/`s_rx_buf` stay
+  internal/DMA-capable).
+- `rest_ops` handler stack buffers (/api/status, /api/alerts,
+  /api/diagnostics/unhandled, /api/wifi/scan — 7 KB total) converted to
+  function-static PSRAM scratch. Safe because esp_http_server serialises all
+  URI handlers on its single worker task (one httpd instance, ws_server);
+  also relieves httpd-task stack pressure.
+- Net effect (`idf.py size`, S3 app, includes the zhac-components moves):
+  dram0 `.bss` 47,736 → 12,648 B (−35,088 B). The only remaining ≥1 KB
+  internal .bss symbol is ESP-IDF's coredump stack, which must stay internal
+  (panic path).
+
 ### Fixed — WebSocket subsystem hardening (P1)
 
 - **ws_server**: broadcasts now skip sockets that opened `/ws` but never

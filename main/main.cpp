@@ -255,7 +255,9 @@ HapOtaStatus           s_p4ota_status        = {};
 uint32_t               s_p4ota_ckpt_offset   = 0;
 
 // ── Alert ring buffer ─────────────────────────────────────────────────────
-AlertLogEntry     s_alert_log[ALERT_LOG_MAX];
+// PSRAM: ~3.5 KB ring, mutex-guarded appends on alert events + REST reads —
+// cold path, never touched from ISR.
+EXT_RAM_BSS_ATTR AlertLogEntry s_alert_log[ALERT_LOG_MAX];
 uint8_t           s_alert_log_head  = 0;
 uint8_t           s_alert_log_count = 0;
 SemaphoreHandle_t s_alert_log_mutex = nullptr;

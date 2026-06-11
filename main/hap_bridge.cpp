@@ -338,7 +338,7 @@ void send_sync_req() {
 // event envelope from it so a maximal coalesced batch always fits the frame.
 static constexpr uint32_t BULK_COALESCE_WIN_MS = 100;
 
-static char        s_bulk_buf[BULK_COALESCE_CAP];
+EXT_RAM_BSS_ATTR static char s_bulk_buf[BULK_COALESCE_CAP];
 static size_t      s_bulk_len   = 0;
 static uint16_t    s_bulk_count = 0;
 static TickType_t  s_bulk_last_flush = 0;

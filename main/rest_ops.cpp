@@ -90,7 +90,10 @@ esp_err_t rest_api_reply(httpd_req_t* req, ApiHandlerFn fn,
 esp_err_t handle_get_status(httpd_req_t* req) {
     // No REQUIRE_AUTH: /api/status is intentionally unauthenticated as
     // the discovery endpoint (non-sensitive health info only).
-    char buf[2048];
+    // Function-static in PSRAM: esp_http_server serialises all handlers on
+    // its single worker task (one httpd instance — ws_server.cpp), so this
+    // cannot be entered concurrently; keeps 2 KB off stack + internal DRAM.
+    EXT_RAM_BSS_ATTR static char buf[2048];
     return rest_api_reply(req, api_status_get, nullptr, 0, buf, sizeof(buf), "status format");
 }
 
@@ -160,7 +163,9 @@ esp_err_t handle_get_metrics(httpd_req_t* req) {
 // ── GET /api/alerts ───────────────────────────────────────────────────────
 esp_err_t handle_get_alerts(httpd_req_t* req) {
     REQUIRE_AUTH(req);
-    char buf[1024];
+    // Static PSRAM scratch — safe: single httpd worker task serialises
+    // handlers (see /metrics note above).
+    EXT_RAM_BSS_ATTR static char buf[1024];
     return rest_api_reply(req, api_alerts_get, nullptr, 0, buf, sizeof(buf), "alerts");
 }
 
@@ -197,7 +202,9 @@ esp_err_t handle_get_logs(httpd_req_t* req) {
 // converter-body extraction patterns to teach the pipeline next.
 esp_err_t handle_get_diagnostics_unhandled(httpd_req_t* req) {
     REQUIRE_AUTH(req);
-    char buf[2048];
+    // Static PSRAM scratch — safe: single httpd worker task serialises
+    // handlers (see /metrics note above).
+    EXT_RAM_BSS_ATTR static char buf[2048];
     return rest_api_reply(req, api_diagnostics_unhandled_get, nullptr, 0,
                            buf, sizeof(buf), "diag");
 }
@@ -409,7 +416,9 @@ esp_err_t handle_get_wifi_scan(httpd_req_t* req) {
     static int64_t s_last_scan_us = 0;
     RATE_LIMIT(req, s_last_scan_us, 10LL * 1000000LL);
 
-    char buf[2048];
+    // Static PSRAM scratch — safe: single httpd worker task serialises
+    // handlers (see /metrics note above).
+    EXT_RAM_BSS_ATTR static char buf[2048];
     return rest_api_reply(req, api_wifi_scan, nullptr, 0, buf, sizeof(buf), "wifi scan");
 }
 
