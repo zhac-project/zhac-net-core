@@ -7,6 +7,32 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Fixed — High / Medium (P2 findings review, T14 HAP correlation edges)
+
+- **hap_bridge** (High): the per-request-seq WAITER table (`hap_roundtrip_v2`)
+  drew its correlation seq from `hap_session_next_seq()` and claimed a slot
+  without checking the seq was free. After 65534 sends the uint16 seq wraps
+  and could alias a long-stalled in-flight waiter; `waiter_find_by_seq` then
+  matched the OLDER slot and delivered one caller's response into another
+  caller's buffer. `waiter_claim` now draws the seq UNDER the table mutex and
+  rejects any candidate already held by a live slot (bounded 8-try loop,
+  skips 0 to match the session convention; on exhaustion the claim fails and
+  the roundtrip returns a clean error rather than risking a colliding
+  correlation). (FINDINGS §1.1, :271)
+- **hap_bridge** (Medium): response delivery in the `on_frame` callback
+  (task_hap) found the waiter under the mutex, RELEASED it, then memcpy'd into
+  `w->rsp_buf`, wrote `*rsp_len_out`, and gave the sem unlocked. If the caller
+  timed out and `waiter_release`'d in that gap, the slot could be reclaimed and
+  re-pointed at a different caller's buffer, so the copy landed in the wrong
+  buffer (flagged by two reviewers). Delivery is now one atomic step
+  (`waiter_deliver`): find + re-check `seq!=0 && seq==ack_seq` + type-check +
+  bounded memcpy + len-write + sem-give all happen under
+  `s_waiter_table_mutex`. A timed-out caller's release (also mutex-guarded)
+  cannot interleave: it either ran first (seq==0 ⇒ no match, late frame
+  dropped) or is blocked until delivery completes into the still-valid slot.
+  The mutex is never held across a blocking call — the memcpy is bounded by
+  `rsp_cap` (≤ HAP_MAX_PAYLOAD). (FINDINGS §1.2, :395)
+
 ### Changed — DRAM→PSRAM static buffer sweep (P1, T12)
 
 - Routed cold/warm static buffers to PSRAM via `EXT_RAM_BSS_ATTR`
