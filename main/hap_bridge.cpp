@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
+#include <unistd.h>   // unlink (drop partial alerts.bin on write failure)
 #include <algorithm>
 #include <atomic>
 #include "freertos/FreeRTOS.h"
@@ -91,10 +92,19 @@ static void task_alert_persist(void*) {
 
         FILE* f = fopen("/spiffs/alerts.bin", "wb");
         if (!f) { ESP_LOGW(TAG, "alert_log_persist: fopen failed"); continue; }
-        fwrite(&head,  1, 1,             f);
-        fwrite(&count, 1, 1,             f);
-        fwrite(snap,   sizeof(AlertLogEntry), ALERT_LOG_MAX, f);
-        fclose(f);
+        // Check every write + the close: a short write (SPIFFS full) or a
+        // close-time flush error would otherwise leave a truncated alerts.bin
+        // that alert_log_load() reads back as a corrupt ring. On any failure
+        // unlink the partial file so the next boot just starts empty.
+        bool ok = fwrite(&head,  1, 1, f) == 1
+               && fwrite(&count, 1, 1, f) == 1
+               && fwrite(snap, sizeof(AlertLogEntry), ALERT_LOG_MAX, f) == ALERT_LOG_MAX;
+        if (fclose(f) != 0) ok = false;
+        if (!ok) {
+            ESP_LOGW(TAG, "alert_log_persist: write/close failed — dropping partial file");
+            unlink("/spiffs/alerts.bin");
+            continue;
+        }
         ESP_LOGD(TAG, "alert_log persisted count=%u", count);
     }
 }
@@ -153,10 +163,12 @@ void hap_send(HapMsgType type, const uint8_t* payload, uint16_t payload_len,
 // REST-side mutex serialising rule/script mutators — concurrent rule
 // edits proceed in parallel up to kHapWaiterCount in flight.
 //
-// kHapWaiterCount is sized for the steady-state concurrency cap: the
-// HTTP server runs 4 worker threads, the WS dispatcher has 1, the OTA
-// flow holds at most 1, leaving headroom. Counting-sem `s_waiter_free_sem`
-// gates claim so 9th caller blocks until a slot frees.
+// kHapWaiterCount is sized for the steady-state concurrency cap. The
+// esp_http_server runs a SINGLE worker task (HTTPD_DEFAULT_CONFIG, no
+// thread-pool override), so REST requests are serialised one at a time;
+// the WS dispatcher adds 1 and the OTA flow holds at most 1, leaving ample
+// headroom. Counting-sem `s_waiter_free_sem` gates claim so the (N+1)th
+// caller blocks until a slot frees.
 struct HapWaiter {
     uint16_t           seq;            // 0 = free
     HapMsgType         rsp_type;
