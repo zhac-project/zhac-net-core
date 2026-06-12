@@ -137,7 +137,7 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     // logged warning rather than emitting broken JSON.
     const bool is_logs = (strcmp(cmd, "logs.get") == 0);
     const bool is_devlist = (strcmp(cmd, "device.list") == 0);
-    const size_t kRspCap      = (is_logs || is_devlist) ? (40 * 1024) : (8 * 1024);
+    const size_t kRspCap      = (is_logs || is_devlist) ? kDevListTransportCap : (8 * 1024);
     const size_t kEnvelopeCap = kRspCap + 1024;
     char* rsp_buf = static_cast<char*>(heap_caps_malloc(kRspCap, MALLOC_CAP_SPIRAM));
     char* env_buf = static_cast<char*>(heap_caps_malloc(kEnvelopeCap, MALLOC_CAP_SPIRAM));

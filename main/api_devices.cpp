@@ -73,6 +73,14 @@ static void devlist_cache_init() {
 // `{"devices":[...]}` document. Returns the assembled length (excl. NUL) on
 // success, or 0 on failure (timeout / parse error / accumulator overflow).
 // `out` must be at least kDevListAccumCap bytes.
+//
+// CURSOR IS A RAW ARRAY INDEX, not a stable device key. If the pool gains or
+// loses a device between pages (multi-roundtrip paging is NOT a single atomic
+// snapshot — the pool lock is held only per-chunk on P4), indices shift and this
+// reassembly may drop or duplicate ONE device in THIS response only. Self-heals
+// on the next refresh (1s cache) + device.added/removed events. Proper fix: a
+// pool-generation token in the envelope, restart-on-mismatch — deferred (exceeds
+// hotfix scope). See FINDINGS follow-up.
 static size_t devlist_fetch_all(char* out, size_t out_cap) {
     // Per-chunk receive buffer (one SPI frame). PSRAM via rest_big_alloc so a
     // burst of concurrent callers doesn't churn the tight internal heap.
@@ -134,6 +142,7 @@ static size_t devlist_fetch_all(char* out, size_t out_cap) {
         // `next` cursor: absent / >= would-not-advance means done. The P4
         // sets next == device count when the final page is reached, and
         // guarantees forward progress (next > start) otherwise.
+        // NOTE: the terminal DATA page reports next==count (>start), so S3 always spends one final empty GET_DEVICES roundtrip to observe next==start. Bounded + cached 1s; acceptable.
         uint16_t next = doc["next"] | static_cast<uint16_t>(0);
         if (!doc["next"].is<uint16_t>() || next <= start) {
             // Either no cursor (legacy single-frame peer) or the terminal
