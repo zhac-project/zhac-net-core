@@ -142,19 +142,15 @@ extern "C" void remote_client_publish_event(const char* name,
         ESP_LOGW(TAG, "publish_event OOM (event=%s)", name);
         return;
     }
-    int n;
-    if (payload_json && payload_len > 0) {
-        n = snprintf(buf, kCap, "{\"event\":\"%s\",\"data\":%.*s}",
-                     name, (int)payload_len, payload_json);
-    } else {
-        n = snprintf(buf, kCap, "{\"event\":\"%s\",\"data\":null}", name);
-    }
-    if (n <= 0 || (size_t)n >= kCap) {
+    // Shared envelope builder (remote_client.h) — same format + overflow
+    // contract as ws_bridge's local broadcast; the two can no longer drift.
+    size_t n = ws_event_envelope_build(buf, kCap, name, payload_json, payload_len);
+    if (n == 0) {
         heap_caps_free(buf);
         return;
     }
 
-    TxItem item{ buf, (size_t)n };
+    TxItem item{ buf, n };
     if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
         // Queue full — drop oldest, free, enqueue this.
         TxItem old{};

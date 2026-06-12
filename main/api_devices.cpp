@@ -28,8 +28,79 @@
 #include "esp_heap_caps.h"
 #include "nvs.h"
 #include <memory>
+#include <atomic>
 
 static const char* TAG_API = "api_devices";
+
+// ── Deferred NVS commit for the device-options namespace (FINDINGS §6) ─────
+// `api_device_options_set` is a moderately hot handler (per-device option
+// write; can arrive in bursts when the SPA pushes several devices' options or
+// a script bulk-applies). It used to `nvs_commit(s_nvs_zhac_opt)` on EVERY
+// call — each commit erases+rewrites a flash page on the httpd task, so a
+// burst meant flash wear plus per-call latency on the shared HTTP worker.
+//
+// `nvs_set_str` already stages the value in RAM and makes it visible to the
+// next read on the SAME long-lived handle; only the `nvs_commit` need be
+// durable. So we debounce the commit: each set re-arms a one-shot timer and
+// the commit lands once the writes go quiet (DEBOUNCE_US), coalescing a burst
+// into a single page write. `s_opt_dirty` guards against a needless commit.
+// Mirrors the rule_store deferred-flush pattern (F-04) — including an explicit
+// flush-now hook the reboot path calls so nothing in-flight is lost.
+static esp_timer_handle_t s_opt_flush_timer = nullptr;
+static std::atomic<bool>  s_opt_dirty{false};
+static constexpr int64_t  kOptFlushDebounceUs = 2'000'000;  // 2 s quiet window
+
+static void opt_commit_now() {
+    // Single-shot the staged page write. Cheap no-op when nothing is dirty.
+    if (s_nvs_zhac_opt && s_opt_dirty.exchange(false)) {
+        esp_err_t err = nvs_commit(s_nvs_zhac_opt);
+        if (err != ESP_OK) {
+            // Re-mark so a later set / explicit flush retries; the staged
+            // values are still in the handle, just not yet durable.
+            s_opt_dirty.store(true);
+            ESP_LOGW(TAG_API, "deferred zhac_opt commit failed: %s",
+                     esp_err_to_name(err));
+        }
+    }
+}
+
+static void opt_flush_timer_cb(void*) { opt_commit_now(); }
+
+// Called from the reboot path (main.cpp) alongside rule_store_flush_now() so a
+// pending device-options write is made durable before restart.
+extern "C" void api_device_opt_flush_now() {
+    if (s_opt_flush_timer) esp_timer_stop(s_opt_flush_timer);  // cancel pending
+    opt_commit_now();
+}
+
+// Stage `write_str` under `nvs_key` and (re)arm the debounced commit. Returns
+// the nvs_set_str result; commit durability is handled by the timer.
+static esp_err_t opt_stage_and_defer(const char* nvs_key, const char* write_str) {
+    esp_err_t err = nvs_set_str(s_nvs_zhac_opt, nvs_key, write_str);
+    if (err != ESP_OK) return err;
+    s_opt_dirty.store(true);
+    if (!s_opt_flush_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = &opt_flush_timer_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "opt_flush",
+            .skip_unhandled_events = true,
+        };
+        // Best-effort: if timer creation fails, fall back to an immediate
+        // commit below so the write is never silently left non-durable.
+        if (esp_timer_create(&args, &s_opt_flush_timer) != ESP_OK) {
+            s_opt_flush_timer = nullptr;
+        }
+    }
+    if (s_opt_flush_timer) {
+        esp_timer_stop(s_opt_flush_timer);                 // restart the window
+        esp_timer_start_once(s_opt_flush_timer, kOptFlushDebounceUs);
+    } else {
+        opt_commit_now();   // no timer available — commit synchronously
+    }
+    return ESP_OK;
+}
 
 // Each DEVICE_LIST chunk the P4 sends is one SPI frame (<= HAP_MAX_PAYLOAD).
 static constexpr size_t kDevListChunkCap = HAP_MAX_PAYLOAD;
@@ -102,7 +173,31 @@ static size_t devlist_fetch_all(char* out, size_t out_cap) {
     bool first_elem = true;
     uint16_t start   = 0;
     bool ok_done     = false;
+
+    // P4-T29 (FINDINGS §5): this loop runs on the SINGLE httpd task and the
+    // DEVICE_LIST paging hotfix turned device.list into up to kDevListMaxPages
+    // (ZAP_MAX_DEVICES+8 = 208) sequential 5 s hap_roundtrip_v2 calls. A dead
+    // or marginal P4 link (every page times out) would otherwise pin the httpd
+    // task — and therefore ALL REST + WS + queued async sends — for up to
+    // 208 × 5 s ≈ 17 minutes. Bound the CUMULATIVE wall-clock the paged loop
+    // may consume; once exceeded we abort and report a failed fetch (the
+    // caller then serves the 1 s stale cache or a clean error), rather than
+    // emitting a half-fleet that LOOKS complete. Worst-case stall is now
+    // kDevListBudgetUs + one in-flight roundtrip (≤5 s) ≈ 13 s. The healthy
+    // path (fleet paged in tens of ms) never trips this. NOTE: the proper fix
+    // is to move multi-roundtrip commands off the httpd task onto a worker —
+    // recommended follow-up; this budget is the minimal stall containment.
+    static constexpr int64_t kDevListBudgetUs = 8'000'000;   // 8 s total
+    const int64_t deadline_us = esp_timer_get_time() + kDevListBudgetUs;
+
     for (int page = 0; page < kDevListMaxPages; page++) {
+        if (esp_timer_get_time() > deadline_us) {
+            ESP_LOGE(TAG_API,
+                     "device.list exceeded %lld ms budget at page %d (start=%u) — aborting",
+                     (long long)(kDevListBudgetUs / 1000), page, (unsigned)start);
+            free(chunk);
+            return 0;   // treat as failed fetch — caller falls back to cache/error
+        }
         uint8_t req[2] = { static_cast<uint8_t>(start & 0xFF),
                            static_cast<uint8_t>((start >> 8) & 0xFF) };
         size_t got = 0;
@@ -499,10 +594,13 @@ extern "C" ApiStatus api_device_options_set(const char* body, size_t body_len,
     const char* raw_body = doc["__raw"] | (const char*)nullptr;
     const char* write_str = (raw_body && raw_body[0]) ? raw_body : body;
 
+    // Stage the write and defer the flash commit (debounced) — see
+    // opt_stage_and_defer. The value is immediately visible to the next read
+    // on this cached handle; durability follows on the quiet-window timer or
+    // the reboot flush hook. `nvs_ok` reflects the stage succeeding.
     bool nvs_ok = false;
     if (s_nvs_zhac_opt) {
-        nvs_ok = (nvs_set_str(s_nvs_zhac_opt, nvs_key, write_str) == ESP_OK) &&
-                 (nvs_commit(s_nvs_zhac_opt) == ESP_OK);
+        nvs_ok = (opt_stage_and_defer(nvs_key, write_str) == ESP_OK);
     }
 
     bool p4_ok     = true;

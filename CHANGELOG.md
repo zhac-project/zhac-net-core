@@ -9,6 +9,78 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **ws_bridge / remote_client (P4-T29, FINDINGS §5, SEC)** — the
+  client-supplied envelope `id` was spliced **unescaped** into every response
+  frame (`{"id":"<id>",...}`) on all three string-id paths (error reply, the
+  auth-ok reply, and the success `data` envelope). A `"` (or `\`, control
+  char) in the id closed the JSON string early and injected arbitrary
+  structure into the frame echoed back to that client — and, via the
+  remote/cloud sentinel path, to the cloud peer. All three sites now run the id
+  through the existing `json_escape` (new `escape_id` wrapper, bounded to 64 B
+  of escaped output). Int ids still pass through as numbers. Host-tested: a
+  crafted `id` carrying `","ok":true,"data":{...}` is fully escaped inside the
+  id value and the real top-level keys stay intact. (`ws_bridge.cpp` :54/:88/
+  :185)
+- **ws_bridge / remote_client (P4-T29, FINDINGS §5, SMELL)** — the
+  `{"event":"<name>","data":<payload>}` frame was open-coded TWICE — once in
+  `ws_event_broadcast` (local WS fan-out, 4 KB+128 cap) and once in
+  `remote_client_publish_event` (cloud mirror, 8 KB cap) — with **divergent
+  buffer caps**, the local-vs-cloud truncation asymmetry the finding flagged
+  (a coalesced batch could fit one transport but be replaced by `data:null` on
+  the other). Folded both onto ONE `static inline ws_event_envelope_build()`
+  in `remote_client.h` (the public header both sites already include, reachable
+  in both Kconfig states — no cross-repo move, no new dependency for the
+  non-remote path). Format + overflow contract (`data:null,"trunc":true`
+  fallback) are now identical; each caller still passes its own transport cap.
+  Host-tested byte-identical for the same input.
+- **api_devices (P4-T29, FINDINGS §6, BLOCK)** — `device.options.set`
+  committed to NVS (`nvs_commit(s_nvs_zhac_opt)`) on **every** call — a flash
+  page erase+write on the httpd task per device-option write, so a burst (SPA
+  pushing several devices, or a script bulk-apply) meant flash wear plus
+  per-call latency on the shared HTTP worker. The commit is now **debounced**:
+  each write stages via `nvs_set_str` (immediately visible to the next read on
+  the cached handle) and (re)arms a 2 s one-shot `esp_timer`; a burst coalesces
+  into a single page write once writes go quiet. An explicit
+  `api_device_opt_flush_now()` is called from the OTA and deferred-reboot paths
+  (next to `rule_store_flush_now()`) so nothing staged is lost across a
+  restart. (`api_devices.cpp` :503)
+- **api_system (P4-T29, FINDINGS §6, BLOCK)** — `api_settings_set` opened +
+  committed + closed the `sys_cfg` namespace **three separate times** in one
+  request (timezone / metrics_en / ap_disabled) — three flash-page writes for a
+  single "save settings". This handler is operator-paced (a human pressing
+  Save), so a background-flush timer is unwarranted; instead the three
+  same-namespace writes are staged into locals and persisted under **one**
+  open/commit/close at the end of the handler. Every live-apply side effect
+  (`setenv`/`tzset`, the static flags, the MQTT/auth re-apply) is unchanged —
+  only the NVS persistence is coalesced. (`api_system.cpp` :544)
+- **groups_store / api_groups (P4-T29, FINDINGS §6, concurrency)** —
+  `group.list` is remote-allow-listed, so it runs on BOTH the single httpd task
+  and `task_remote` (cloud-invoked). The store was unsynchronised across those
+  contexts: a httpd `group.create`/`update`/`delete` mutating the bitmap+blobs
+  while `task_remote` walked the same namespace for a `group.list`, the
+  file-static `all[]` scratch in `api_group_list` refilled mid-serialisation by
+  a concurrent second list (torn read), and a non-atomic `grp_next_id()`→
+  `grp_save()` in create that let two creators grab the same slot id. Added a
+  store-wide **recursive** mutex (`GrpLockGuard`) held across each whole op,
+  a new atomic `grp_create()` (id-alloc + save under one lock), and bracketed
+  `api_group_list`'s load+serialise with `grp_store_lock()`/`unlock()` so the
+  serialised snapshot is the one loaded. Mirrors the wifi-scan-mutex fix
+  (P2-T16) for the same httpd-vs-`task_remote` race class. (`api_groups.cpp`
+  :47, `groups_store.cpp`)
+- **api_devices (P4-T29, FINDINGS §5, BLOCK — stall containment)** — the
+  DEVICE_LIST paging hotfix turned `device.list` into up to `ZAP_MAX_DEVICES+8`
+  (208) sequential 5 s `hap_roundtrip_v2` calls, all on the single httpd task.
+  A dead or marginal P4 link (every page times out) would pin the httpd task —
+  and therefore ALL REST + WS + queued async sends — for up to 208 × 5 s ≈ 17
+  minutes. Added a cumulative **wall-clock budget** (8 s) to the paged loop:
+  once exceeded it aborts and reports a failed fetch (caller serves the 1 s
+  stale cache or a clean error) rather than emitting a half-fleet that looks
+  complete. Worst-case stall is now ~8 s + one in-flight roundtrip ≈ 13 s; the
+  healthy path (tens of ms) never trips it. **Recommended follow-up:** move
+  multi-roundtrip commands (`device.list`) off the httpd task onto a worker so
+  no single command can stall the shared HTTP/WS server at all — the budget is
+  minimal containment, not the full fix. (`api_devices.cpp` `devlist_fetch_all`)
+
 - **api_system (P4-T28, FINDINGS §8)** — updated `/api/status` for the
   caller-owned `sys_metrics` CPU% baseline. `zap_common/sys_metrics.h` dropped
   its shared per-translation-unit `static` baseline in favour of a
