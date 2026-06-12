@@ -9,6 +9,14 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **api_system (P4-T28, FINDINGS §8)** — updated `/api/status` for the
+  caller-owned `sys_metrics` CPU% baseline. `zap_common/sys_metrics.h` dropped
+  its shared per-translation-unit `static` baseline in favour of a
+  caller-supplied `sys_metrics_cpu_ctx_t`. `api_status_get` now keeps a private
+  function-static `s_status_cpu_ctx` (its own window, never crossing the P4
+  heartbeat's) and passes it to `sys_metrics_sample_cpu_pct(ctx, c0, c1)`. The
+  default single httpd worker serialises status requests; a fanned-out worker
+  pool would at worst yield a transient bogus reading, not state corruption.
 - **api_devices (HOTFIX)** — `api_device_list` now LOOPS over the paged
   `GET_DEVICES` protocol and reassembles every chunk into one full
   `{"devices":[...]}`. The device list previously timed out for anyone with

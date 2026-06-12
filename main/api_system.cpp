@@ -110,8 +110,15 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         s3_stack_hwm = (min_hwm == UINT32_MAX) ? 0 : min_hwm;
     }
 
+    // Caller-owned CPU%-baseline window for the /api/status cadence —
+    // own copy so it never crosses the P4 heartbeat's window (FINDINGS
+    // §8: the sampler dropped its shared per-TU static). The default
+    // single httpd worker serialises status requests; should the server
+    // ever fan status across worker threads, the worst case is a
+    // transient bogus reading for one poll, not state corruption.
+    static sys_metrics_cpu_ctx_t s_status_cpu_ctx{};
     uint8_t  s3_cpu_c0 = 0, s3_cpu_c1 = 0;
-    sys_metrics_sample_cpu_pct(s3_cpu_c0, s3_cpu_c1);
+    sys_metrics_sample_cpu_pct(s_status_cpu_ctx, s3_cpu_c0, s3_cpu_c1);
 
     char p4_fw_ver[16] = {};
     hap_bridge_copy_p4_fw_ver(p4_fw_ver, sizeof(p4_fw_ver));
