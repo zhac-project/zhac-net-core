@@ -193,6 +193,21 @@ extern "C" bool auth_rotate_token(char* out, size_t out_cap) {
     return true;
 }
 
+// Constant-time compare of a 32-byte (32-hex-char) candidate against the
+// configured API token. XOR-accumulate every byte so the loop's timing is
+// independent of where the first mismatch falls — no early-out side channel
+// on the token. Shared by the REST (check_auth) and WS (auth_check_token)
+// validators below, both of which compare against the same s_api_token.
+// PRECONDITION: `candidate` must point to >=32 readable bytes — both callers
+// guarantee this via a `strlen(...) == 32` check immediately before calling;
+// a future caller MUST do the same (the loop reads 32 bytes unconditionally).
+static inline bool token_matches_ct(const char* candidate) {
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++)
+        diff |= (uint8_t)candidate[i] ^ (uint8_t)s_api_token[i];
+    return diff == 0;
+}
+
 bool check_auth(httpd_req_t* req) {
     if (!s_auth_enabled) return true;
     if (auth_is_locked()) return false;     // CC-F8 rate-limit
@@ -202,10 +217,7 @@ bool check_auth(httpd_req_t* req) {
         return false;
     }
     if (strlen(key) != 32) { auth_record_failure(); return false; }
-    uint8_t diff = 0;
-    for (int i = 0; i < 32; i++)
-        diff |= (uint8_t)key[i] ^ (uint8_t)s_api_token[i];
-    if (diff != 0) { auth_record_failure(); return false; }
+    if (!token_matches_ct(key)) { auth_record_failure(); return false; }
     return true;
 }
 
@@ -217,10 +229,7 @@ bool auth_check_token(const char* token) {
     if (!s_auth_enabled) return true;
     if (auth_is_locked()) return false;
     if (!token || strlen(token) != 32) { auth_record_failure(); return false; }
-    uint8_t diff = 0;
-    for (int i = 0; i < 32; i++)
-        diff |= (uint8_t)token[i] ^ (uint8_t)s_api_token[i];
-    if (diff != 0) { auth_record_failure(); return false; }
+    if (!token_matches_ct(token)) { auth_record_failure(); return false; }
     return true;
 }
 
@@ -329,8 +338,8 @@ static void task_ota(void*) {
         esp_https_ota_config_t ota_cfg = {};
         ota_cfg.http_config            = &http_cfg;
 
-        ws_event_broadcast("ota.start",
-            "{\"target\":\"s3\",\"total\":0,\"offset\":0}", 38);
+        static const char kOtaStartEv[] = "{\"target\":\"s3\",\"total\":0,\"offset\":0}";
+        ws_event_broadcast("ota.start", kOtaStartEv, sizeof(kOtaStartEv) - 1);
 
         esp_https_ota_handle_t handle = nullptr;
         esp_err_t ret = esp_https_ota_begin(&ota_cfg, &handle);

@@ -9,6 +9,30 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **main / hap_bridge (P5-T32, FINDINGS §5, LOW)** — post-release cleanup of
+  the open LOW-severity tail (most LOW rows were already resolved incidentally
+  during P0–P4):
+  - `main.cpp` `task_ota` passed a hardcoded `payload_len 38` for the
+    `ota.start` event literal that is only **36** bytes — the WS/cloud peer
+    received the JSON plus two bytes of trailing garbage. Replaced with a named
+    `static const char[]` + `sizeof - 1`, so the length now tracks the literal.
+  - `hap_bridge.cpp` `alert_log_persist` ignored every `fwrite`/`fclose`
+    result — a short write (SPIFFS full) or a close-time flush error left a
+    truncated `alerts.bin` that `alert_log_load()` reads back as a corrupt
+    ring. Now checks all three writes and the close; on any failure it logs and
+    `unlink`s the partial file so the next boot starts empty (added
+    `<unistd.h>`).
+  - `hap_bridge.cpp` corrected the stale "HTTP server runs 4 worker threads"
+    comment over `kHapWaiterCount` — the esp_http_server here uses
+    `HTTPD_DEFAULT_CONFIG()` with no thread-pool override, so it runs a single
+    worker task and serialises REST requests. Comment only.
+  - `main.cpp` folded the two byte-wise constant-time token-compare loops
+    (`check_auth` REST path + `auth_check_token` WS path, both comparing
+    against the same `s_api_token`) into one `token_matches_ct()` helper. Pure
+    compare, same translation unit — behaviour unchanged. The third copy in
+    `components/ws_server/ws_server.cpp` is left as-is: it lives in a separate
+    component with its own token storage and no shared header, so hoisting it
+    across the module boundary is out of scope for a LOW cleanup.
 - **hap_master (P4-T31, FINDINGS HAP, `hap_master.cpp` `do_two_stage_exchange`)**
   — turned the `s_dispatch_buf` consume-synchronously assumption into an
   ENFORCED invariant. The static `s_dispatch_buf` (PSRAM post-DMA copy target)
