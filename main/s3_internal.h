@@ -40,6 +40,10 @@ static constexpr uint32_t STACK_MON_INITIAL_DELAY_MS = 15000;  // let all tasks 
 // big batches with `data:null`, losing live updates under load.
 static constexpr size_t BULK_COALESCE_CAP = 4096;
 
+// device-list assembled-JSON emit ceiling; >~125 devices truncates with a log
+// — raise with kDevListAccumCap to support larger fleets.
+static constexpr size_t kDevListTransportCap = 40 * 1024;
+
 // ── CORS ──────────────────────────────────────────────────────────────────
 // Default: same-origin only (no Access-Control-Allow-Origin emitted →
 // browsers block cross-origin requests). The WebUI is served from the

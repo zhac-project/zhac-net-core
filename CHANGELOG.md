@@ -7,9 +7,25 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
-### Security
+### Fixed
 
-- **docs/config**: documented that release builds MUST keep
+- **api_devices (HOTFIX)** — `api_device_list` now LOOPS over the paged
+  `GET_DEVICES` protocol and reassembles every chunk into one full
+  `{"devices":[...]}`. The device list previously timed out for anyone with
+  ~15+ devices: the P4 could not fit the fleet in one 4096-byte SPI frame and
+  silently dropped the reply. `api_device_list` now sends `GET_DEVICES` with a
+  `uint16` LE `start_index`, parses each `{"next":N,"devices":[...]}` chunk,
+  re-serialises every device element into a **PSRAM accumulator** (64 KB,
+  sized for `ZAP_MAX_DEVICES` × ~320 B), and follows the `next` cursor until
+  done. The loop is bounded (`ZAP_MAX_DEVICES + 8` pages) so it can never spin,
+  and the accumulator is freed on every exit path. The reassembled output is
+  the same `{"devices":[...]}` the SPA already consumes. The 1 s burst-coalesce
+  cache now holds the full list (grown from `HAP_MAX_PAYLOAD` to the
+  accumulator size). The WS `device.list` response cap (`ws_bridge.cpp`) and
+  the REST `/api/devices` buffer (`rest_devices.cpp`) are bumped 8/16 KB → 40 KB
+  (~125 devices) so the now-complete list isn't re-truncated at the transport;
+  past that the accumulator truncates with a logged warning instead of
+  emitting broken JSON.
   `CONFIG_LOG_DEFAULT_LEVEL` ≤ INFO (≤ 3) — `esp_http_client` logs full request
   URLs at DEBUG, and the `tg_gw` Telegram client carries the bot token in the
   URL, so a DEBUG/VERBOSE image leaks the token to serial / `/api/logs`.

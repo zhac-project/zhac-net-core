@@ -31,30 +31,137 @@
 
 static const char* TAG_API = "api_devices";
 
-// Device-list cap matches the largest snapshot the P4 sends (HAP_MAX_PAYLOAD).
-static constexpr size_t kDevListRspCap = HAP_MAX_PAYLOAD;
-static constexpr size_t kDevInfoRspCap = HAP_MAX_PAYLOAD;
+// Each DEVICE_LIST chunk the P4 sends is one SPI frame (<= HAP_MAX_PAYLOAD).
+static constexpr size_t kDevListChunkCap = HAP_MAX_PAYLOAD;
+static constexpr size_t kDevInfoRspCap   = HAP_MAX_PAYLOAD;
+
+// PAGING (HOTFIX): the P4 cannot fit a full fleet in one 4096-byte frame
+// (~16 realistic devices overflow it), so GET_DEVICES is now paged — each
+// roundtrip returns one chunk `{"next":N,"devices":[...]}` and we follow the
+// `next` cursor until done, accumulating every device into ONE reassembled
+// `{"devices":[...]}`. Worst case ZAP_MAX_DEVICES(200) × ~320 B ≈ 64 KB, so
+// the accumulator lives in PSRAM (internal DRAM is the tight heap on S3).
+static constexpr size_t kDevListAccumCap = 64 * 1024;
+// Loop bound — never spin even if a buggy peer fails to advance the cursor.
+static constexpr int     kDevListMaxPages = ZAP_MAX_DEVICES + 8;
 
 // ── Devices ──────────────────────────────────────────────────────────────
 
 // Coalesce burst calls. The SPA's auto-refresh + manual click can queue a
 // dozen `device.list` cmds in <100 ms; without this gate every one fires
-// a fresh GET_DEVICES + DEVICE_LIST round-trip across SPI, exhausting
+// a fresh (now multi-page) GET_DEVICES round-trip across SPI, exhausting
 // the HAP session window and tipping both sides into retransmit storms.
 // 1 s TTL is generous — DEVICE_LIST changes only on join/leave, and
 // push events (`device.added/removed`) refresh the cache out-of-band.
 static constexpr int64_t kDevListCacheMs = 1000;
 static SemaphoreHandle_t s_devlist_cache_mutex = nullptr;
 static int64_t           s_devlist_last_ok_ms  = 0;
-static char*             s_devlist_cache_buf   = nullptr;
+static char*             s_devlist_cache_buf   = nullptr;   // holds the FULL list
 static size_t            s_devlist_cache_len   = 0;
 
 static void devlist_cache_init() {
     if (s_devlist_cache_mutex) return;
     s_devlist_cache_mutex = xSemaphoreCreateMutex();
+    // Cache the reassembled list (not a single chunk), so size it to the
+    // accumulator, not HAP_MAX_PAYLOAD.
     s_devlist_cache_buf   = static_cast<char*>(
-        heap_caps_malloc(kDevListRspCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        heap_caps_malloc(kDevListAccumCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     configASSERT(s_devlist_cache_mutex && s_devlist_cache_buf);
+}
+
+// Fetch every device page from the P4 and reassemble into `out` as a single
+// `{"devices":[...]}` document. Returns the assembled length (excl. NUL) on
+// success, or 0 on failure (timeout / parse error / accumulator overflow).
+// `out` must be at least kDevListAccumCap bytes.
+//
+// CURSOR IS A RAW ARRAY INDEX, not a stable device key. If the pool gains or
+// loses a device between pages (multi-roundtrip paging is NOT a single atomic
+// snapshot — the pool lock is held only per-chunk on P4), indices shift and this
+// reassembly may drop or duplicate ONE device in THIS response only. Self-heals
+// on the next refresh (1s cache) + device.added/removed events. Proper fix: a
+// pool-generation token in the envelope, restart-on-mismatch — deferred (exceeds
+// hotfix scope). See FINDINGS follow-up.
+static size_t devlist_fetch_all(char* out, size_t out_cap) {
+    // Per-chunk receive buffer (one SPI frame). PSRAM via rest_big_alloc so a
+    // burst of concurrent callers doesn't churn the tight internal heap.
+    char* chunk = static_cast<char*>(rest_big_alloc(kDevListChunkCap));
+    if (!chunk) return 0;
+
+    // Build the reassembled array by appending each chunk's elements. We open
+    // the envelope once, splice every device object across all pages, close
+    // once. Re-serialising each element keeps the element shape byte-exact.
+    size_t pos = 0;
+    auto put = [&](const char* s, size_t n) -> bool {
+        if (pos + n + 1 > out_cap) return false;   // +1 for trailing NUL
+        memcpy(out + pos, s, n);
+        pos += n;
+        return true;
+    };
+    if (!put("{\"devices\":[", 12)) { free(chunk); return 0; }
+
+    bool first_elem = true;
+    uint16_t start   = 0;
+    bool ok_done     = false;
+    for (int page = 0; page < kDevListMaxPages; page++) {
+        uint8_t req[2] = { static_cast<uint8_t>(start & 0xFF),
+                           static_cast<uint8_t>((start >> 8) & 0xFF) };
+        size_t got = 0;
+        if (!hap_roundtrip_v2(HapMsgType::GET_DEVICES, req, sizeof(req),
+                              chunk, kDevListChunkCap, &got, 5000)) {
+            ESP_LOGE(TAG_API, "device.list page %d roundtrip failed (start=%u)",
+                     page, (unsigned)start);
+            free(chunk);
+            return 0;
+        }
+
+        JsonDocument doc;
+        DeserializationError de = deserializeJson(doc, chunk, got);
+        if (de) {
+            ESP_LOGE(TAG_API, "device.list page %d JSON parse: %s",
+                     page, de.c_str());
+            free(chunk);
+            return 0;
+        }
+
+        JsonArrayConst devs = doc["devices"].as<JsonArrayConst>();
+        for (JsonObjectConst o : devs) {
+            if (!first_elem && !put(",", 1)) { free(chunk); return 0; }
+            // Re-serialise this element straight into the accumulator tail.
+            size_t avail = out_cap - pos - 1;            // reserve NUL
+            size_t w = serializeJson(o, out + pos, avail);
+            if (w == 0 || w >= avail) {                  // element didn't fit
+                ESP_LOGE(TAG_API, "device.list accumulator overflow at page %d",
+                         page);
+                free(chunk);
+                return 0;
+            }
+            pos += w;
+            first_elem = false;
+        }
+
+        // `next` cursor: absent / >= would-not-advance means done. The P4
+        // sets next == device count when the final page is reached, and
+        // guarantees forward progress (next > start) otherwise.
+        // NOTE: the terminal DATA page reports next==count (>start), so S3 always spends one final empty GET_DEVICES roundtrip to observe next==start. Bounded + cached 1s; acceptable.
+        uint16_t next = doc["next"] | static_cast<uint16_t>(0);
+        if (!doc["next"].is<uint16_t>() || next <= start) {
+            // Either no cursor (legacy single-frame peer) or the terminal
+            // page — we are done after consuming this chunk.
+            ok_done = true;
+            break;
+        }
+        start = next;
+    }
+
+    free(chunk);
+    if (!ok_done) {
+        ESP_LOGE(TAG_API, "device.list paging hit max %d pages without done",
+                 kDevListMaxPages);
+        return 0;
+    }
+    if (!put("]}", 2)) return 0;
+    out[pos] = '\0';
+    return pos;
 }
 
 extern "C" ApiStatus api_device_list(const char* /*body*/, size_t /*body_len*/,
@@ -84,26 +191,30 @@ extern "C" ApiStatus api_device_list(const char* /*body*/, size_t /*body_len*/,
         xSemaphoreGive(s_devlist_cache_mutex);
     }
 
-    auto rsp = std::unique_ptr<char[]>(new (std::nothrow) char[kDevListRspCap]);
-    if (!rsp) return API_INTERNAL_ERROR;
-    size_t got = 0;
-    if (!hap_roundtrip_v2(HapMsgType::GET_DEVICES, nullptr, 0,
-                           rsp.get(), kDevListRspCap, &got, 5000)) {
-        return API_INTERNAL_ERROR;
-    }
+    // Reassemble all pages into a PSRAM accumulator.
+    char* accum = static_cast<char*>(rest_big_alloc(kDevListAccumCap));
+    if (!accum) return API_INTERNAL_ERROR;
+    size_t total = devlist_fetch_all(accum, kDevListAccumCap);
+    if (total == 0) { free(accum); return API_INTERNAL_ERROR; }
 
     // Refresh cache + reply. Cache write is mutex-guarded so concurrent
     // callers see a consistent buffer.
     xSemaphoreTake(s_devlist_cache_mutex, portMAX_DELAY);
-    const size_t cache_n = (got < kDevListRspCap) ? got : kDevListRspCap;
-    memcpy(s_devlist_cache_buf, rsp.get(), cache_n);
+    const size_t cache_n = (total < kDevListAccumCap) ? total : kDevListAccumCap - 1;
+    memcpy(s_devlist_cache_buf, accum, cache_n);
+    s_devlist_cache_buf[cache_n] = '\0';
     s_devlist_cache_len  = cache_n;
     s_devlist_last_ok_ms = esp_timer_get_time() / 1000;
     xSemaphoreGive(s_devlist_cache_mutex);
 
-    size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
-    memcpy(rsp_buf, rsp.get(), n);
+    size_t n = (total >= rsp_cap) ? rsp_cap - 1 : total;
+    if (total >= rsp_cap) {
+        ESP_LOGW(TAG_API, "device.list %u B exceeds caller cap %u — truncated",
+                 (unsigned)total, (unsigned)rsp_cap);
+    }
+    memcpy(rsp_buf, accum, n);
     rsp_buf[n] = '\0';
+    free(accum);
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
