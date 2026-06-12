@@ -44,6 +44,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   `api_device_opt_flush_now()` is called from the OTA and deferred-reboot paths
   (next to `rule_store_flush_now()`) so nothing staged is lost across a
   restart. (`api_devices.cpp` :503)
+  - _Known limitation:_ a device-opt staged within the 2 s debounce window is
+    discarded on a WiFi-forget / factory reboot — that path intentionally wipes
+    NVS, so the staged write is dropped with the rest of config (no flush hook,
+    by design).
 - **api_system (P4-T29, FINDINGS §6, BLOCK)** — `api_settings_set` opened +
   committed + closed the `sys_cfg` namespace **three separate times** in one
   request (timezone / metrics_en / ap_disabled) — three flash-page writes for a

@@ -484,6 +484,9 @@ extern "C" ApiStatus api_wifi_disconnect(const char* /*body*/, size_t /*body_len
     static esp_timer_handle_t s_forget_timer = nullptr;
     if (!s_forget_timer) {
         const esp_timer_create_args_t args = {
+            // no api_device_opt_flush_now() here: forget wipes NVS + reboots, so
+            // a staged device-opt is intentionally discarded with the rest of
+            // config (different state class).
             .callback = [](void*) { wifi_mgr_forget_and_reboot(); },
             .arg = nullptr,
             .dispatch_method = ESP_TIMER_TASK,

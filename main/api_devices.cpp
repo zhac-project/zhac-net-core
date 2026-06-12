@@ -41,7 +41,9 @@ static const char* TAG_API = "api_devices";
 //
 // `nvs_set_str` already stages the value in RAM and makes it visible to the
 // next read on the SAME long-lived handle; only the `nvs_commit` need be
-// durable. So we debounce the commit: each set re-arms a one-shot timer and
+// durable. NVS serialises handle ops internally; only commit ORDERING matters
+// here, not a data race (set/get run on the httpd task, commit on the esp_timer
+// task). So we debounce the commit: each set re-arms a one-shot timer and
 // the commit lands once the writes go quiet (DEBOUNCE_US), coalescing a burst
 // into a single page write. `s_opt_dirty` guards against a needless commit.
 // Mirrors the rule_store deferred-flush pattern (F-04) — including an explicit
