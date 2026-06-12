@@ -17,7 +17,13 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   heartbeat's) and passes it to `sys_metrics_sample_cpu_pct(ctx, c0, c1)`. The
   default single httpd worker serialises status requests; a fanned-out worker
   pool would at worst yield a transient bogus reading, not state corruption.
-- **api_devices (HOTFIX)** — `api_device_list` now LOOPS over the paged
+- **metrics_mqtt (P4-T28, FINDINGS §8)** — the snapshot publisher already
+  skipped the publish when `mqtt_format_snapshot_json` returned 0 (the new
+  truncation contract), but did so **silently**, so a chronically-oversized
+  snapshot — e.g. after a metric is added that blows the 2 KB `s_buf` — would
+  just stop appearing on the broker with no trace. `on_tick` now emits a
+  **rate-limited** (one line / ~5 min) `ESP_LOGW` on the skip so the condition
+  is diagnosable without log spam.
   `GET_DEVICES` protocol and reassembles every chunk into one full
   `{"devices":[...]}`. The device list previously timed out for anyone with
   ~15+ devices: the P4 could not fit the fleet in one 4096-byte SPI frame and

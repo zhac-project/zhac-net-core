@@ -38,7 +38,24 @@ void on_tick(void*) {
     if (!mqtt_gw_is_connected() || !mqtt_gw_is_secure()) return;
     metrics::update_memory_snapshot();
     const size_t n = metrics::mqtt_format_snapshot_json(s_buf, sizeof(s_buf));
-    if (n == 0) return;
+    if (n == 0) {
+        // The exporter returns 0 only when the snapshot did not fit
+        // s_buf and was therefore truncated to invalid JSON — we skip
+        // the publish (FINDINGS §8). With kBufLen = 2048 this should
+        // never trip; if it does, a metric was added that blows the
+        // buffer and the snapshot will silently stop publishing, so
+        // surface it. Rate-limited to one line per ~5 min so a
+        // chronically-oversized snapshot can't spam the log.
+        static int64_t s_last_warn_us = 0;
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_warn_us > 300LL * 1000000LL) {
+            s_last_warn_us = now_us;
+            ESP_LOGW(TAG, "snapshot truncated (>%u B) — publish skipped; "
+                          "raise kBufLen or trim metrics",
+                     (unsigned)kBufLen);
+        }
+        return;
+    }
     mqtt_gw_publish(kTopic, s_buf, n, 0, false);
 }
 
