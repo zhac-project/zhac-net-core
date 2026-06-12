@@ -9,6 +9,16 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **hap_master (P4-T31, FINDINGS HAP, `hap_master.cpp` `do_two_stage_exchange`)**
+  — turned the `s_dispatch_buf` consume-synchronously assumption into an
+  ENFORCED invariant. The static `s_dispatch_buf` (PSRAM post-DMA copy target)
+  is single-owner: the dispatch callback must consume it synchronously before
+  the next exchange reuses it. The callback runs AFTER `s_spi_mutex` is released
+  (synchronously, between release and function return), so a lightweight
+  function-static re-entrancy guard now wraps the post-release `s_cb` call —
+  `configASSERT(!s_in_dispatch)` fires if a future 2nd dispatch task ever
+  re-enters while a callback is mid-flight. Comment + guard only; buffer
+  ownership and the SPI flow are unchanged.
 - **ws_bridge / remote_client (P4-T29, FINDINGS §5, SEC)** — the
   client-supplied envelope `id` was spliced **unescaped** into every response
   frame (`{"id":"<id>",...}`) on all three string-id paths (error reply, the
