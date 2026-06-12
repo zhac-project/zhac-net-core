@@ -125,14 +125,19 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     }
 
     // Response + envelope live in PSRAM. `logs.get` alone needs ~32 KB;
-    // every other command fits comfortably in 8 KB. Starting small
-    // keeps per-command allocation churn low during bootstrap bursts
-    // (8+ commands hit the backend the moment the SPA connects). If
-    // the handler's output would overflow 32 KB we bail with an error
-    // — only `logs.get` realistically needs that room and we size it
-    // explicitly below.
+    // most commands fit comfortably in 8 KB. Starting small keeps
+    // per-command allocation churn low during bootstrap bursts (8+
+    // commands hit the backend the moment the SPA connects). If the
+    // handler's output would overflow the cap we bail with an error.
+    //
+    // `device.list` is now PAGED + reassembled into one full
+    // `{"devices":[...]}` (HOTFIX) — a large fleet (200 devices ≈ 64 KB
+    // worst case) blows past 8 KB, so give it the big bucket too; ~40 KB
+    // covers ~125 devices, beyond which the accumulator truncates with a
+    // logged warning rather than emitting broken JSON.
     const bool is_logs = (strcmp(cmd, "logs.get") == 0);
-    const size_t kRspCap      = is_logs ? (40 * 1024) : (8 * 1024);
+    const bool is_devlist = (strcmp(cmd, "device.list") == 0);
+    const size_t kRspCap      = (is_logs || is_devlist) ? (40 * 1024) : (8 * 1024);
     const size_t kEnvelopeCap = kRspCap + 1024;
     char* rsp_buf = static_cast<char*>(heap_caps_malloc(kRspCap, MALLOC_CAP_SPIRAM));
     char* env_buf = static_cast<char*>(heap_caps_malloc(kEnvelopeCap, MALLOC_CAP_SPIRAM));

@@ -87,13 +87,17 @@ esp_err_t handle_get_devices(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     // F-01 v2: hap_roundtrip_v2 admits concurrent callers up to its
     // own waiter-slot cap; the old REST-level mutex probe is gone.
-    char* buf = static_cast<char*>(rest_big_alloc(16 * 1024));   // F33: PSRAM
+    // HOTFIX: device.list is now paged + reassembled into one full
+    // {"devices":[...]}; a large fleet overflows the old 16 KB buffer, so
+    // size it like the WS path (~40 KB ≈ 125 devices). Past that the
+    // accumulator truncates with a logged warning rather than mid-JSON.
+    char* buf = static_cast<char*>(rest_big_alloc(40 * 1024));   // F33: PSRAM
     if (!buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_OK;
     }
     size_t n = 0;
-    ApiStatus st = api_device_list(nullptr, 0, buf, 16 * 1024, &n);
+    ApiStatus st = api_device_list(nullptr, 0, buf, 40 * 1024, &n);
     if (st != API_OK) {
         free(buf);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "P4 timeout");
