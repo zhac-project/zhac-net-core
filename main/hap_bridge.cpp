@@ -171,38 +171,134 @@ static HapWaiter         s_waiters[kHapWaiterCount];
 static SemaphoreHandle_t s_waiter_table_mutex = nullptr;
 static SemaphoreHandle_t s_waiter_free_sem    = nullptr;
 
-// Claim one free slot under the table mutex. Caller must already have
-// decremented s_waiter_free_sem so a free slot exists — we just find it.
-static HapWaiter* waiter_claim(uint16_t seq, HapMsgType rsp_type,
+// Data requests are sent HAP_FLAG_NO_ACK, so the window/retransmit-based
+// on_link_dead never fires for them. Track consecutive roundtrip timeouts as
+// an independent data-link liveness signal: a streak ⇒ presume the link dead
+// and force a re-SYNC (see hap_roundtrip_v2 tail).
+static std::atomic<uint8_t>   s_roundtrip_dead_streak{0};
+static constexpr uint8_t      HAP_ROUNDTRIP_DEAD_STREAK = 3; // consecutive timeouts ⇒ link presumed dead
+
+// Number of distinct seqs we will try before giving up when every candidate
+// collides with an in-flight waiter. With only kHapWaiterCount (8) slots ever
+// active, a collision is already vanishingly rare; 8 tries makes exhaustion
+// effectively impossible while staying bounded.
+static constexpr int kWaiterClaimMaxTries = 8;
+
+// Claim one free slot under the table mutex AND assign it a seq that is not
+// already in use by any active waiter. Caller must already have decremented
+// s_waiter_free_sem so a free slot exists.
+//
+// Defect 1 (FINDINGS §1.1): the seq is a uint16. After 65534 sends the
+// hap_session counter wraps and can hand out a value that a long-stalled
+// in-flight waiter still holds. If two waiters share a seq, waiter_find_by_seq
+// matches the OLDER one and delivers caller A's response into caller B's
+// buffer. Drawing the seq UNDER the table mutex and rejecting any value that
+// collides with a live slot closes the window: a fresh seq cannot alias an
+// active waiter. hap_session_next_seq() is the seq source and already skips 0,
+// so every candidate here is a valid on-wire seq; we re-check the skip-0
+// invariant defensively. On exhaustion we fail the claim (caller bails and
+// returns the free-sem) rather than risk a colliding correlation.
+static HapWaiter* waiter_claim(HapMsgType rsp_type,
                                 char* rsp_buf, size_t rsp_cap,
-                                size_t* rsp_len_out) {
+                                size_t* rsp_len_out,
+                                uint16_t* seq_out) {
     xSemaphoreTake(s_waiter_table_mutex, portMAX_DELAY);
     HapWaiter* w = nullptr;
     for (auto& s : s_waiters) {
         if (s.seq == 0) { w = &s; break; }
     }
-    if (w) {
-        w->seq         = seq;
-        w->rsp_type    = rsp_type;
-        w->rsp_buf     = rsp_buf;
-        w->rsp_cap     = rsp_cap;
-        w->rsp_len_out = rsp_len_out;
-        w->ok          = false;
-        xSemaphoreTake(w->sem, 0);   // drain any stale signal from prior use
+    if (!w) {
+        xSemaphoreGive(s_waiter_table_mutex);
+        return nullptr;
     }
+
+    uint16_t seq = 0;
+    bool seq_ok  = false;
+    for (int attempt = 0; attempt < kWaiterClaimMaxTries; ++attempt) {
+        const uint16_t cand = hap_session_next_seq();
+        if (cand == 0) continue;   // skip-0 convention (matches next_seq)
+        bool collides = false;
+        for (auto& s : s_waiters) {
+            if (s.seq == cand) { collides = true; break; }
+        }
+        if (!collides) { seq = cand; seq_ok = true; break; }
+    }
+    if (!seq_ok) {
+        // Every candidate collided with a live slot (or was 0). Do NOT claim
+        // the slot — leave it free and signal failure so the caller returns
+        // the free-sem and reports a clean error instead of risking a
+        // cross-delivered correlation.
+        xSemaphoreGive(s_waiter_table_mutex);
+        return nullptr;
+    }
+
+    w->seq         = seq;
+    w->rsp_type    = rsp_type;
+    w->rsp_buf     = rsp_buf;
+    w->rsp_cap     = rsp_cap;
+    w->rsp_len_out = rsp_len_out;
+    w->ok          = false;
+    xSemaphoreTake(w->sem, 0);   // drain any stale signal from prior use
+    *seq_out = seq;
     xSemaphoreGive(s_waiter_table_mutex);
     return w;
 }
 
-static HapWaiter* waiter_find_by_seq(uint16_t seq) {
-    if (seq == 0) return nullptr;
+// Defect 2 (FINDINGS §1.2): atomic response delivery.
+//
+// The frame callback (task_hap) previously found the waiter under the mutex,
+// RELEASED the mutex, then memcpy'd into w->rsp_buf, wrote *rsp_len_out, and
+// gave the sem — all unlocked. If the caller had already timed out and called
+// waiter_release() in that gap, the slot could be reclaimed and re-pointed at a
+// DIFFERENT caller's buffer, so the memcpy landed in the wrong buffer (and the
+// sem-give woke the wrong caller). Two reviewers flagged this independently.
+//
+// Fix: find + re-check + memcpy + len-write + sem-give all happen UNDER the
+// table mutex as one indivisible step. A timed-out caller's waiter_release()
+// (also mutex-guarded) cannot interleave: either it ran first (seq==0 ⇒ no
+// match here, we drop the late frame) or it is blocked until we finish (in
+// which case we delivered into the still-valid slot before it freed it). The
+// memcpy is bounded (≤ rsp_cap ≤ HAP_MAX_PAYLOAD) and non-blocking, so holding
+// the mutex across it is safe — we never block while holding it.
+//
+// Returns true if a matching, still-waiting slot was found and delivered.
+static bool waiter_deliver(uint16_t ack_seq, HapMsgType rsp_type,
+                           const uint8_t* payload, uint16_t payload_len) {
+    if (ack_seq == 0) return false;
     xSemaphoreTake(s_waiter_table_mutex, portMAX_DELAY);
     HapWaiter* w = nullptr;
     for (auto& s : s_waiters) {
-        if (s.seq == seq) { w = &s; break; }
+        // Re-check seq AND in-use (seq!=0): a released slot has seq==0 and is
+        // skipped, so a late frame for a timed-out caller cannot be written.
+        if (s.seq != 0 && s.seq == ack_seq) { w = &s; break; }
+    }
+    bool delivered = false;
+    if (w) {
+        if (rsp_type == w->rsp_type) {
+            const size_t n =
+                std::min(static_cast<size_t>(payload_len), w->rsp_cap);
+            if (n > 0 && payload) memcpy(w->rsp_buf, payload, n);
+            if (n < payload_len) {
+                ESP_LOGW(TAG,
+                         "hap_roundtrip_v2: truncated rsp type=0x%02x %u->%zu",
+                         static_cast<uint8_t>(rsp_type), payload_len, n);
+            }
+            *w->rsp_len_out = n;
+            w->ok = true;
+        } else {
+            ESP_LOGW(TAG,
+                     "hap_roundtrip_v2: type mismatch seq=%u got=0x%02x want=0x%02x",
+                     ack_seq, static_cast<uint8_t>(rsp_type),
+                     static_cast<uint8_t>(w->rsp_type));
+        }
+        // Give the sem INSIDE the lock so the wake is atomic w.r.t. the buffer
+        // write and the release: the caller cannot observe a half-written
+        // buffer, and a concurrent waiter_release sees a coherent slot.
+        xSemaphoreGive(w->sem);
+        delivered = true;
     }
     xSemaphoreGive(s_waiter_table_mutex);
-    return w;
+    return delivered;
 }
 
 static void waiter_release(HapWaiter* w) {
@@ -261,11 +357,15 @@ bool hap_roundtrip_v2(HapMsgType type,
         return false;
     }
 
-    const uint16_t seq = hap_session_next_seq();
-    HapWaiter* w = waiter_claim(seq, rsp_type, rsp_buf, rsp_cap, rsp_len_out);
+    uint16_t seq = 0;
+    HapWaiter* w = waiter_claim(rsp_type, rsp_buf, rsp_cap, rsp_len_out, &seq);
     if (!w) {
-        // Free-sem said a slot existed; if claim fails the table state
-        // diverged from the sem count — give the sem back and bail.
+        // Either the table state diverged from the sem count, or every seq
+        // candidate collided with a live waiter (Defect 1 exhaustion — should
+        // be impossible with 8 slots). Either way give the sem back and bail
+        // with a clean error rather than risk a colliding correlation.
+        ESP_LOGE(TAG, "hap_roundtrip_v2: waiter_claim failed (req=0x%02x)",
+                 static_cast<uint8_t>(type));
         xSemaphoreGive(s_waiter_free_sem);
         return false;
     }
@@ -281,9 +381,24 @@ bool hap_roundtrip_v2(HapMsgType type,
     const bool got = xSemaphoreTake(w->sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     const bool ok  = got && w->ok;
     waiter_release(w);
-    if (!got) {
+    if (got) {
+        // A reply arrived ⇒ the data link is alive; clear the dead-link streak.
+        s_roundtrip_dead_streak.store(0, std::memory_order_release);
+    } else {
         ESP_LOGW(TAG, "hap_roundtrip_v2 timeout type=0x%02x seq=%u after %" PRIu32 "ms",
                  static_cast<uint8_t>(type), seq, timeout_ms);
+        // Data requests are NO_ACK, so the window-based on_link_dead never fires for them.
+        // Repeated roundtrip timeouts while heartbeats still flow = a half-dead link (P4 tore
+        // its session down and is awaiting SYNC). Force a re-SYNC to recover — clearing s_synced
+        // makes the hap_task loop resend SYNC_REQ. exchange() so we only act on the true→false edge.
+        const uint8_t streak = static_cast<uint8_t>(
+            s_roundtrip_dead_streak.fetch_add(1, std::memory_order_release) + 1);
+        if (streak >= HAP_ROUNDTRIP_DEAD_STREAK &&
+            s_synced.exchange(false, std::memory_order_acq_rel)) {
+            ESP_LOGE(TAG, "HAP data link dead — %u consecutive roundtrip timeouts, forcing re-SYNC",
+                     streak);
+            s_roundtrip_dead_streak.store(0, std::memory_order_release);
+        }
     }
     return ok;
 }
@@ -312,10 +427,11 @@ void send_sync_req() {
 // frame callback fires from task_hap, the flush is the loop-tail timer
 // check); no mutex needed. If another task ever needs to drive these,
 // add a lock here.
-static constexpr size_t   BULK_COALESCE_CAP    = 4096;
+// BULK_COALESCE_CAP itself lives in s3_internal.h — ws_bridge sizes its
+// event envelope from it so a maximal coalesced batch always fits the frame.
 static constexpr uint32_t BULK_COALESCE_WIN_MS = 100;
 
-static char        s_bulk_buf[BULK_COALESCE_CAP];
+EXT_RAM_BSS_ATTR static char s_bulk_buf[BULK_COALESCE_CAP];
 static size_t      s_bulk_len   = 0;
 static uint16_t    s_bulk_count = 0;
 static TickType_t  s_bulk_last_flush = 0;
@@ -370,27 +486,12 @@ void task_hap(void*) {
             // seq still gives the sem so the caller doesn't hang —
             // w->ok stays false → caller returns error.
             if (f.ack_seq != 0) {
-                if (HapWaiter* w = waiter_find_by_seq(f.ack_seq)) {
-                    if (f.type == w->rsp_type) {
-                        const size_t n = std::min(
-                            static_cast<size_t>(f.payload_len), w->rsp_cap);
-                        memcpy(w->rsp_buf, f.payload, n);
-                        if (n < f.payload_len) {
-                            ESP_LOGW(TAG,
-                                     "hap_roundtrip_v2: truncated rsp type=0x%02x %u→%zu",
-                                     static_cast<uint8_t>(f.type),
-                                     f.payload_len, n);
-                        }
-                        *w->rsp_len_out = n;
-                        w->ok = true;
-                    } else {
-                        ESP_LOGW(TAG,
-                                 "hap_roundtrip_v2: type mismatch seq=%u got=0x%02x want=0x%02x",
-                                 f.ack_seq, static_cast<uint8_t>(f.type),
-                                 static_cast<uint8_t>(w->rsp_type));
-                    }
-                    xSemaphoreGive(w->sem);
-                }
+                // Defect 2 (FINDINGS §1.2): the find + buffer write + sem-give
+                // are now one atomic step under the table mutex (see
+                // waiter_deliver) so a concurrently-timing-out caller's
+                // waiter_release can never reclaim the slot mid-copy and steer
+                // the memcpy into a different caller's buffer.
+                waiter_deliver(f.ack_seq, f.type, f.payload, f.payload_len);
             }
             switch (f.type) {
                 case HapMsgType::HEARTBEAT: {

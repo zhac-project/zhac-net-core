@@ -7,6 +7,144 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Security
+
+- **docs/config**: documented that release builds MUST keep
+  `CONFIG_LOG_DEFAULT_LEVEL` ≤ INFO (≤ 3) — `esp_http_client` logs full request
+  URLs at DEBUG, and the `tg_gw` Telegram client carries the bot token in the
+  URL, so a DEBUG/VERBOSE image leaks the token to serial / `/api/logs`.
+  `sdkconfig.prod.defaults` already pins WARN (level 2); the risk and the rule
+  are now noted in README "Known hardening gaps".
+
+### Fixed — High / Medium / Low (P2 findings review, T16 wifi_mgr event-loop unblock)
+
+- **wifi_mgr** (High): the STA reconnect backoff did `vTaskDelay` (up to 60 s)
+  INSIDE the `WIFI_EVENT_STA_DISCONNECTED` handler, which runs in the default
+  `esp_event` loop task. Sleeping there stalled ALL system event dispatch for
+  the whole STA-down window — IP got-IP, AP join/leave, the MQTT bring-up
+  triggered off got-IP, and the remote_client wifi bits — and risked
+  event-queue overflow. The handler now computes the backoff and arms a
+  one-shot `esp_timer` (`wifi_reconnect`), then returns immediately; the timer
+  callback (esp_timer task, not an ISR) issues `esp_wifi_connect()`. The
+  backoff schedule is unchanged (2 s ≤5 retries, 10 s 6..30, 60 s after) — only
+  WHERE the wait happens moved. The retry counter is now `std::atomic<int>`
+  (defensive; still single-producer in the esp_event task) and got-IP cancels
+  any pending reconnect. (FINDINGS §5.1, :103)
+- **wifi_mgr** (Medium): `s_scan_results` / `s_scan_count` were unsynchronised
+  statics reachable concurrently from the local httpd task and `task_remote`
+  (`wifi.scan` is remote-allow-listed), so a concurrent scan could tear the
+  array out from under a reader. Added `s_scan_mtx`; the results read-back +
+  count store in `wifi_mgr_scan` is now mutex-guarded (the blocking
+  `esp_wifi_scan_start` stays outside the lock — esp_wifi's scan engine is
+  single-instance, so a concurrent start just errors), and
+  `wifi_mgr_get_scan_results` was changed to copy a stable snapshot into a
+  caller-owned buffer under the lock instead of returning the live pointer.
+  Caller (`api_wifi_scan`) updated to the snapshot API. (FINDINGS §5.2, :487)
+- **wifi_mgr** (Low): the captive-DNS task only re-checked `s_ap_mode` AFTER a
+  blocking `recvfrom`, so after AP-disable it lingered (socket + ~3 KB stack)
+  until a stray packet arrived, and the start guard then blocked respawn. The
+  socket now carries `SO_RCVTIMEO` (1 s); the recv loop re-checks `s_ap_mode`
+  each timeout and, on AP-stop, closes the socket, clears the (now file-scope)
+  `s_dns_started`, and deletes the task so a later AP-enable respawns it. The
+  1 s timeout paces the poll (no busy-spin). (FINDINGS §5.3, :319)
+
+### Fixed — High / Medium (P2 findings review, T14 HAP correlation edges)
+
+- **hap_bridge** (High): the per-request-seq WAITER table (`hap_roundtrip_v2`)
+  drew its correlation seq from `hap_session_next_seq()` and claimed a slot
+  without checking the seq was free. After 65534 sends the uint16 seq wraps
+  and could alias a long-stalled in-flight waiter; `waiter_find_by_seq` then
+  matched the OLDER slot and delivered one caller's response into another
+  caller's buffer. `waiter_claim` now draws the seq UNDER the table mutex and
+  rejects any candidate already held by a live slot (bounded 8-try loop,
+  skips 0 to match the session convention; on exhaustion the claim fails and
+  the roundtrip returns a clean error rather than risking a colliding
+  correlation). (FINDINGS §1.1, :271)
+- **hap_bridge** (Medium): response delivery in the `on_frame` callback
+  (task_hap) found the waiter under the mutex, RELEASED it, then memcpy'd into
+  `w->rsp_buf`, wrote `*rsp_len_out`, and gave the sem unlocked. If the caller
+  timed out and `waiter_release`'d in that gap, the slot could be reclaimed and
+  re-pointed at a different caller's buffer, so the copy landed in the wrong
+  buffer (flagged by two reviewers). Delivery is now one atomic step
+  (`waiter_deliver`): find + re-check `seq!=0 && seq==ack_seq` + type-check +
+  bounded memcpy + len-write + sem-give all happen under
+  `s_waiter_table_mutex`. A timed-out caller's release (also mutex-guarded)
+  cannot interleave: it either ran first (seq==0 ⇒ no match, late frame
+  dropped) or is blocked until delivery completes into the still-valid slot.
+  The mutex is never held across a blocking call — the memcpy is bounded by
+  `rsp_cap` (≤ HAP_MAX_PAYLOAD). (FINDINGS §1.2, :395)
+
+### Changed — DRAM→PSRAM static buffer sweep (P1, T12)
+
+- Routed cold/warm static buffers to PSRAM via `EXT_RAM_BSS_ATTR`
+  (`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y`): `hap_bridge` attr.bulk
+  coalescer (4 KB), `wifi_mgr` scan results (1.8 KB), `metrics_mqtt` snapshot
+  scratch (2 KB), `api_groups` group-list records (9.5 KB — the single largest
+  dram0 .bss symbol), `main` alert ring (3.5 KB), `rest_rules` group-handler
+  scratch (3.2 KB), and `hap_master`'s frame dispatch buffer (4 KB — the
+  post-DMA copy only; the actual SPI DMA buffers `s_tx_buf`/`s_rx_buf` stay
+  internal/DMA-capable).
+- `rest_ops` handler stack buffers (/api/status, /api/alerts,
+  /api/diagnostics/unhandled, /api/wifi/scan — 7 KB total) converted to
+  function-static PSRAM scratch. Safe because esp_http_server serialises all
+  URI handlers on its single worker task (one httpd instance, ws_server);
+  also relieves httpd-task stack pressure.
+- Net effect (`idf.py size`, S3 app, includes the zhac-components moves):
+  dram0 `.bss` 47,736 → 12,648 B (−35,088 B). The only remaining ≥1 KB
+  internal .bss symbol is ESP-IDF's coredump stack, which must stay internal
+  (panic path).
+
+### Fixed — WebSocket subsystem hardening (P1)
+
+- **ws_server**: broadcasts now skip sockets that opened `/ws` but never
+  authenticated (when a token is configured) — previously an unauthed socket
+  passively received every event: device states, alerts, log lines. The
+  `{"cmd":"auth"}` handshake reply is a targeted `ws_server_reply` and is
+  unaffected.
+- **ws_server**: send-failure handling in `ws_server_broadcast` no longer
+  logs inside the send loop. Failures are collected, the dead fd is removed
+  FIRST, and the warning logged after — with the WS log sink enabled the old
+  order re-entered the log pipeline against the same dead fd and recursed to
+  stack overflow. A per-task re-entry guard (`ws_server_in_broadcast`)
+  additionally drops WS-sink fan-out of any line logged from inside the
+  broadcast path. `ws_server_reply` gets the same remove-then-log ordering.
+- **log_ring**: the WS log sink no longer calls `ws_server_broadcast` from
+  the logging task (which stalled arbitrary tasks behind a slow client and
+  formed the recursion pair above) — it enqueues to the F33 WS-TX worker via
+  the new `ws_bridge_broadcast_enqueue()`, which never blocks and never logs
+  (drops are counted).
+- **ws_bridge**: event envelope was 2048 B while hap_bridge's attr.bulk
+  coalescer emits up to 4096 B — coalesced batches >~2 KB were silently
+  replaced with `data:null`, losing live updates under load.
+  `BULK_COALESCE_CAP` moved to `s3_internal.h`; the (PSRAM) envelope is now
+  sized `BULK_COALESCE_CAP + 128` with an ESP_LOGW on the now-unreachable
+  truncation fallback.
+- **ws_bridge**: `on_mqtt_rx` MQTT→WS mirroring and the `device_deleted`
+  event (api_devices) route through the WS-TX worker queue instead of
+  fanning out on the esp-mqtt / httpd task. `ws_server_broadcast` is now
+  called exclusively by the TX worker.
+- **ws_server**: registered an httpd `close_fn` — abnormal disconnects
+  (TCP RST, keepalive death, LRU purge) never hit `remove_fd`, leaking one
+  of the 3 client-table slots until a later send happened to fail. The hook
+  fires for every terminated session; `remove_fd` no-ops for non-WS fds.
+- **ws_server**: a `/ws` open beyond the 3-client table is now actively
+  closed (`httpd_sess_trigger_close` + warn) instead of staying half-alive
+  (could send commands, never received broadcasts).
+- **ws_server**: WS PING frames are answered with PONG again —
+  `handle_ws_control_frames` flipped to `false` so esp_http_server
+  auto-replies PONG/CLOSE per RFC 6455 (the old handler swallowed PING);
+  CLOSE teardown lands in the new `close_fn`.
+- **ws_bridge**: inbound envelope `args` larger than the 2 KB serialize
+  buffer were silently truncated into corrupt JSON — now measured first and
+  rejected with `err:"args too large"`.
+- **main**: `status.get` gains `ws_tx_drops` (frames dropped on the WS-TX
+  path: queue full / not started / snapshot alloc failure) so slow-client
+  drop pressure is observable.
+
+**NEEDS HARDWARE TEST** — PING/PONG keepalive, RST slot reclaim via the
+httpd `close_fn`, and auth-gated broadcast filtering need on-device
+verification.
+
 ### Added — Per-device flood control
 
 - **device.options.set**: now accepts `throttle_ms` (per-device report
@@ -188,4 +326,3 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   image rolled back on every subsequent boot when rollback was
   enabled. `app_update` added to the main component REQUIRES for
   explicitness (transitively pulled by `esp_https_ota` already). (F-08)
-</content>

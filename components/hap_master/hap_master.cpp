@@ -5,6 +5,7 @@
 #include "hap_protocol_decode.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -78,7 +79,7 @@ void hap_master_init() {
         .duty_cycle_pos   = 0,
         .cs_ena_pretrans  = 0,
         .cs_ena_posttrans = 0,
-        .clock_speed_hz   = 8 * 1000 * 1000,  // 8 MHz on 2-3 cm soldered copper on breadboard. 4 MHz proved stable (28 ms RTTs, no SPI mutex timeouts under burst); pushing higher to claim more headroom. If P4→S3 goes unidirectional-silent (the historical 5 MHz failure mode on the old 20 cm jumper rig), drop back to 4 or 6 MHz. 10 MHz remains the next candidate on a real PCB.
+        .clock_speed_hz   = 6 * 1000 * 1000,  // 6 MHz on 2-3 cm soldered copper on breadboard. Dropped from 8 MHz: at 8 MHz a transient P4→S3 unidirectional-silent / ACK-loss event triggered a permanent half-dead link after ~48h (data NO_ACK frames never fired the window-based on_link_dead, so S3 never re-SYNCed). 6 MHz cuts that transient rate while keeping headroom. 4 MHz proved stable (28 ms RTTs, no SPI mutex timeouts under burst). 10 MHz remains the next candidate on a real PCB.
         .input_delay_ns   = 0,
         .sample_point     = {},
         .spics_io_num     = PIN_CS,
@@ -105,7 +106,7 @@ void hap_master_init() {
 
     s_spi_mutex = xSemaphoreCreateMutex();
     configASSERT(s_spi_mutex);
-    ESP_LOGI(TAG, "hap_master init OK — SPI2 master 8 MHz, DRDY GPIO%d", PIN_DRDY);  // F48: matches clock_speed_hz (was a stale "10 MHz")
+    ESP_LOGI(TAG, "hap_master init OK — SPI2 master 6 MHz, DRDY GPIO%d", PIN_DRDY);  // F48: matches clock_speed_hz (8→6 MHz, fix/hap-link-resync)
 }
 
 static void do_two_stage_exchange(const HapFrame& my_frame) {
@@ -175,7 +176,10 @@ static void do_two_stage_exchange(const HapFrame& my_frame) {
     // call holds s_spi_mutex; the callback runs synchronously between
     // mutex release and function return, after which the buffer is free
     // for the next exchange.
-    static uint8_t s_dispatch_buf[HAP_MAX_PAYLOAD];
+    // PSRAM (EXT_RAM_BSS_ATTR): this is the post-DMA copy target only —
+    // it is NEVER handed to the SPI driver. The actual DMA buffers
+    // (s_tx_buf/s_rx_buf) must stay internal/DMA-capable and do.
+    EXT_RAM_BSS_ATTR static uint8_t s_dispatch_buf[HAP_MAX_PAYLOAD];
 
     if (s2_len > 0) {
         memset(s_tx_buf, 0, s2_len);

@@ -152,6 +152,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"log_ws_level\":\"%c\""
          ",\"ap_disabled\":%s"
          ",\"ws_clients\":%d"
+         ",\"ws_tx_drops\":%" PRIu32
          ",\"synced\":%s"
          ",\"metrics_enabled\":%s"
          ",\"auth_enabled\":%s"
@@ -204,6 +205,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         log_sinks_get_ws_level(),
         s_ap_disabled                                    ? "true" : "false",
         ws_server_client_count(),
+        ws_bridge_tx_drops(),
         s_synced.load(std::memory_order_acquire)         ? "true" : "false",
         s_metrics_enabled                                ? "true" : "false",
         s_auth_enabled                                   ? "true" : "false",
@@ -366,8 +368,13 @@ extern "C" ApiStatus api_wifi_scan(const char* /*body*/, size_t /*body_len*/,
                                     char* rsp_buf, size_t rsp_cap,
                                     size_t* rsp_len) {
     wifi_mgr_scan();
-    uint16_t count = 0;
-    const wifi_ap_record_t* results = wifi_mgr_get_scan_results(&count);
+    // T16 (FINDINGS §5.2): copy a stable snapshot of the scan results — the
+    // underlying array is shared with the remote-client task (wifi.scan is
+    // remote-allow-listed) and could be overwritten by a concurrent scan if
+    // we iterated the live static. Buffer matches the internal capacity.
+    static constexpr uint16_t kMaxAps = WIFI_MGR_MAX_SCAN;
+    wifi_ap_record_t results[kMaxAps];
+    uint16_t count = wifi_mgr_get_scan_results(results, kMaxAps);
 
     int pos = 0;
     pos += snprintf(rsp_buf + pos, rsp_cap - pos, "{\"networks\":[");

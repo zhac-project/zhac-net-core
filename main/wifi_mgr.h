@@ -39,6 +39,13 @@ void wifi_mgr_get_ip_str(char* buf, size_t len);
 const char* wifi_mgr_get_ap_ssid(void);
 
 /**
+ * Maximum number of AP records retained by a single scan. The internal scan
+ * buffer and any caller-side snapshot buffer share this bound. Defined as a
+ * macro (not a constexpr) so this C-compatible header stays usable from C TUs.
+ */
+#define WIFI_MGR_MAX_SCAN 20
+
+/**
  * Perform a blocking WiFi scan and return the number of APs found.
  * After this call, use wifi_mgr_get_scan_results() to access the records.
  * Returns 0 on error.
@@ -46,11 +53,19 @@ const char* wifi_mgr_get_ap_ssid(void);
 uint16_t wifi_mgr_scan(void);
 
 /**
- * Access the most recent scan results.
- * @param count_out  receives the number of records.
- * @return pointer to the internal wifi_ap_record_t array (valid until next scan).
+ * Copy a snapshot of the most recent scan results into a caller-owned buffer.
+ *
+ * The internal results array is shared between the local httpd task and the
+ * remote-client task (wifi.scan is remote-allow-listed). Returning a pointer
+ * to the live static let a concurrent scan overwrite the array mid-read; this
+ * snapshot API copies under the scan mutex so the caller gets a stable copy.
+ *
+ * @param out  caller-owned buffer to receive the records (may be nullptr only
+ *             if @p max is 0).
+ * @param max  capacity of @p out in records.
+ * @return number of records actually copied (min of stored count and @p max).
  */
-const wifi_ap_record_t* wifi_mgr_get_scan_results(uint16_t* count_out);
+uint16_t wifi_mgr_get_scan_results(wifi_ap_record_t* out, uint16_t max);
 
 /**
  * Erase stored WiFi credentials from NVS and reboot.

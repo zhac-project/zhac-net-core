@@ -9,7 +9,7 @@
 //   - WS    (frame {type:"log", entry:{…}})
 
 #include "log_ring.h"
-#include "s3_internal.h"   // ws_event_broadcast
+#include "s3_internal.h"   // ws_bridge_broadcast_enqueue
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -217,17 +217,27 @@ void dispatch_to_sinks(const char* src, char level,
         }
     }
 
-    if (ws_on && level_passes(level, s_ws_level.load())) {
+    if (ws_on && level_passes(level, s_ws_level.load()) &&
+        !ws_server_in_broadcast()) {
         // Only the legacy frame remains — the new SPA polls
         // `logs.get` every 5 s from pages/Logs.jsx instead of
         // subscribing to `log.entry` events. Per-log ws_event
         // fan-out created alloc + mutex pressure that stalled
         // TaskHTTP under bootstrap load.
+        //
+        // Enqueue to the WS-TX worker, NEVER ws_server_broadcast directly:
+        // the direct call ran the per-client fan-out on whatever task logged
+        // (stalling it behind a slow client) and, worse, a send failure
+        // inside the broadcast logged again → unbounded recursion → stack
+        // overflow. The enqueue path never blocks and never logs (drops are
+        // counted in ws_bridge_tx_drops()). The ws_server_in_broadcast()
+        // gate above additionally drops lines logged from INSIDE the
+        // broadcast send path itself, so the TX worker can't feed itself.
         int w = snprintf(frame, kFrameCap,
                          "{\"type\":\"log\",\"level\":\"%c\",\"entry\":%s}",
                          level, body);
         if (w > 0 && (size_t)w < kFrameCap) {
-            ws_server_broadcast(frame, (size_t)w);
+            ws_bridge_broadcast_enqueue(frame, (size_t)w);
         }
     }
 

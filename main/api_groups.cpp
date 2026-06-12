@@ -20,6 +20,7 @@
 #include <ctime>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -46,7 +47,10 @@ static void grp_parse_members_from_body(const char* body, GrpRecord& r) {
 extern "C" ApiStatus api_group_list(const char* /*body*/, size_t /*body_len*/,
                                      char* rsp_buf, size_t rsp_cap,
                                      size_t* rsp_len) {
-    static GrpRecord all[GRP_MAX_GROUPS];
+    // PSRAM: ~9.5 KB of group records, refilled from NVS on every call —
+    // cold path, would otherwise be the single largest dram0 .bss symbol.
+    // (Pre-existing `static` — call sites are serialised the same as before.)
+    EXT_RAM_BSS_ATTR static GrpRecord all[GRP_MAX_GROUPS];
     uint16_t cnt = grp_load_all(all, GRP_MAX_GROUPS);
     size_t pos = 0;
     pos += snprintf(rsp_buf + pos, rsp_cap - pos, "{\"groups\":[");

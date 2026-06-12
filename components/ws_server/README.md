@@ -1,184 +1,172 @@
 # ws_server — WebSocket server (S3 only)
 
-Thin wrapper around ESP-IDF's `esp_http_server` that owns the boot of
-the on-device HTTP daemon, registers the `/ws` endpoint, and exposes a
-small fan-out / point-reply API. The same `httpd_handle_t` is reused by
-the REST handlers in `firmware/zhac-net-core/main/rest_*.cpp`, so the SPA, the
-REST API and the WS channel all share one socket pool.
+Thin wrapper around ESP-IDF's `esp_http_server` that owns the boot of the
+on-device HTTP daemon, registers the `/ws` endpoint, and exposes a small
+fan-out / point-reply API. The same `httpd_handle_t` is reused by the REST
+handlers in `main/rest_*.cpp` (fetched via `ws_server_get_handle()`), so the
+SPA, the REST API and the WS channel all share one socket pool.
 
-## Purpose
-
-The SPA in `www-spa/` is WebSocket-first: every command/response
-envelope and every push event traverses `/ws`. This component is the
-device-side half of that channel — it accepts the upgrade, optionally
-authenticates the handshake, tracks live sockets and provides
-`broadcast`/`reply` primitives that callers (`ws_bridge.cpp`,
-`hap_bridge.cpp`, `log_ring.cpp`) drive.
-
-It does **not** know anything about the message envelope or the API. It
-just hands raw text frames to a registered RX callback and ships
-caller-formatted JSON back out.
+The component is envelope-agnostic: it hands raw text frames to a registered
+RX callback and ships caller-formatted JSON back out. Envelope shape
+(`{id,cmd,args}` / `{event,data}`) is owned by `main/ws_bridge.cpp` and
+documented in `zhac-docs/WS_API.md` (sibling repo).
 
 ## Where it sits
 
 - **Chip:** ESP32-S3 only (P4 has no IP stack).
-- **Owns:** the singleton `httpd_handle_t` (`server_port=80`,
-  `max_open_sockets=9`, `max_uri_handlers=48`, `stack_size=8192`,
-  `lru_purge_enable=true`).
+- **Owns:** the singleton `httpd_handle_t` — `server_port=80`,
+  `max_open_sockets=9` (LWIP cap 10, one reserved for listen),
+  `max_uri_handlers=48`, `stack_size=12288` (the worst observed chain —
+  `api_rule_list → hap_roundtrip → SPI exchange → BULK callback →
+  ws_event_broadcast → lwip_send` — tripped the canary at 8 K),
+  `lru_purge_enable=true`, TCP keepalive `10/5/3`,
+  `recv/send_wait_timeout=10` (F33 slowloris bound), and a custom
+  `close_fn` (see Lifecycle).
 - **Called by:**
-  - `firmware/zhac-net-core/main/main.cpp:589` — `ws_server_init()` boots the
-    daemon during S3 startup.
-  - `firmware/zhac-net-core/main/main.cpp:649` — installs `on_ws_rx` as the
-    RX callback that decodes `{id,cmd,args}` envelopes.
-  - `firmware/zhac-net-core/main/main.cpp:121` /
-    `auth_rotate_token()` (`main.cpp:131`) — pushes the API token after
-    NVS load and on rotation.
-  - `firmware/zhac-net-core/main/ws_bridge.cpp:236` — `ws_event_broadcast()`
-    formats the `{event,data}` envelope, then calls
-    `ws_server_broadcast()`.
-  - `firmware/zhac-net-core/main/ws_bridge.cpp` `on_ws_rx` /
-    `ws_dispatch_send_reply` — calls `ws_server_reply(fd, …)` for
-    correlated command responses.
-  - `firmware/zhac-net-core/main/rest_ops.cpp:527` —
-    `ws_server_get_handle()` to register the REST URI handlers on the
-    same daemon.
-- **Dependencies (`REQUIRES`):** `esp_http_server`, `freertos`.
+  - `main/main.cpp` — `ws_server_init()` at boot; pushes the API token after
+    NVS load and on rotation (`ws_server_set_api_token`,
+    `ws_server_fd_deauth_all`).
+  - `main/ws_bridge.cpp` — installs `on_ws_rx`; its TX worker is the **only**
+    caller of `ws_server_broadcast()`; dispatch replies via
+    `ws_server_reply(fd, …)`.
+  - `main/log_ring.cpp` — WS log sink; checks `ws_server_in_broadcast()`
+    before fanning a log line out to WS.
+  - `main/rest_ops.cpp` — `ws_server_get_handle()` to register REST URIs on
+    the same daemon.
+  - `components/remote_client` — `ws_server_register_reply_hook()` to route
+    sentinel-fd replies over the cloud link.
+- **Dependencies (`REQUIRES`):** `esp_http_server`; uses FreeRTOS mutex +
+  `heap_caps_malloc` (PSRAM).
 
-## Public API
+## Public API (`include/ws_server.h`)
 
-All declarations live in `include/ws_server.h`.
+| Symbol | Contract |
+|--------|----------|
+| `ws_server_init()` | Creates the fd-table mutex, starts httpd on :80, registers `/ws`, installs `close_fn`. Call exactly once. On `httpd_start` failure logs and returns; all other calls are then no-ops (`s_server == nullptr`). |
+| `ws_server_broadcast(json, len)` | Fan-out of one TEXT frame to every **authed** fd. **Single-broadcaster contract: only the ws_bridge TX worker may call this** (enforced by a `configASSERT` on the `s_broadcast_task` guard). Producers must use `ws_bridge_broadcast_enqueue()` / `ws_event_broadcast()` (`main/s3_internal.h`) instead. Snapshots the fd list under `s_mutex`, releases it, then loops `httpd_ws_send_frame_async`. **Never logs inside the send loop** — failures are collected, dead fds removed first, logged after (log-sink recursion guard). |
+| `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted** (`remove_fd` before logging — same ordering rule as broadcast). |
+| `ws_server_get_handle()` | Underlying daemon handle for registering additional URIs. `nullptr` before init. |
+| `ws_server_set_rx_callback(cb)` | Installs the inbound text-frame callback (single slot, latest wins, `nullptr` detaches). |
+| `ws_server_set_api_token(token)` | Sets the 32-char token (`char[33]`, truncated). `nullptr`/`""` disables auth entirely (token set ⇔ auth on). |
+| `ws_server_client_count()` | Live fd count under `s_mutex`. |
+| `ws_server_in_broadcast()` | True when the *calling* task is inside the broadcast send loop. Used by the log pipeline to drop WS fan-out of lines logged from within the TX path. |
+| `ws_server_fd_is_authed(fd)` / `ws_server_fd_set_authed(fd)` | F18 per-fd auth state; the dispatch layer permits only `auth` until set. |
+| `ws_server_fd_deauth_all()` | Q48: clears every authed flag on token rotation — stale-token sockets must re-auth. |
+| `ws_server_register_reply_hook(sentinel_fd, hook)` | Routes `ws_server_reply` for one reserved sentinel fd (outside legal httpd range) to a hook (e.g. remote_client). Single slot; register before traffic; `nullptr` unregisters. |
 
-| Symbol | Purpose | Notes / called from |
-|--------|---------|---------------------|
-| `using WsRxCallback = void(*)(int fd, const char* data, size_t len);` | Per-frame callback for inbound text frames. `fd` identifies the socket so the handler can reply with `ws_server_reply()`. | Single global slot; latest registration wins. |
-| `void ws_server_init();` | Creates the fd-table mutex, starts the httpd daemon on port 80, registers the `/ws` URI handler. Logs `ws_server started on :80/ws`. Idempotent guards are absent — call exactly once. | `main.cpp:app_main` |
-| `void ws_server_broadcast(const char* json, size_t len);` | Sends `json` as `HTTPD_WS_TYPE_TEXT` to every fd in the table. Snapshots the fd list under `s_mutex`, releases it, then loops `httpd_ws_send_frame_async`. Failed sends drop the fd via `remove_fd()` and log `ws_broadcast: send failed fd=%d err=%d`. | `ws_bridge.cpp:ws_event_broadcast` |
-| `void ws_server_reply(int fd, const char* json, size_t len);` | One-shot point reply for command responses correlated by envelope `id`. No-op if `fd < 0` or daemon is down. Logs `ws_reply: send failed …` on failure but does **not** evict the fd (caller may retry). | `ws_bridge.cpp` dispatch path |
-| `httpd_handle_t ws_server_get_handle();` | Returns the underlying daemon handle so other components can register additional URIs on the same daemon. Returns `nullptr` before `ws_server_init()` succeeds. | `rest_ops.cpp:527` |
-| `void ws_server_set_rx_callback(WsRxCallback cb);` | Installs the inbound-frame callback. Pass `nullptr` to detach. | `main.cpp:649` |
-| `void ws_server_set_api_token(const char* token);` | Sets the 32-byte hex API token (max 32 chars + NUL). Pass `nullptr` or `""` to disable handshake auth. | `main.cpp:121,149` and `auth_rotate_token` |
-| `int ws_server_client_count();` | Snapshot of the live fd count under `s_mutex`. Mostly for logging / metrics gating. | available to callers |
+## Constants
 
-## Important constants
+| Symbol | Value | Why |
+|--------|-------|-----|
+| `MAX_WS_CLIENTS` | 3 | Hard cap on concurrent WS sockets. **Table full → `httpd_sess_trigger_close(fd)`** — a slot-less socket would be a half-functional zombie (accepts commands, never sees a broadcast). |
+| `WS_RX_MAX` | 8 KB | DS10: cap on an inbound text frame (covers rule DSL + `script.check` Lua source). Larger frames are logged and dropped — no huge forced allocation. |
+| Token length | exactly 32 chars | Constant-time XOR-accumulate compare, no short-circuit. |
 
-| Symbol | Value | Where | Why |
-|--------|-------|-------|-----|
-| `MAX_WS_CLIENTS` | `3` | `ws_server.cpp:15` | Hard cap on concurrent WS sockets. Excess accepts are logged as `WS client limit reached, rejecting fd=%d`. The fd is added to the table only if there's room; httpd keeps the underlying socket but the server will never broadcast to it. |
-| `s_api_token` | `char[33]` | `ws_server.cpp:13` | Fixed-size token buffer; tokens longer than 32 chars are truncated. |
-| Auth token length check | `strlen(key) != 32` | `ws_server.cpp` `ws_handler` | Handshake auth requires *exactly* 32 chars. |
-| `cfg.max_open_sockets` | `9` | `ws_server.cpp:ws_server_init` | LWIP cap is 10; httpd reserves one for the listen socket. |
-| `cfg.max_uri_handlers` | `48` | `ws_server.cpp:ws_server_init` | Headroom for REST endpoints registered via `ws_server_get_handle()`. |
-| `cfg.stack_size` | `8192` | `ws_server.cpp:ws_server_init` | Default 4096 was too small for the static-file handler's path buffers. |
+## Auth (F18 — first-message auth)
 
-## Wire format / handshake
+When a token is configured the socket **may open unauthenticated**; there is
+no 401 at the upgrade. Per-fd state drives two gates:
 
-The component is envelope-agnostic — JSON shape is decided by callers
-(`ws_bridge.cpp` and the SPA per `docs/WS_API.md`). For reference:
+1. **Handshake fast-path:** a valid token in the `X-Api-Key` header (or the
+   legacy `?token=` query) marks the fd authed at upgrade time — back-compat
+   for non-browser clients. Browsers connect bare and send a first
+   `{"cmd":"auth"}` message instead, keeping the long-lived token out of
+   proxy/access logs. The dispatch layer (`ws_bridge.cpp`) rejects every
+   other command on an unauthed fd.
+2. **Broadcast gate:** `ws_server_broadcast` skips unauthed fds when auth is
+   on — an unauthenticated socket passively receives **nothing** (no device
+   states, alerts, log lines); it only gets targeted `ws_server_reply`
+   frames (e.g. the auth handshake response itself, which is never a
+   broadcast).
 
-- **Command request:**  `{"id":<u32>, "cmd":"<name>", "args":{…}}`
-- **Command response:** `{"id":<u32>, "ok":true|false, "data":…|"err":"…"}`
-- **Push event:**       `{"event":"<name>", "data":{…}}`
+Token rotation calls `ws_server_fd_deauth_all()` so live sessions on the old
+token drop back to the auth-only command set.
 
-Handshake (HTTP `GET /ws`, `Upgrade: websocket`):
+## Broadcast TX contract (single broadcaster)
 
-1. If no API token is configured, the upgrade is accepted unconditionally.
-2. If a token is configured, the handler reads either:
-   - the `X-Api-Key` header (preferred for non-browser clients), or
-   - the `?token=<…>` query parameter (required for browser
-     `WebSocket()` constructor — it cannot set custom headers).
-3. The token is required to be exactly 32 chars and is compared
-   constant-time (XOR-accumulate over all 32 bytes — no short-circuit).
-4. On mismatch the handler returns `401 Unauthorized` and the fd is
-   not added to the table.
+`ws_server_broadcast` is **not** a general-purpose producer API:
 
-There is no in-band `{"auth": "..."}` re-handshake; auth is purely a
-handshake-time decision.
+- The ONLY sanctioned caller is the ws_bridge TX worker
+  (`ws_bridge_tx_init`). Arbitrary tasks enqueue via
+  `ws_bridge_broadcast_enqueue(json, len)` — copies the frame, never blocks,
+  **never logs** (log-pipeline-safe; queue-full/OOM drops are counted in
+  `ws_bridge_tx_drops()` and surfaced in `status.get`). See the contract
+  block in `main/s3_internal.h`.
+- A `configASSERT` before the guard store fires if a second task enters the
+  send loop concurrently.
+- Inside the send loop: no `ESP_LOG*` and no early returns between the
+  `s_broadcast_task` guard stores — with the WS log sink enabled a log line
+  re-enters the WS TX path, and a stuck guard would permanently mute the
+  sink. `ws_server_in_broadcast()` is the sink's re-entry check.
+- Failure handling: collect failed fds, `remove_fd` them all **first**, log
+  after — the fd is already gone, so a re-broadcast of the log line can't
+  re-fail (bounded, no recursion).
 
-## Threading & concurrency
+## Lifecycle: close_fn + control frames
 
-- `s_mutex` (FreeRTOS mutex, created in `ws_server_init`) protects only
-  the fd table (`s_fds`, `s_fd_count`). Never held across an httpd
-  send.
-- `add_fd` / `remove_fd` take `s_mutex` for the duration of the
-  table edit.
-- `ws_server_broadcast` takes `s_mutex` only long enough to
-  `memcpy` the fd list onto the stack, then releases it before the
-  `httpd_ws_send_frame_async` loop. This is the load-bearing pattern
-  that prevents a slow client from blocking the next broadcast.
-- `ws_server_reply` does not take `s_mutex` — it operates on a single
-  caller-supplied fd.
-- Callers **must not** hold any of their own mutexes across
-  `ws_server_broadcast` / `ws_server_reply` (see WEB-F2 below). The
-  canonical caller-side pattern is in `ws_bridge.cpp:ws_event_broadcast`:
-  format under the local scratch mutex, snapshot the bytes, release
-  the local mutex, then call into `ws_server`.
-- `httpd_ws_send_frame_async` itself enqueues work on the httpd
-  control socket; concurrent broadcasts from multiple producer tasks
-  serialise inside httpd, not inside this component.
+- `cfg.close_fn = ws_httpd_close_fn` fires on **every** terminated session —
+  plain HTTP and WS alike; graceful CLOSE, TCP RST, keepalive death, LRU
+  purge. It runs `remove_fd(sockfd)` (no-op for non-WS fds) **and then
+  `close(sockfd)`** — under IDF v6.0 a custom `close_fn` replaces the
+  server's own close, so skipping the `close()` would leak the socket.
+  Without this hook, abnormal disconnects only freed a table slot when a
+  later send happened to fail.
+- `handle_ws_control_frames = false`: httpd itself answers PING with PONG
+  and replies to CLOSE (RFC 6455), then tears the session down through
+  `close_fn`. (The old `true` setting swallowed PING without a PONG, so
+  keepalive-probing clients timed out.) Control frames never reach
+  `ws_handler`.
 
-## Error / failure modes
+## Inbound path
+
+Text frames only. The handler probes the frame length (`max_len=0`),
+enforces `WS_RX_MAX`, then reads into a right-sized **PSRAM** buffer
+(`MALLOC_CAP_SPIRAM`, internal-heap fallback), NUL-terminates and invokes
+the RX callback. The old fixed 256-byte stack buffer (truncated rule DSL /
+Lua uploads) is gone.
+
+## Threading
+
+- `s_mutex` protects only the fd table (`s_fds`, `s_fd_authed`,
+  `s_fd_count`); never held across an httpd send.
+- `httpd_ws_send_frame_async` enqueues on the httpd control socket; the
+  single-broadcaster rule means fan-out ordering is decided in the TX
+  worker's queue, not by racing producers.
+- Callers must not hold their own mutexes across `ws_server_broadcast` /
+  `ws_server_reply` (WEB-F2): format under a local lock, snapshot, release,
+  then send.
+
+## Failure modes
 
 | Condition | Behaviour |
 |-----------|-----------|
-| fd table full | `add_fd` logs `WS client limit reached, rejecting fd=%d`, leaves the socket alive but unsubscribed. |
-| Send failure during broadcast | `ws_broadcast: send failed fd=%d err=%d`; the fd is removed from the table immediately. |
-| Send failure during reply | `ws_reply: send failed fd=%d err=%d`; the fd is **not** removed — the caller may retry or wait for the next broadcast to evict it. |
-| Auth missing / wrong length / mismatch | `401 Unauthorized` body `unauthorized`, fd not added. |
-| `httpd_start` failure | `ws_server_init` logs `httpd_start failed` and returns; subsequent calls are no-ops because `s_server` stays `nullptr`. |
-| Inbound `HTTPD_WS_TYPE_CLOSE` or `httpd_ws_recv_frame` error | fd removed from the table, error returned to httpd. |
-| Inbound payload >256 B | Frame is truncated to the 256-byte stack buffer in `ws_handler`. Callers must keep WS commands small (the SPA's largest commands fit). |
-
-## Integration example
-
-```c
-#include "ws_server.h"
-
-static void on_ws_rx(int fd, const char* data, size_t len) {
-    // Parse {id, cmd, args} envelope, dispatch, reply with
-    // ws_server_reply(fd, response_json, response_len).
-}
-
-void s3_init(const char* api_token) {
-    ws_server_init();
-    ws_server_set_rx_callback(on_ws_rx);
-    if (api_token && api_token[0]) {
-        ws_server_set_api_token(api_token);   // 32-char hex token
-    }
-}
-
-void push_event(const char* envelope_json, size_t n) {
-    if (ws_server_client_count() == 0) return;
-    ws_server_broadcast(envelope_json, n);
-}
-```
+| fd table full | `WS client limit (3) reached, closing fd=%d` + `httpd_sess_trigger_close`. |
+| Send failure (broadcast) | fd removed first, then `ws_broadcast: send failed fd=%d err=%d (removed)`. |
+| Send failure (reply) | fd removed first, then `ws_reply: send failed fd=%d err=%d (removed)`. |
+| Inbound frame > 8 KB | `ws frame %u B exceeds cap %u — dropped`; connection stays up. |
+| Frame buffer OOM | `ESP_ERR_NO_MEM` returned to httpd. |
+| `httpd_ws_recv_frame` error | fd removed, error returned to httpd (session torn down → `close_fn`). |
+| `httpd_start` failure | logged; component stays inert. |
 
 ## Recent changes
 
-- **2026-04-25 — WEB-F2 (CRITICAL → fixed).**
-  `ws_server_broadcast` now snapshots the fd table under `s_mutex` and
-  releases the lock before the per-fd `httpd_ws_send_frame_async`
-  loop. The matching caller-side fix lives in
-  `firmware/zhac-net-core/main/ws_bridge.cpp:ws_event_broadcast`: format the
-  `{event,data}` envelope into the static 2 KB scratch under
-  `s_evt_mutex`, copy onto the stack, release `s_evt_mutex`, then call
-  `ws_server_broadcast`. A slow WS client can no longer stall TaskHAP,
-  the log task or the alert task. See `docs/FINDINGS.md#web-f2`.
-- **2026-04-25 — CC-F6 (related).** The dead raw-broadcast path in
-  `firmware/p4_core/main/hap_dispatch.cpp` (`bulk_push` /
-  `flush_bulk` / `encode_bulk`) is being retired alongside the type-tag
-  split (HAP-F3); the S3 side already routes everything through
-  `ws_event_broadcast`.
+- **2026-06 — d4a4626 (WS hardening cluster).** Broadcasts are auth-gated
+  (unauthed fds receive nothing but targeted replies); log-sink recursion on
+  dead-fd sends killed via the never-log-in-send-loop rule +
+  `ws_server_in_broadcast()` guard; `close_fn` slot cleanup on every session
+  end (incl. RST/LRU) with explicit `close(sockfd)`; `handle_ws_control_frames
+  = false` so httpd answers PING/PONG and CLOSE itself; 8 KB PSRAM inbound
+  cap; table-full now closes the socket; reply-path eviction; single-
+  broadcaster `configASSERT`. **Hardware gate:** PING→PONG keepalive and
+  client-table reclaim after a hard TCP RST need manual on-device
+  verification.
 
 ## Cross-references
 
-- `docs/WS_API.md` — command list and envelope schema (SPA contract).
-- `docs/REST_API.md` — REST surface that shares the same `httpd_handle_t`.
-- `docs/FINDINGS.md#web-f2`, `docs/FINDINGS.md#cc-f8` — the audit
-  entries that drove today's broadcast fix and the API-token rate-limit
-  follow-up.
-- `firmware/zhac-net-core/main/ws_bridge.cpp` — envelope formatting,
-  RX dispatch table (~35 entries), `ws_event_broadcast`.
-- `firmware/zhac-net-core/main/api_handlers.{h,cpp}` — the transport-agnostic
-  command handlers reached from both REST and WS.
-- `components/metrics/README.md` — sibling shared-infrastructure
-  component.
+- `zhac-docs/WS_API.md` — command list + envelope schema (SPA contract).
+- `zhac-docs/REST_API.md` — REST surface sharing the same `httpd_handle_t`.
+- `main/ws_bridge.cpp` — envelope formatting, RX dispatch, TX worker,
+  `ws_event_broadcast` / `ws_bridge_broadcast_enqueue`.
+- `main/s3_internal.h` — the producer-side broadcast contract block.
+- `main/log_ring.cpp` — WS log sink (consumer of `ws_server_in_broadcast`).
+- `components/remote_client` — sentinel-fd reply hook user.
