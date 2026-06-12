@@ -88,6 +88,15 @@ static constexpr EventBits_t EVB_AUTH_OK      = 1 << 5;
 static constexpr EventBits_t EVB_AUTH_FAIL    = 1 << 6;
 static constexpr EventBits_t EVB_BACKOFF_DONE = 1 << 7;
 static constexpr EventBits_t EVB_TX           = 1 << 8; // RX/TX frame pending — wake the loop to drain the queues now
+// Defensive (FINDINGS §5, :536): remote_client_enable() must NOT load NVS into
+// s_cfg from the API caller's task while a live task_remote concurrently reads
+// s_cfg.url / s_cfg.token (start_ws_client / send_auth_frame) — that races a
+// torn credential read. Instead enable() sets this bit and the remote task
+// reloads s_cfg from NVS at a safe point (top of the loop, before any connect),
+// so only task_remote ever touches s_cfg. api_remote_connect persists the new
+// url/token to NVS *before* calling enable(), so the deferred reload always
+// observes the fresh creds.
+static constexpr EventBits_t EVB_RELOAD_CFG   = 1 << 9;
 
 // Persistent config (loaded from NVS, refreshed on _enable()).
 struct RemoteCfg {
@@ -133,19 +142,15 @@ extern "C" void remote_client_publish_event(const char* name,
         ESP_LOGW(TAG, "publish_event OOM (event=%s)", name);
         return;
     }
-    int n;
-    if (payload_json && payload_len > 0) {
-        n = snprintf(buf, kCap, "{\"event\":\"%s\",\"data\":%.*s}",
-                     name, (int)payload_len, payload_json);
-    } else {
-        n = snprintf(buf, kCap, "{\"event\":\"%s\",\"data\":null}", name);
-    }
-    if (n <= 0 || (size_t)n >= kCap) {
+    // Shared envelope builder (remote_client.h) — same format + overflow
+    // contract as ws_bridge's local broadcast; the two can no longer drift.
+    size_t n = ws_event_envelope_build(buf, kCap, name, payload_json, payload_len);
+    if (n == 0) {
         heap_caps_free(buf);
         return;
     }
 
-    TxItem item{ buf, (size_t)n };
+    TxItem item{ buf, n };
     if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
         // Queue full — drop oldest, free, enqueue this.
         TxItem old{};
@@ -194,7 +199,26 @@ static void ws_event_handler(void* /*arg*/, esp_event_base_t /*base*/,
             xEventGroupSetBits(s_remote_evt, EVB_WSS_EVENT);
             break;
         case WEBSOCKET_EVENT_DATA:
-            // Only text frames; binary is unexpected, skip.
+            // INBOUND FRAME CONTRACT (FINDINGS §5, :199) — 8 KB single-frame cap.
+            //
+            // This handler dispatches ONLY complete, single text frames:
+            //   - op_code 0x01 (text). Binary (0x02) and, deliberately,
+            //     fragmentation continuation frames (op_code 0x00 with a
+            //     non-zero payload_offset) are dropped — reassembly across
+            //     CONTINUATION frames is NOT implemented in this batch.
+            //   - data_len in (0, 8192]. The esp_websocket_client buffer_size
+            //     is fixed at 8 KB (see start_ws_client) and the outbound
+            //     publish_event envelope shares the same 8 KB cap, so both
+            //     directions agree on the bound.
+            //
+            // CONTRACT for the cloud: every device-bound message MUST fit in a
+            // single ≤ 8 KB text frame. Larger or fragmented payloads are
+            // silently discarded here and will never reach dispatch — the
+            // device-sync protocol must page/chunk to stay under the cap
+            // (cross-ref: project_hub_cloud_devicesync — remote device.list /
+            // events; the reconcile relist must not emit a >8 KB frame). If a
+            // future protocol revision needs larger frames, raise buffer_size
+            // AND implement continuation reassembly here together.
             if (d->op_code != 0x01) break;
             if (d->data_len == 0 || d->data_len > 8192) break;
             {
@@ -357,21 +381,40 @@ static bool sta_has_ip() {
 }
 
 static void task_remote_body(void*) {
-    // Initial event: ENABLE if cfg says so, otherwise stay DISABLED.
-    if (s_cfg.enabled && s_cfg.url[0] && s_cfg.token[0]) {
-        auto cur = s_state.load(std::memory_order_relaxed);
-        s_state.store(remote_state_next(cur, REMOTE_EV_ENABLE),
-                      std::memory_order_release);
-    }
+    // Initial enable is driven exclusively by the EVB_ENABLE bit that
+    // remote_client_init()/remote_client_enable() set after spawning us — we do
+    // NOT read s_cfg here. Reading s_cfg at body entry would (a) race a
+    // concurrent remote_client_disable() clearing s_cfg on the API task during
+    // a respawn, and (b) duplicate the EVB_ENABLE step. enable() also queues
+    // EVB_RELOAD_CFG, so s_cfg is refreshed in-loop before the first connect.
 
-    // State-entry detection for AUTHENTICATING (Fix 2).
-    static RemoteState last_state = REMOTE_STATE_DISABLED;
+    // State-entry detection for AUTHENTICATING — LOCAL (not static): the task
+    // self-deletes on DISABLED and is respawned on re-enable, so a static would
+    // retain the previous incarnation's state and break just_entered_auth edge
+    // detection. A fresh task always starts from DISABLED.
+    RemoteState last_state = REMOTE_STATE_DISABLED;
 
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_remote_evt,
             EVB_ENABLE | EVB_DISABLE | EVB_WIFI_UP | EVB_WIFI_DOWN |
-            EVB_WSS_EVENT | EVB_AUTH_OK | EVB_AUTH_FAIL | EVB_BACKOFF_DONE | EVB_TX,
+            EVB_WSS_EVENT | EVB_AUTH_OK | EVB_AUTH_FAIL | EVB_BACKOFF_DONE |
+            EVB_TX | EVB_RELOAD_CFG,
             pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
+
+        // Deferred credential reload (FINDINGS §5, :536). remote_client_enable()
+        // requested an NVS reload by setting EVB_RELOAD_CFG instead of touching
+        // s_cfg itself. Reload here — on task_remote, the SOLE owner of s_cfg —
+        // before any state step / connect this pass, so start_ws_client() and
+        // send_auth_frame() below always read a consistent url/token. The next
+        // connect attempt (after the EVB_ENABLE that rode in alongside this bit)
+        // picks up the fresh creds; a live connection on stale creds is torn
+        // down by the surrounding enable→reconnect flow.
+        if (bits & EVB_RELOAD_CFG) {
+            remote_nvs_load(&s_cfg.enabled,
+                            s_cfg.url,   sizeof(s_cfg.url),
+                            s_cfg.token, sizeof(s_cfg.token),
+                            s_cfg.devid, sizeof(s_cfg.devid));
+        }
 
         // Map bits -> RemoteEvent and step state machine.
         auto step = [](RemoteEvent ev) {
@@ -488,7 +531,29 @@ static void task_remote_body(void*) {
                 uint32_t delay = remote_backoff_compute(
                     s_attempt, CONFIG_ZHAC_REMOTE_BACKOFF_MAX_S, esp_random());
                 ESP_LOGI(TAG, "backoff %u s (attempt=%u)", (unsigned)delay, s_attempt);
-                vTaskDelay(pdMS_TO_TICKS(delay * 1000));
+                // FINDINGS §5 (:491): wait out the backoff ON THE EVENT GROUP,
+                // not via vTaskDelay. A bare vTaskDelay (up to BACKOFF_MAX_S)
+                // pinned the state-machine task asleep, so an EVB_DISABLE or
+                // EVB_WIFI_DOWN posted during backoff sat unprocessed for the
+                // whole sleep (a disable/wifi-down felt unresponsive for up to
+                // a full backoff window). Block on those two bits with the
+                // backoff as the TIMEOUT: an abort event wakes us immediately.
+                //
+                // clear-on-exit = pdFALSE: leave the abort bit set so the
+                // top-of-loop step() dispatch handles it next iteration (→
+                // DISABLED / IDLE_NO_WIFI). On a clean timeout (no abort bit)
+                // fire BACKOFF_DONE and advance to CONNECTING as before.
+                EventBits_t bo = xEventGroupWaitBits(
+                    s_remote_evt, EVB_DISABLE | EVB_WIFI_DOWN,
+                    pdFALSE, pdFALSE, pdMS_TO_TICKS(delay * 1000));
+                if (bo & (EVB_DISABLE | EVB_WIFI_DOWN)) {
+                    // Aborted — re-loop; the abort bit is still set and will be
+                    // consumed (pdTRUE) + stepped at the top of the loop.
+                    break;
+                }
+                // belt-and-suspenders; the step() below is the real
+                // BACKOFF->CONNECTING transition (the bit is consumed as a
+                // no-op by the next clearOnExit wait).
                 xEventGroupSetBits(s_remote_evt, EVB_BACKOFF_DONE);
                 step(REMOTE_EV_BACKOFF_DONE);
                 break;
@@ -501,8 +566,47 @@ static void task_remote_body(void*) {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
+// Create the kernel objects (TX/RX queues + event group) and register the
+// ws_server reply hook EXACTLY ONCE for the life of the process.
+//
+// FINDINGS §5 (:514): a disable→enable cycle self-deletes task_remote (the
+// DISABLED case calls vTaskDelete + clears s_task), and re-enable used to
+// re-run remote_client_init, which recreated s_tx_queue / s_rx_queue /
+// s_remote_evt over the still-live old handles → 2 queues + 1 event group
+// leaked per cycle. The kernel objects are now created here once, guarded by
+// s_objects_ready, and REUSED across every task respawn. s_remote_evt in
+// particular must be stable: app_main captured it via `extern` to post WIFI
+// bits, so recreating it would also strand those posts on a dead handle.
+static bool s_objects_ready = false;
+
+static void remote_objects_init_once(void) {
+    if (s_objects_ready) return;
+    s_tx_queue   = xQueueCreate(CONFIG_ZHAC_REMOTE_TX_QUEUE_DEPTH, sizeof(TxItem));
+    s_rx_queue   = xQueueCreate(4, sizeof(RxItem));
+    s_remote_evt = xEventGroupCreate();
+
+    // Register the ws_server reply hook so dispatch_envelope replies
+    // for the REMOTE_VIRTUAL_FD sentinel route here. (Idempotent target,
+    // but registered once alongside the objects regardless.)
+    ws_server_register_reply_hook(REMOTE_VIRTUAL_FD, &remote_client_send_reply);
+
+    s_objects_ready = (s_tx_queue && s_rx_queue && s_remote_evt);
+}
+
+// Spawn task_remote if it is not already alive. Respawnable: the DISABLED
+// state deletes the task and clears s_task, and re-enable calls this to bring
+// it back. Does NOT recreate kernel objects (see remote_objects_init_once).
+static void remote_task_spawn(void) {
+    if (s_task) return;
+    xTaskCreatePinnedToCore(task_remote_body, "task_remote",
+        6 * 1024, nullptr, tskIDLE_PRIORITY + 3, &s_task, 0);
+}
+
 extern "C" void remote_client_init(void) {
-    // Load NVS.
+    // Boot-time NVS load. This runs on app_main (single-threaded — task_remote
+    // does not exist yet), so it is safe to populate s_cfg directly here; the
+    // concurrent-read hazard (FINDINGS :536) only exists once the task is live,
+    // which is why the re-enable path defers the reload via EVB_RELOAD_CFG.
     if (!remote_nvs_load(&s_cfg.enabled,
                           s_cfg.url,   sizeof(s_cfg.url),
                           s_cfg.token, sizeof(s_cfg.token),
@@ -511,20 +615,17 @@ extern "C" void remote_client_init(void) {
         return;
     }
 
-    s_tx_queue   = xQueueCreate(CONFIG_ZHAC_REMOTE_TX_QUEUE_DEPTH, sizeof(TxItem));
-    s_rx_queue   = xQueueCreate(4, sizeof(RxItem));
-    s_remote_evt = xEventGroupCreate();
-
-    // Register the ws_server reply hook so dispatch_envelope replies
-    // for the REMOTE_VIRTUAL_FD sentinel route here.
-    ws_server_register_reply_hook(REMOTE_VIRTUAL_FD, &remote_client_send_reply);
+    remote_objects_init_once();
+    if (!s_objects_ready) {
+        ESP_LOGE(TAG, "remote object alloc failed; remote stays DISABLED");
+        return;
+    }
 
     // Wire wifi event group bridge: caller registers WIFI_EVENT /
     // IP_EVENT handlers in app_main that set our EVB_WIFI_UP /
     // EVB_WIFI_DOWN bits (see Task 11).
 
-    xTaskCreatePinnedToCore(task_remote_body, "task_remote",
-        6 * 1024, nullptr, tskIDLE_PRIORITY + 3, &s_task, 0);
+    remote_task_spawn();
 
     if (s_cfg.enabled && s_cfg.url[0] && s_cfg.token[0]) {
         xEventGroupSetBits(s_remote_evt, EVB_ENABLE);
@@ -532,23 +633,30 @@ extern "C" void remote_client_init(void) {
 }
 
 extern "C" void remote_client_enable(void) {
-    // Reload NVS to pick up url/token changes from api_remote_connect.
-    remote_nvs_load(&s_cfg.enabled,
-                     s_cfg.url,   sizeof(s_cfg.url),
-                     s_cfg.token, sizeof(s_cfg.token),
-                     s_cfg.devid, sizeof(s_cfg.devid));
+    // FINDINGS §5 (:536): do NOT load NVS into s_cfg here. This runs on the API
+    // caller's task and a live task_remote may be reading s_cfg.url/.token
+    // concurrently. Instead ensure the kernel objects + task exist, then ask
+    // the remote task to reload its own s_cfg via EVB_RELOAD_CFG. The task is
+    // the sole writer/reader of s_cfg. api_remote_connect already persisted the
+    // new url/token to NVS before calling us, so the deferred reload sees them.
+    remote_objects_init_once();
+    if (!s_objects_ready) return;   // alloc failed at boot; nothing to enable
 
-    // If the task isn't alive (was DISABLED at boot), spawn it now.
-    if (!s_task) {
-        remote_client_init();
-        return;
-    }
-    xEventGroupSetBits(s_remote_evt, EVB_ENABLE);
+    remote_task_spawn();   // respawn if a prior disable self-deleted the task
+
+    // RELOAD_CFG must be processed before the connect that EVB_ENABLE drives —
+    // the task handles RELOAD_CFG at the top of its loop, ahead of any step().
+    xEventGroupSetBits(s_remote_evt, EVB_RELOAD_CFG | EVB_ENABLE);
 }
 
 extern "C" void remote_client_disable(bool forget_creds) {
     if (forget_creds) {
         remote_nvs_forget_creds();
+        // KNOWN cold-path race (FINDINGS §5 residual): this clears s_cfg on the API
+        // task, not task_remote — symmetric to the enable() torn-cred hazard, but here
+        // DISABLE drives teardown (stop_ws_client + vTaskDelete) so the worst case is an
+        // empty-URL read on a connection already dying. Future: route via an
+        // EVB_FORGET_CFG bit like EVB_RELOAD_CFG so only task_remote touches s_cfg.
         s_cfg.url[0]   = 0;
         s_cfg.token[0] = 0;
     }

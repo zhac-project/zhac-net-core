@@ -382,6 +382,10 @@ static void task_ota(void*) {
             // rows that would otherwise be lost across the OTA restart.
             extern void rule_store_flush_now();
             rule_store_flush_now();
+            // P4-T29: same for the debounced device-options NVS commit —
+            // make any staged-but-not-yet-flushed write durable first.
+            // (Declared in api_handlers.h, pulled via s3_internal.h.)
+            api_device_opt_flush_now();
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_restart();
         } else {

@@ -9,7 +9,107 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
-- **api_devices (HOTFIX)** — `api_device_list` now LOOPS over the paged
+- **hap_master (P4-T31, FINDINGS HAP, `hap_master.cpp` `do_two_stage_exchange`)**
+  — turned the `s_dispatch_buf` consume-synchronously assumption into an
+  ENFORCED invariant. The static `s_dispatch_buf` (PSRAM post-DMA copy target)
+  is single-owner: the dispatch callback must consume it synchronously before
+  the next exchange reuses it. The callback runs AFTER `s_spi_mutex` is released
+  (synchronously, between release and function return), so a lightweight
+  function-static re-entrancy guard now wraps the post-release `s_cb` call —
+  `configASSERT(!s_in_dispatch)` fires if a future 2nd dispatch task ever
+  re-enters while a callback is mid-flight. Comment + guard only; buffer
+  ownership and the SPI flow are unchanged.
+- **ws_bridge / remote_client (P4-T29, FINDINGS §5, SEC)** — the
+  client-supplied envelope `id` was spliced **unescaped** into every response
+  frame (`{"id":"<id>",...}`) on all three string-id paths (error reply, the
+  auth-ok reply, and the success `data` envelope). A `"` (or `\`, control
+  char) in the id closed the JSON string early and injected arbitrary
+  structure into the frame echoed back to that client — and, via the
+  remote/cloud sentinel path, to the cloud peer. All three sites now run the id
+  through the existing `json_escape` (new `escape_id` wrapper, bounded to 64 B
+  of escaped output). Int ids still pass through as numbers. Host-tested: a
+  crafted `id` carrying `","ok":true,"data":{...}` is fully escaped inside the
+  id value and the real top-level keys stay intact. (`ws_bridge.cpp` :54/:88/
+  :185)
+- **ws_bridge / remote_client (P4-T29, FINDINGS §5, SMELL)** — the
+  `{"event":"<name>","data":<payload>}` frame was open-coded TWICE — once in
+  `ws_event_broadcast` (local WS fan-out, 4 KB+128 cap) and once in
+  `remote_client_publish_event` (cloud mirror, 8 KB cap) — with **divergent
+  buffer caps**, the local-vs-cloud truncation asymmetry the finding flagged
+  (a coalesced batch could fit one transport but be replaced by `data:null` on
+  the other). Folded both onto ONE `static inline ws_event_envelope_build()`
+  in `remote_client.h` (the public header both sites already include, reachable
+  in both Kconfig states — no cross-repo move, no new dependency for the
+  non-remote path). Format + overflow contract (`data:null,"trunc":true`
+  fallback) are now identical; each caller still passes its own transport cap.
+  Host-tested byte-identical for the same input.
+- **api_devices (P4-T29, FINDINGS §6, BLOCK)** — `device.options.set`
+  committed to NVS (`nvs_commit(s_nvs_zhac_opt)`) on **every** call — a flash
+  page erase+write on the httpd task per device-option write, so a burst (SPA
+  pushing several devices, or a script bulk-apply) meant flash wear plus
+  per-call latency on the shared HTTP worker. The commit is now **debounced**:
+  each write stages via `nvs_set_str` (immediately visible to the next read on
+  the cached handle) and (re)arms a 2 s one-shot `esp_timer`; a burst coalesces
+  into a single page write once writes go quiet. An explicit
+  `api_device_opt_flush_now()` is called from the OTA and deferred-reboot paths
+  (next to `rule_store_flush_now()`) so nothing staged is lost across a
+  restart. (`api_devices.cpp` :503)
+  - _Known limitation:_ a device-opt staged within the 2 s debounce window is
+    discarded on a WiFi-forget / factory reboot — that path intentionally wipes
+    NVS, so the staged write is dropped with the rest of config (no flush hook,
+    by design).
+- **api_system (P4-T29, FINDINGS §6, BLOCK)** — `api_settings_set` opened +
+  committed + closed the `sys_cfg` namespace **three separate times** in one
+  request (timezone / metrics_en / ap_disabled) — three flash-page writes for a
+  single "save settings". This handler is operator-paced (a human pressing
+  Save), so a background-flush timer is unwarranted; instead the three
+  same-namespace writes are staged into locals and persisted under **one**
+  open/commit/close at the end of the handler. Every live-apply side effect
+  (`setenv`/`tzset`, the static flags, the MQTT/auth re-apply) is unchanged —
+  only the NVS persistence is coalesced. (`api_system.cpp` :544)
+- **groups_store / api_groups (P4-T29, FINDINGS §6, concurrency)** —
+  `group.list` is remote-allow-listed, so it runs on BOTH the single httpd task
+  and `task_remote` (cloud-invoked). The store was unsynchronised across those
+  contexts: a httpd `group.create`/`update`/`delete` mutating the bitmap+blobs
+  while `task_remote` walked the same namespace for a `group.list`, the
+  file-static `all[]` scratch in `api_group_list` refilled mid-serialisation by
+  a concurrent second list (torn read), and a non-atomic `grp_next_id()`→
+  `grp_save()` in create that let two creators grab the same slot id. Added a
+  store-wide **recursive** mutex (`GrpLockGuard`) held across each whole op,
+  a new atomic `grp_create()` (id-alloc + save under one lock), and bracketed
+  `api_group_list`'s load+serialise with `grp_store_lock()`/`unlock()` so the
+  serialised snapshot is the one loaded. Mirrors the wifi-scan-mutex fix
+  (P2-T16) for the same httpd-vs-`task_remote` race class. (`api_groups.cpp`
+  :47, `groups_store.cpp`)
+- **api_devices (P4-T29, FINDINGS §5, BLOCK — stall containment)** — the
+  DEVICE_LIST paging hotfix turned `device.list` into up to `ZAP_MAX_DEVICES+8`
+  (208) sequential 5 s `hap_roundtrip_v2` calls, all on the single httpd task.
+  A dead or marginal P4 link (every page times out) would pin the httpd task —
+  and therefore ALL REST + WS + queued async sends — for up to 208 × 5 s ≈ 17
+  minutes. Added a cumulative **wall-clock budget** (8 s) to the paged loop:
+  once exceeded it aborts and reports a failed fetch (caller serves the 1 s
+  stale cache or a clean error) rather than emitting a half-fleet that looks
+  complete. Worst-case stall is now ~8 s + one in-flight roundtrip ≈ 13 s; the
+  healthy path (tens of ms) never trips it. **Recommended follow-up:** move
+  multi-roundtrip commands (`device.list`) off the httpd task onto a worker so
+  no single command can stall the shared HTTP/WS server at all — the budget is
+  minimal containment, not the full fix. (`api_devices.cpp` `devlist_fetch_all`)
+
+- **api_system (P4-T28, FINDINGS §8)** — updated `/api/status` for the
+  caller-owned `sys_metrics` CPU% baseline. `zap_common/sys_metrics.h` dropped
+  its shared per-translation-unit `static` baseline in favour of a
+  caller-supplied `sys_metrics_cpu_ctx_t`. `api_status_get` now keeps a private
+  function-static `s_status_cpu_ctx` (its own window, never crossing the P4
+  heartbeat's) and passes it to `sys_metrics_sample_cpu_pct(ctx, c0, c1)`. The
+  default single httpd worker serialises status requests; a fanned-out worker
+  pool would at worst yield a transient bogus reading, not state corruption.
+- **metrics_mqtt (P4-T28, FINDINGS §8)** — the snapshot publisher already
+  skipped the publish when `mqtt_format_snapshot_json` returned 0 (the new
+  truncation contract), but did so **silently**, so a chronically-oversized
+  snapshot — e.g. after a metric is added that blows the 2 KB `s_buf` — would
+  just stop appearing on the broker with no trace. `on_tick` now emits a
+  **rate-limited** (one line / ~5 min) `ESP_LOGW` on the skip so the condition
+  is diagnosable without log spam.
   `GET_DEVICES` protocol and reassembles every chunk into one full
   `{"devices":[...]}`. The device list previously timed out for anyone with
   ~15+ devices: the P4 could not fit the fleet in one 4096-byte SPI frame and
@@ -31,6 +131,47 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   URL, so a DEBUG/VERBOSE image leaks the token to serial / `/api/logs`.
   `sdkconfig.prod.defaults` already pins WARN (level 2); the risk and the rule
   are now noted in README "Known hardening gaps".
+
+### Fixed — Medium (P4 findings review, T26 remote_client lifecycle/backoff)
+
+- **remote_client** (Medium): the `BACKOFF` state slept with a bare
+  `vTaskDelay` (up to `CONFIG_ZHAC_REMOTE_BACKOFF_MAX_S`) inside the
+  state-machine task, so an `EVB_DISABLE` / `EVB_WIFI_DOWN` posted during a
+  backoff window sat unprocessed for the whole sleep — a `remote.disconnect`
+  or a Wi-Fi drop felt unresponsive for up to a full backoff. The task now
+  waits out the backoff on the event group (`xEventGroupWaitBits` with the
+  backoff as the timeout, watching `EVB_DISABLE | EVB_WIFI_DOWN`, clear-on-exit
+  off); an abort bit wakes it immediately and is consumed + stepped at the top
+  of the loop (→ `DISABLED` / `IDLE_NO_WIFI`), while a clean timeout fires
+  `EVB_BACKOFF_DONE` → `CONNECTING` exactly as before. (FINDINGS §5, :491)
+- **remote_client** (Medium): a disable→enable cycle leaked two queues and one
+  event group each time. `DISABLED` self-deletes `task_remote`, and re-enable
+  re-ran `remote_client_init`, which recreated `s_tx_queue` / `s_rx_queue` /
+  `s_remote_evt` over the still-live old handles. The kernel objects are now
+  created once (`remote_objects_init_once`, guarded by `s_objects_ready`) and
+  reused across every task respawn; only the task itself is respawnable
+  (`remote_task_spawn`). Keeping `s_remote_evt` stable also stops stranding the
+  Wi-Fi bits that `app_main` posts to it via the captured `extern` handle.
+  (FINDINGS §5, :514)
+- **remote_client** (Medium): `remote_client_enable` reloaded NVS into `s_cfg`
+  from the API caller's task while a live `task_remote` could concurrently read
+  `s_cfg.url` / `.token` (`start_ws_client` / `send_auth_frame`), risking torn
+  credentials. The reload is now deferred to the remote task via a new
+  `EVB_RELOAD_CFG` bit: `enable()` no longer touches `s_cfg` (it just sets
+  `EVB_RELOAD_CFG | EVB_ENABLE`), and the task reloads `s_cfg` from NVS at the
+  top of its loop — before any connect — so `task_remote` is the sole accessor
+  of `s_cfg`. `api_remote_connect` already persists the new creds to NVS before
+  calling `enable()`, so the deferred reload always observes them. The task's
+  body-entry `s_cfg` read was dropped (initial enable now rides the
+  `EVB_ENABLE` bit), and `last_state` was made task-local so a respawn starts
+  edge detection from `DISABLED`. (FINDINGS §5, :536)
+- **remote_client** (Medium, documentation): the inbound WSS path drops frames
+  with `data_len > 8192` and drops continuation/fragmented frames (op_code
+  0x00) — messages > 8 KB never dispatch. Reassembly is out of scope for this
+  batch; the 8 KB single-frame cap is now documented as a contract in
+  `ws_event_handler` (both directions share the 8 KB bound) with a cross-ref to
+  the `project_hub_cloud_devicesync` constraint (the reconcile relist /
+  device.list must page to stay under the cap). (FINDINGS §5, :199)
 
 ### Fixed — High / Medium / Low (P2 findings review, T16 wifi_mgr event-loop unblock)
 

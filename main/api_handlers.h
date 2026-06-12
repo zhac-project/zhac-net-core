@@ -153,6 +153,11 @@ ApiStatus api_device_attr_set(const char* body, size_t body_len,
 ApiStatus api_device_options_set(const char* body, size_t body_len,
                                   char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
+// P4-T29: force the debounced device-options NVS commit to land now. Called
+// from reboot/OTA paths so a staged-but-not-yet-flushed device.options.set
+// write is made durable before restart. No-op when nothing is pending.
+void api_device_opt_flush_now(void);
+
 // POST /api/devices/{ieee}/interview — args: {"ieee":"..."}.
 ApiStatus api_device_reinterview(const char* body, size_t body_len,
                                   char* rsp_buf, size_t rsp_cap, size_t* rsp_len);

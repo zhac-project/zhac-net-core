@@ -49,8 +49,17 @@ extern "C" ApiStatus api_group_list(const char* /*body*/, size_t /*body_len*/,
                                      size_t* rsp_len) {
     // PSRAM: ~9.5 KB of group records, refilled from NVS on every call —
     // cold path, would otherwise be the single largest dram0 .bss symbol.
-    // (Pre-existing `static` — call sites are serialised the same as before.)
+    //
+    // P4-T29 (FINDINGS §6): `group.list` is remote-allow-listed, so this runs
+    // on BOTH the httpd task and task_remote. The `all[]` scratch is file-
+    // static and SHARED between those contexts — a concurrent second
+    // group.list would refill it mid-serialisation here (torn read). Hold the
+    // store lock across the load AND the read-back loop so the snapshot we
+    // serialise is the one we loaded. (Recursive mutex — grp_load_all re-takes
+    // it internally; create/update/delete from the other task block until we
+    // release, matching the wifi-scan-snapshot pattern P2-T16 used.)
     EXT_RAM_BSS_ATTR static GrpRecord all[GRP_MAX_GROUPS];
+    grp_store_lock();
     uint16_t cnt = grp_load_all(all, GRP_MAX_GROUPS);
     size_t pos = 0;
     pos += snprintf(rsp_buf + pos, rsp_cap - pos, "{\"groups\":[");
@@ -61,6 +70,7 @@ extern "C" ApiStatus api_group_list(const char* /*body*/, size_t /*body_len*/,
         if (pos + n < rsp_cap) { memcpy(rsp_buf + pos, tmp, n); pos += n; }
     }
     pos += snprintf(rsp_buf + pos, rsp_cap - pos, "]}");
+    grp_store_unlock();
     if (rsp_len) *rsp_len = pos;
     return API_OK;
 }
@@ -73,11 +83,12 @@ extern "C" ApiStatus api_group_create(const char* body, size_t body_len,
     if (deserializeJson(doc, body, body_len)) return API_BAD_REQUEST;
 
     GrpRecord r{};
-    r.id = grp_next_id();
     strncpy(r.name, doc["name"] | "", sizeof(r.name) - 1);
     grp_parse_members_from_body(body, r);
 
-    if (!grp_save(r)) return API_INTERNAL_ERROR;
+    // P4-T29: atomic id-alloc + persist (was next_id()+save() with a TOCTOU
+    // window between them — two concurrent creators could grab the same slot).
+    if (!grp_create(r)) return API_INTERNAL_ERROR;
 
     size_t n = grp_to_json(r, rsp_buf, rsp_cap);
     if (rsp_len) *rsp_len = n;

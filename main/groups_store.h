@@ -28,6 +28,13 @@ uint16_t grp_load_all(GrpRecord* out, uint16_t max);
 // Save a group record to NVS. Returns true on success.
 bool grp_save(const GrpRecord& r);
 
+// Atomically allocate the next free id INTO `r.id` and persist `r`. Use this
+// instead of grp_next_id()+grp_save() from request handlers: it holds the
+// store lock across both steps so two concurrent creators (httpd vs the
+// remote-allow-listed cloud task) cannot grab the same slot. Returns false if
+// the table is full or the save fails. On success `r.id` is the new id.
+bool grp_create(GrpRecord& r);
+
 // Delete group by id. Returns true on success.
 bool grp_delete(uint16_t id);
 
@@ -36,3 +43,10 @@ bool grp_find(uint16_t id, GrpRecord& out);
 
 // Serialise one GrpRecord to JSON in buf[cap]. Returns length, or 0 on overflow.
 size_t grp_to_json(const GrpRecord& r, char* buf, size_t cap);
+
+// Store-lock accessors (recursive). Use ONLY to bracket a load-into-shared-
+// buffer + read-back sequence (see api_group_list) so the buffer cannot be
+// refilled by a concurrent caller on another task mid-read. The individual
+// grp_* ops already lock internally; do not wrap single calls.
+void grp_store_lock();
+void grp_store_unlock();

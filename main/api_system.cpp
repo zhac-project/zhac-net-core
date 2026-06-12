@@ -110,8 +110,15 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         s3_stack_hwm = (min_hwm == UINT32_MAX) ? 0 : min_hwm;
     }
 
+    // Caller-owned CPU%-baseline window for the /api/status cadence —
+    // own copy so it never crosses the P4 heartbeat's window (FINDINGS
+    // §8: the sampler dropped its shared per-TU static). The default
+    // single httpd worker serialises status requests; should the server
+    // ever fan status across worker threads, the worst case is a
+    // transient bogus reading for one poll, not state corruption.
+    static sys_metrics_cpu_ctx_t s_status_cpu_ctx{};
     uint8_t  s3_cpu_c0 = 0, s3_cpu_c1 = 0;
-    sys_metrics_sample_cpu_pct(s3_cpu_c0, s3_cpu_c1);
+    sys_metrics_sample_cpu_pct(s_status_cpu_ctx, s3_cpu_c0, s3_cpu_c1);
 
     char p4_fw_ver[16] = {};
     hap_bridge_copy_p4_fw_ver(p4_fw_ver, sizeof(p4_fw_ver));
@@ -448,7 +455,12 @@ extern "C" ApiStatus api_wifi_connect(const char* body, size_t body_len,
     static esp_timer_handle_t s_reboot_timer = nullptr;
     if (!s_reboot_timer) {
         const esp_timer_create_args_t args = {
-            .callback = [](void*) { esp_restart(); },
+            // P4-T29: flush any debounced device-options NVS write before the
+            // restart so a staged-but-uncommitted option survives the reboot.
+            .callback = [](void*) {
+                api_device_opt_flush_now();   // flush debounced device-options NVS
+                esp_restart();
+            },
             .arg = nullptr,
             .dispatch_method = ESP_TIMER_TASK,
             .name = "reboot_deferred",
@@ -472,6 +484,9 @@ extern "C" ApiStatus api_wifi_disconnect(const char* /*body*/, size_t /*body_len
     static esp_timer_handle_t s_forget_timer = nullptr;
     if (!s_forget_timer) {
         const esp_timer_create_args_t args = {
+            // no api_device_opt_flush_now() here: forget wipes NVS + reboots, so
+            // a staged device-opt is intentionally discarded with the rest of
+            // config (different state class).
             .callback = [](void*) { wifi_mgr_forget_and_reboot(); },
             .arg = nullptr,
             .dispatch_method = ESP_TIMER_TASK,
@@ -554,15 +569,24 @@ extern "C" ApiStatus api_settings_set(const char* body, size_t body_len,
         ESP_LOGI(TAG_API, "MQTT broker updated: %s", url);
     }
 
+    // P4-T29 (FINDINGS §6, :544): `sys_cfg` was opened+committed+closed THREE
+    // separate times in one request (timezone / metrics_en / ap_disabled) —
+    // three flash-page writes for a single "save settings". This handler is
+    // operator-paced (a human pressing Save), so a background-flush timer is
+    // unwarranted; instead the three same-namespace writes are STAGED into
+    // locals here and written under ONE open/commit/close at the end of the
+    // function. Live-apply side effects (setenv/tzset, the static flags) stay
+    // exactly where they were — only the NVS persistence is coalesced.
+    bool        sys_cfg_dirty = false;
+    bool        set_tz        = false;  char tz_keep[64] = {};
+    bool        set_metrics   = false;  uint8_t metrics_val = 0;
+    bool        set_apdis     = false;  uint8_t apdis_val   = 0;
+
     const char* tz_str = doc["timezone"] | (const char*)nullptr;
     if (tz_str && tz_str[0] != '\0') {
         if (strlen(tz_str) >= 64) return API_BAD_REQUEST;
-        nvs_handle_t h;
-        if (nvs_open("sys_cfg", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_str(h, "timezone", tz_str);
-            nvs_commit(h);
-            nvs_close(h);
-        }
+        strncpy(tz_keep, tz_str, sizeof(tz_keep) - 1);
+        set_tz = sys_cfg_dirty = true;
         setenv("TZ", tz_str, 1);
         tzset();
         ESP_LOGI(TAG_API, "Timezone updated: %s", tz_str);
@@ -570,12 +594,8 @@ extern "C" ApiStatus api_settings_set(const char* body, size_t body_len,
 
     if (doc["metrics_enabled"].is<bool>()) {
         s_metrics_enabled = doc["metrics_enabled"].as<bool>();
-        nvs_handle_t h;
-        if (nvs_open("sys_cfg", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_u8(h, "metrics_en", s_metrics_enabled ? 1 : 0);
-            nvs_commit(h);
-            nvs_close(h);
-        }
+        metrics_val = s_metrics_enabled ? 1 : 0;
+        set_metrics = sys_cfg_dirty = true;
         ESP_LOGI(TAG_API, "Prometheus metrics: %s",
                  s_metrics_enabled ? "enabled" : "disabled");
     }
@@ -583,12 +603,8 @@ extern "C" ApiStatus api_settings_set(const char* body, size_t body_len,
     if (doc["ap_disabled"].is<bool>()) {
         bool en = doc["ap_disabled"].as<bool>();
         s_ap_disabled = en;
-        nvs_handle_t h;
-        if (nvs_open("sys_cfg", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_u8(h, "ap_disabled", en ? 1 : 0);
-            nvs_commit(h);
-            nvs_close(h);
-        }
+        apdis_val = en ? 1 : 0;
+        set_apdis = sys_cfg_dirty = true;
         ESP_LOGI(TAG_API, "AP disabled flag: %u (takes effect on next STA connect)",
                  en);
     }
@@ -694,6 +710,20 @@ extern "C" ApiStatus api_settings_set(const char* body, size_t body_len,
             ESP_LOGI(TAG_API, "Log sinks: mqtt=%s(%c) ws=%s(%c)",
                      mqtt_en ? "on" : "off", mqtt_lv,
                      ws_en   ? "on" : "off", ws_lv);
+        }
+    }
+
+    // P4-T29: single coalesced sys_cfg write for whatever subset of
+    // timezone / metrics_en / ap_disabled this request touched — one
+    // open + (N) sets + one commit + one close, instead of up to three.
+    if (sys_cfg_dirty) {
+        nvs_handle_t h;
+        if (nvs_open("sys_cfg", NVS_READWRITE, &h) == ESP_OK) {
+            if (set_tz)      nvs_set_str(h, "timezone",   tz_keep);
+            if (set_metrics) nvs_set_u8 (h, "metrics_en", metrics_val);
+            if (set_apdis)   nvs_set_u8 (h, "ap_disabled", apdis_val);
+            nvs_commit(h);
+            nvs_close(h);
         }
     }
 

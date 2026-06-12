@@ -1,4 +1,7 @@
 build/
+# nested host-test build dirs (e.g. components/*/test/build_verify/) —
+# the bare `build/` above only matches dirs literally named "build"
+components/*/test/build*/
 managed_components/
 dependencies.lock
 sdkconfig.old
@@ -8,3 +11,5 @@ compile_commands.json
 .vscode/
 .idea/
 .DS_Store
+# transient code-review scratch — never committed
+REVIEW_FINDINGS.md

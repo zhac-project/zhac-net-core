@@ -49,8 +49,24 @@ static const WsCmd* ws_lookup(const char* name) {
     return nullptr;
 }
 
-// `id` may be any JSON value; we pass it through verbatim by quoting if
-// it was a string. Most clients will send an int.
+// Escape a byte array as a JSON string value (without surrounding quotes).
+// Defined further down; forward-declared so the envelope builders below can
+// sanitise the client-supplied `id` before splicing it.
+static size_t json_escape(const char* src, int src_len, char* out, size_t out_cap);
+
+// Escape a client-supplied string `id` for safe splicing into a response
+// envelope. A raw `"` (or `\`, control char) in the id would otherwise close
+// the JSON string early and inject arbitrary structure into the frame echoed
+// back to that client or forwarded to the cloud peer (FINDINGS §5: unescaped
+// id splice). The id is bounded to 64 bytes of escaped output — ids are
+// correlation tokens, not payloads; anything longer is the caller's problem
+// and is simply truncated, never overflowed.
+static void escape_id(const char* id, char* out, size_t out_cap) {
+    json_escape(id ? id : "", id ? (int)strlen(id) : 0, out, out_cap);
+}
+
+// `id` may be any JSON value; an int passes through as a number, a string is
+// JSON-escaped (escape_id) before being quoted. Most clients send an int.
 static void send_envelope_error(int fd, JsonVariantConst id_var,
                                   const char* err) {
     char buf[256];
@@ -60,9 +76,11 @@ static void send_envelope_error(int fd, JsonVariantConst id_var,
                      "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}",
                      id_var.as<int>(), err);
     } else if (id_var.is<const char*>()) {
+        char id_esc[64];
+        escape_id(id_var.as<const char*>(), id_esc, sizeof(id_esc));
         n = snprintf(buf, sizeof(buf),
                      "{\"id\":\"%s\",\"ok\":false,\"err\":\"%s\"}",
-                     id_var.as<const char*>(), err);
+                     id_esc, err);
     } else {
         n = snprintf(buf, sizeof(buf),
                      "{\"id\":null,\"ok\":false,\"err\":\"%s\"}", err);
@@ -89,10 +107,17 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
             if (auth_check_token(doc["args"]["token"] | "")) {
                 ws_server_fd_set_authed(fd);
                 char ok[96];
-                int n = id_var.is<const char*>()
-                    ? snprintf(ok, sizeof(ok), "{\"id\":\"%s\",\"ok\":true}",
-                               id_var.as<const char*>())
-                    : snprintf(ok, sizeof(ok), "{\"id\":null,\"ok\":true}");
+                int n;
+                if (id_var.is<int>()) {
+                    n = snprintf(ok, sizeof(ok), "{\"id\":%d,\"ok\":true}",
+                                 id_var.as<int>());
+                } else if (id_var.is<const char*>()) {
+                    char id_esc[64];
+                    escape_id(id_var.as<const char*>(), id_esc, sizeof(id_esc));
+                    n = snprintf(ok, sizeof(ok), "{\"id\":\"%s\",\"ok\":true}", id_esc);
+                } else {
+                    n = snprintf(ok, sizeof(ok), "{\"id\":null,\"ok\":true}");
+                }
                 if (n > 0 && (size_t)n < sizeof(ok)) ws_server_reply(fd, ok, (size_t)n);
             } else {
                 send_envelope_error(fd, id_var, "auth failed");
@@ -182,16 +207,21 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
         return;
     }
 
-    // Build envelope. id passes through verbatim — int or string.
+    // Build envelope. An int id passes through as a number; a string id is
+    // JSON-escaped (escape_id) so a `"` in it cannot break out of the string
+    // and inject structure into the frame (FINDINGS §5). `data` is the
+    // handler's already-well-formed JSON body.
     int n;
     if (id_var.is<int>()) {
         n = snprintf(env_buf, kEnvelopeCap,
                      "{\"id\":%d,\"ok\":true,\"data\":%.*s}",
                      id_var.as<int>(), (int)rsp_len, rsp_buf);
     } else if (id_var.is<const char*>()) {
+        char id_esc[64];
+        escape_id(id_var.as<const char*>(), id_esc, sizeof(id_esc));
         n = snprintf(env_buf, kEnvelopeCap,
                      "{\"id\":\"%s\",\"ok\":true,\"data\":%.*s}",
-                     id_var.as<const char*>(), (int)rsp_len, rsp_buf);
+                     id_esc, (int)rsp_len, rsp_buf);
     } else {
         n = snprintf(env_buf, kEnvelopeCap,
                      "{\"id\":null,\"ok\":true,\"data\":%.*s}",
@@ -332,23 +362,20 @@ void ws_event_broadcast(const char* name, const char* payload_json, size_t paylo
     // means we cannot let a second producer race the formatting half;
     // copy onto the stack so the broadcast half can run unlocked.
     // (WEB-F2 in docs/FINDINGS.md.)
-    int n;
-    if (payload_json && payload_len > 0) {
-        n = snprintf(s_evt_buf, sizeof(s_evt_buf),
-                     "{\"event\":\"%s\",\"data\":%.*s}",
-                     name, (int)payload_len, payload_json);
-    } else {
-        n = snprintf(s_evt_buf, sizeof(s_evt_buf),
-                     "{\"event\":\"%s\",\"data\":null}", name);
-    }
-    if (n <= 0 || (size_t)n >= sizeof(s_evt_buf)) {
-        // Now-unreachable safety: the slab fits BULK_COALESCE_CAP, the largest
-        // payload any producer emits. Logging here is fine — this function is
-        // no longer on the log pipeline (the WS log sink enqueues directly).
-        ESP_LOGW(TAG, "event '%s' payload %u B overflows %u B envelope — data:null",
+    // Shared envelope builder (remote_client.h) — ONE format + overflow
+    // contract for both the local WS broadcast (here) and the cloud mirror
+    // (remote_client_publish_event), so the two can never drift in shape or
+    // truncation behaviour again (FINDINGS §5: local-vs-cloud cap asymmetry).
+    // The builder degrades an oversized frame to `data:null,"trunc":true`
+    // internally; if it returns 0 even that did not fit (now-unreachable —
+    // the slab fits BULK_COALESCE_CAP, the largest payload any producer
+    // emits). Logging here is fine — this function is no longer on the log
+    // pipeline (the WS log sink enqueues directly).
+    size_t n = ws_event_envelope_build(s_evt_buf, sizeof(s_evt_buf),
+                                       name, payload_json, payload_len);
+    if (n == 0) {
+        ESP_LOGW(TAG, "event '%s' payload %u B does not fit %u B envelope — dropped",
                  name, (unsigned)payload_len, (unsigned)sizeof(s_evt_buf));
-        n = snprintf(s_evt_buf, sizeof(s_evt_buf),
-                     "{\"event\":\"%s\",\"data\":null,\"trunc\":true}", name);
     }
 
     // Heap-allocate the snapshot rather than putting 2 KB on stack —
@@ -359,10 +386,10 @@ void ws_event_broadcast(const char* name, const char* payload_json, size_t paylo
     // tripped the stack canary on the HTTP server task.
     char*    local    = nullptr;
     size_t   send_len = 0;
-    if (n > 0 && (size_t)n < sizeof(s_evt_buf)) {
-        local = static_cast<char*>(malloc((size_t)n));
+    if (n > 0) {
+        local = static_cast<char*>(malloc(n));
         if (local) {
-            send_len = (size_t)n;
+            send_len = n;
             memcpy(local, s_evt_buf, send_len);
         }
     }

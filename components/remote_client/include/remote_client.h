@@ -10,6 +10,50 @@
 extern "C" {
 #endif
 
+// ── Shared event-envelope builder ────────────────────────────────────────
+// ONE place that formats the `{"event":"<name>","data":<payload>}` frame
+// broadcast to local WS clients (ws_bridge `ws_event_broadcast`) AND mirrored
+// to the cloud peer (remote_client `publish_event`). Previously the two sites
+// open-coded the same snprintf with DIVERGENT buffer caps (4 KB local vs 8 KB
+// cloud) — the local-vs-cloud truncation asymmetry FINDINGS §5 flagged: a
+// coalesced batch could fit the cloud frame yet be replaced by `data:null`
+// locally (or vice-versa). Folding the format here keeps the wire shape and
+// the overflow contract identical; each caller still passes its own `cap`
+// (sized for its transport), but the framing can no longer drift.
+//
+// `name` is an internal, fixed event identifier (e.g. "attr.bulk") — NOT
+// client-controlled — so it is spliced verbatim (no escape). `payload_json`
+// is already well-formed JSON produced by an api_* handler and is spliced as
+// a value. On overflow / bad args the frame degrades to a parseable
+// `{"event":"<name>","data":null,"trunc":true}` rather than emitting broken
+// JSON. Returns bytes written (excluding NUL), or 0 if even the degraded
+// frame does not fit `cap`.
+//
+// `static inline` (header-only, no emitted symbol, available in BOTH Kconfig
+// states) so the no-op-stub build still sees one definition and there is no
+// ODR / cross-component-link concern.
+#include <cstdio>
+static inline size_t ws_event_envelope_build(char* out, size_t cap,
+                                             const char* name,
+                                             const char* payload_json,
+                                             size_t payload_len) {
+    if (!out || cap == 0) return 0;
+    int n;
+    if (payload_json && payload_len > 0) {
+        n = snprintf(out, cap, "{\"event\":\"%s\",\"data\":%.*s}",
+                     name ? name : "", (int)payload_len, payload_json);
+    } else {
+        n = snprintf(out, cap, "{\"event\":\"%s\",\"data\":null}",
+                     name ? name : "");
+    }
+    if (n > 0 && (size_t)n < cap) return (size_t)n;
+    // Degrade to a still-parseable frame so a peer never receives a truncated
+    // object. If even this does not fit, report failure (0) to the caller.
+    n = snprintf(out, cap, "{\"event\":\"%s\",\"data\":null,\"trunc\":true}",
+                 name ? name : "");
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
 // Sentinel fd used as `int fd` in `ws_server_reply`-style calls when
 // the response is to be routed to the remote socket instead of a
 // local httpd fd. Chosen well outside the legal fd range

@@ -240,7 +240,20 @@ static void do_two_stage_exchange(const HapFrame& my_frame) {
         _METRIC_COUNTER_INC(METRIC_HAP_TX_FRAMES_TOTAL, 1);
     }
 
-    if (dispatched && s_cb) s_cb(dispatched_peer);
+    // Invariant enforcement: s_dispatch_buf is single-owner — the callback
+    // MUST consume it synchronously (no stashing the pointer for async use)
+    // before we return and the next exchange reuses the buffer. s_spi_mutex
+    // already serialises callers; this guard catches a future 2nd dispatch
+    // task that would violate the assumption. The dispatch runs here AFTER the
+    // mutex release (callback executes synchronously between release and
+    // return), so the guard wraps the post-release s_cb call.
+    if (dispatched && s_cb) {
+        static bool s_in_dispatch = false;
+        configASSERT(!s_in_dispatch);
+        s_in_dispatch = true;
+        s_cb(dispatched_peer);
+        s_in_dispatch = false;
+    }
 }
 
 void hap_master_send(const HapFrame& frame) {
