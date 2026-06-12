@@ -7,6 +7,15 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Security
+
+- **docs/config**: documented that release builds MUST keep
+  `CONFIG_LOG_DEFAULT_LEVEL` ≤ INFO (≤ 3) — `esp_http_client` logs full request
+  URLs at DEBUG, and the `tg_gw` Telegram client carries the bot token in the
+  URL, so a DEBUG/VERBOSE image leaks the token to serial / `/api/logs`.
+  `sdkconfig.prod.defaults` already pins WARN (level 2); the risk and the rule
+  are now noted in README "Known hardening gaps".
+
 ### Fixed — High / Medium / Low (P2 findings review, T16 wifi_mgr event-loop unblock)
 
 - **wifi_mgr** (High): the STA reconnect backoff did `vTaskDelay` (up to 60 s)

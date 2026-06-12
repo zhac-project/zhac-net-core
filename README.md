@@ -122,6 +122,12 @@ enabled — only the default is off.
   planned replacement.
 - **F2** — the token (and all NVS secrets) sit in plaintext flash unless Secure
   Boot + Flash Encryption are enabled; see `sdkconfig.prod.defaults`.
+- **Release log level** — release builds MUST keep `CONFIG_LOG_DEFAULT_LEVEL`
+  ≤ INFO (value ≤ 3). `esp_http_client` logs the full request URL at DEBUG, and
+  the `tg_gw` Telegram client carries the bot token in that URL — a DEBUG/VERBOSE
+  image would leak the bot token to the serial console / `/api/logs`.
+  `sdkconfig.prod.defaults` pins WARN (level 2); do not raise it for shipping
+  images.
 
 ## License
 
