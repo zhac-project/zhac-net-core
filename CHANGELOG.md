@@ -16,6 +16,47 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   `sdkconfig.prod.defaults` already pins WARN (level 2); the risk and the rule
   are now noted in README "Known hardening gaps".
 
+### Fixed — Medium (P4 findings review, T26 remote_client lifecycle/backoff)
+
+- **remote_client** (Medium): the `BACKOFF` state slept with a bare
+  `vTaskDelay` (up to `CONFIG_ZHAC_REMOTE_BACKOFF_MAX_S`) inside the
+  state-machine task, so an `EVB_DISABLE` / `EVB_WIFI_DOWN` posted during a
+  backoff window sat unprocessed for the whole sleep — a `remote.disconnect`
+  or a Wi-Fi drop felt unresponsive for up to a full backoff. The task now
+  waits out the backoff on the event group (`xEventGroupWaitBits` with the
+  backoff as the timeout, watching `EVB_DISABLE | EVB_WIFI_DOWN`, clear-on-exit
+  off); an abort bit wakes it immediately and is consumed + stepped at the top
+  of the loop (→ `DISABLED` / `IDLE_NO_WIFI`), while a clean timeout fires
+  `EVB_BACKOFF_DONE` → `CONNECTING` exactly as before. (FINDINGS §5, :491)
+- **remote_client** (Medium): a disable→enable cycle leaked two queues and one
+  event group each time. `DISABLED` self-deletes `task_remote`, and re-enable
+  re-ran `remote_client_init`, which recreated `s_tx_queue` / `s_rx_queue` /
+  `s_remote_evt` over the still-live old handles. The kernel objects are now
+  created once (`remote_objects_init_once`, guarded by `s_objects_ready`) and
+  reused across every task respawn; only the task itself is respawnable
+  (`remote_task_spawn`). Keeping `s_remote_evt` stable also stops stranding the
+  Wi-Fi bits that `app_main` posts to it via the captured `extern` handle.
+  (FINDINGS §5, :514)
+- **remote_client** (Medium): `remote_client_enable` reloaded NVS into `s_cfg`
+  from the API caller's task while a live `task_remote` could concurrently read
+  `s_cfg.url` / `.token` (`start_ws_client` / `send_auth_frame`), risking torn
+  credentials. The reload is now deferred to the remote task via a new
+  `EVB_RELOAD_CFG` bit: `enable()` no longer touches `s_cfg` (it just sets
+  `EVB_RELOAD_CFG | EVB_ENABLE`), and the task reloads `s_cfg` from NVS at the
+  top of its loop — before any connect — so `task_remote` is the sole accessor
+  of `s_cfg`. `api_remote_connect` already persists the new creds to NVS before
+  calling `enable()`, so the deferred reload always observes them. The task's
+  body-entry `s_cfg` read was dropped (initial enable now rides the
+  `EVB_ENABLE` bit), and `last_state` was made task-local so a respawn starts
+  edge detection from `DISABLED`. (FINDINGS §5, :536)
+- **remote_client** (Medium, documentation): the inbound WSS path drops frames
+  with `data_len > 8192` and drops continuation/fragmented frames (op_code
+  0x00) — messages > 8 KB never dispatch. Reassembly is out of scope for this
+  batch; the 8 KB single-frame cap is now documented as a contract in
+  `ws_event_handler` (both directions share the 8 KB bound) with a cross-ref to
+  the `project_hub_cloud_devicesync` constraint (the reconcile relist /
+  device.list must page to stay under the cap). (FINDINGS §5, :199)
+
 ### Fixed — High / Medium / Low (P2 findings review, T16 wifi_mgr event-loop unblock)
 
 - **wifi_mgr** (High): the STA reconnect backoff did `vTaskDelay` (up to 60 s)
