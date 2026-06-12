@@ -555,6 +555,9 @@ static void task_remote_body(void*) {
                     // consumed (pdTRUE) + stepped at the top of the loop.
                     break;
                 }
+                // belt-and-suspenders; the step() below is the real
+                // BACKOFF->CONNECTING transition (the bit is consumed as a
+                // no-op by the next clearOnExit wait).
                 xEventGroupSetBits(s_remote_evt, EVB_BACKOFF_DONE);
                 step(REMOTE_EV_BACKOFF_DONE);
                 break;
@@ -653,6 +656,11 @@ extern "C" void remote_client_enable(void) {
 extern "C" void remote_client_disable(bool forget_creds) {
     if (forget_creds) {
         remote_nvs_forget_creds();
+        // KNOWN cold-path race (FINDINGS §5 residual): this clears s_cfg on the API
+        // task, not task_remote — symmetric to the enable() torn-cred hazard, but here
+        // DISABLE drives teardown (stop_ws_client + vTaskDelete) so the worst case is an
+        // empty-URL read on a connection already dying. Future: route via an
+        // EVB_FORGET_CFG bit like EVB_RELOAD_CFG so only task_remote touches s_cfg.
         s_cfg.url[0]   = 0;
         s_cfg.token[0] = 0;
     }
