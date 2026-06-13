@@ -491,6 +491,15 @@ void task_hap(void*) {
         .on_frame     = [](const HapFrame& f) {
             _METRIC_COUNTER_INC(METRIC_HAP_RX_FRAMES_TOTAL, 1);
             _METRIC_TIMER_SCOPE(METRIC_HAP_RX_HANDLE);
+            // INVARIANT (load-bearing — see hap_session_on_receive's
+            // dispatch-before-ACK): every branch here MUST fully read/copy
+            // `f.payload` BEFORE issuing any HAP send (hap_master_send / a
+            // roundtrip). `f.payload` points into the transport's shared
+            // dispatch buffer; a send re-enters the two-stage exchange and
+            // overwrites it. `waiter_deliver` below copies it out immediately;
+            // a new case that sends MUST do so only AFTER consuming the payload,
+            // else it silently delivers a clobbered payload (the device.list
+            // empty-list bug).
             // v2 dispatch — runs FIRST so the per-type cases below stay
             // focused on side-effects (WS broadcast, MQTT fanout, log,
             // cache). A response with ack_seq==0 is unsolicited (legacy
