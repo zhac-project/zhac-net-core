@@ -240,19 +240,20 @@ static void do_two_stage_exchange(const HapFrame& my_frame) {
         _METRIC_COUNTER_INC(METRIC_HAP_TX_FRAMES_TOTAL, 1);
     }
 
-    // Invariant enforcement: s_dispatch_buf is single-owner — the callback
-    // MUST consume it synchronously (no stashing the pointer for async use)
-    // before we return and the next exchange reuses the buffer. s_spi_mutex
-    // already serialises callers; this guard catches a future 2nd dispatch
-    // task that would violate the assumption. The dispatch runs here AFTER the
-    // mutex release (callback executes synchronously between release and
-    // return), so the guard wraps the post-release s_cb call.
+    // s_dispatch_buf is a single shared post-DMA buffer, reused by the next
+    // exchange. The callback runs here synchronously AFTER s_spi_mutex is
+    // released. Re-entrancy is EXPECTED and safe: an on_frame handler routinely
+    // replies/forwards via hap_master_send(), which re-enters this function on
+    // the same task — the nested exchange reuses s_dispatch_buf, so the
+    // invariant is simply that s_cb consumes dispatched_peer.payload BEFORE any
+    // nested send (which it does). Single-owner is enforced by s_spi_mutex
+    // serialising the SPI, NOT by forbidding re-entry.
+    //
+    // NB: a prior `configASSERT(!s_in_dispatch)` re-entrancy guard here was a
+    // bug — it crashed on this normal receive→handle→send path (the on_frame
+    // handler sending a reply re-enters do_two_stage_exchange). Removed.
     if (dispatched && s_cb) {
-        static bool s_in_dispatch = false;
-        configASSERT(!s_in_dispatch);
-        s_in_dispatch = true;
         s_cb(dispatched_peer);
-        s_in_dispatch = false;
     }
 }
 

@@ -9,6 +9,16 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **hap_master — CRITICAL crash regression (revert of a P4-T31 over-reach)** —
+  the re-entrancy `configASSERT(!s_in_dispatch)` added in T31 to "enforce" the
+  `s_dispatch_buf` single-owner invariant crashed S3 (`abort` → reboot loop) on
+  a normal path: an on_frame handler replying/forwarding via `hap_master_send`
+  re-enters `do_two_stage_exchange` on the same task. Re-entry is expected and
+  safe (callback consumes `dispatched_peer.payload` before the nested send;
+  `s_spi_mutex` serialises the SPI). Removed the assert + guard, kept an accurate
+  comment. The T31 finding only asked to *document* the invariant, not forbid
+  re-entry. (Manifested as "device.list times out, no P4 log" — S3 was
+  rebooting mid-roundtrip.)
 - **main / hap_bridge (P5-T32, FINDINGS §5, LOW)** — post-release cleanup of
   the open LOW-severity tail (most LOW rows were already resolved incidentally
   during P0–P4):
