@@ -517,7 +517,34 @@ void task_hap(void*) {
             switch (f.type) {
                 case HapMsgType::HEARTBEAT: {
                     HapHeartbeat hb{};
-                    hap_json_decode_heartbeat(f.payload, f.payload_len, hb);
+                    const bool hb_ok =
+                        hap_json_decode_heartbeat(f.payload, f.payload_len, hb);
+                    // P4-restart detector. A successfully-decoded uptime that
+                    // went BACKWARDS means P4 rebooted and re-ran
+                    // hap_session_init — its HAP seq counter rewound to 1. Force
+                    // a full re-SYNC: the handshake's SYNC_ACK is where
+                    // hap_session clears our stale receive-side dedup high-water.
+                    // Without this, every fresh low-seq NEEDS_ACK reply from the
+                    // restarted P4 (DEVICE_LIST / DEVICE_INFO / SET_ACK — the only
+                    // P4→S3 NEEDS_ACK frames) is silently dropped as "behind the
+                    // window" while NO_ACK traffic (heartbeats, *_RSP) keeps
+                    // flowing, so device.list/get/set wedge with NO self-heal: the
+                    // roundtrip dead-streak that would otherwise re-SYNC keeps
+                    // getting reset by the NO_ACK roundtrips that still succeed.
+                    // Heartbeats are NO_ACK and arrive every interval regardless
+                    // of request traffic, so this catches the restart within one
+                    // heartbeat. exchange() ⇒ act only on the synced→unsynced edge
+                    // (and skip the work entirely once already unsynced).
+                    if (hb_ok) {
+                        const uint32_t prev_uptime =
+                            s_p4_uptime_s.load(std::memory_order_relaxed);
+                        if (prev_uptime != 0 && hb.uptime < prev_uptime &&
+                            s_synced.exchange(false, std::memory_order_acq_rel)) {
+                            ESP_LOGW(TAG, "P4 restart detected (uptime %" PRIu32
+                                     " -> %" PRIu32 ") — forcing re-SYNC to clear "
+                                     "stale dedup window", prev_uptime, hb.uptime);
+                        }
+                    }
                     s_p4_uptime_s.store(hb.uptime,        std::memory_order_relaxed);
                     s_p4_psram_free.store(hb.psram_free,  std::memory_order_relaxed);
                     s_p4_psram_total.store(hb.psram_total,std::memory_order_relaxed);
