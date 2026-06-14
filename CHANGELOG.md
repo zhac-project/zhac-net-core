@@ -9,6 +9,19 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **hap_bridge — force re-SYNC on detected P4 restart** — P4's heartbeat uptime
+  going backwards is an unambiguous reboot signal, and the heartbeat is NO_ACK so
+  it flows regardless of request traffic. On a successfully-decoded uptime
+  regression S3 now forces `s_synced=false` to re-run the SYNC handshake, which
+  resets the receive-side dedup window (see `zhac-components` hap_session). This
+  is belt-and-suspenders for the peer-restart edge; the primary device.list/get/
+  set "wedge after hours of uptime" fix (the uint16 high-water wrap) lives in
+  `zhac-components` hap_session.
+
+## [v2026061302] - 2026-06-13
+
+### Fixed
+
 - **hap_master — CRITICAL crash regression (revert of a P4-T31 over-reach)** —
   the re-entrancy `configASSERT(!s_in_dispatch)` added in T31 to "enforce" the
   `s_dispatch_buf` single-owner invariant crashed S3 (`abort` → reboot loop) on
