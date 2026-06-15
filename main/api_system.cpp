@@ -27,6 +27,7 @@
 #include "task_stacks.h"
 #include "ArduinoJson.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"   // esp_app_get_description()->version (S3 FW version)
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -120,8 +121,9 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
     uint8_t  s3_cpu_c0 = 0, s3_cpu_c1 = 0;
     sys_metrics_sample_cpu_pct(s_status_cpu_ctx, s3_cpu_c0, s3_cpu_c1);
 
-    char p4_fw_ver[16] = {};
+    char p4_fw_ver[32] = {};
     hap_bridge_copy_p4_fw_ver(p4_fw_ver, sizeof(p4_fw_ver));
+    const char* s3_fw_ver = esp_app_get_description()->version;  // git-derived
 
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
     const bool remote_available = true;
@@ -163,6 +165,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"synced\":%s"
          ",\"metrics_enabled\":%s"
          ",\"auth_enabled\":%s"
+         ",\"fw_version\":\"%s\""
          ",\"p4_unresponsive\":%s"
          ",\"p4\":{"
            "\"devices\":%" PRIu16
@@ -216,6 +219,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         s_synced.load(std::memory_order_acquire)         ? "true" : "false",
         s_metrics_enabled                                ? "true" : "false",
         s_auth_enabled                                   ? "true" : "false",
+        s3_fw_ver,
         // F-01 fix: api_token field removed — /api/status is
         // unauthenticated, so echoing the bootstrap token here let any
         // LAN client read it. Token now surfaces only via serial log

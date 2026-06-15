@@ -91,7 +91,7 @@ extern std::atomic<uint32_t> s_p4_psram_total;
 extern std::atomic<uint8_t>  s_p4_cpu_pct_c0;
 extern std::atomic<uint8_t>  s_p4_cpu_pct_c1;
 extern std::atomic<uint32_t> s_p4_proto_mask;
-extern char                  s_p4_fw_ver[16];
+extern char                  s_p4_fw_ver[32];
 // Extended memory diagnostics forwarded from P4's HEARTBEAT payload.
 extern std::atomic<uint32_t> s_p4_heap_free;
 extern std::atomic<uint32_t> s_p4_heap_min_free;
