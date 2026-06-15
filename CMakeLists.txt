@@ -17,5 +17,20 @@ else()
     message(FATAL_ERROR "shared components dir not found — set IDF_COMPONENT_OVERRIDE_PATH or clone zhac-components as a sibling")
 endif()
 
+# Firmware version baked into esp_app_desc.version (shown in the web UI Info
+# block). Derived from git: the release tag on a clean checkout (e.g.
+# v2026061501), tag-commits-ghash when ahead, or the bare hash if untagged.
+# Must be set before project().
+execute_process(
+    COMMAND git describe --tags --always --dirty
+    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+    OUTPUT_VARIABLE ZHAC_GIT_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT ZHAC_GIT_VERSION)
+    set(ZHAC_GIT_VERSION "unknown")
+endif()
+set(PROJECT_VER "${ZHAC_GIT_VERSION}")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(zhac-net-core)

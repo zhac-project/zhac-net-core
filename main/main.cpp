@@ -245,7 +245,7 @@ std::atomic<uint32_t> s_p4_psram_total{0};
 std::atomic<uint8_t>  s_p4_cpu_pct_c0{0};
 std::atomic<uint8_t>  s_p4_cpu_pct_c1{0};
 std::atomic<uint32_t> s_p4_proto_mask{0};
-char                  s_p4_fw_ver[16] = {};
+char                  s_p4_fw_ver[32] = {};   // git-describe version from P4's SYNC
 std::atomic<uint32_t> s_p4_heap_free{0};
 std::atomic<uint32_t> s_p4_heap_min_free{0};
 std::atomic<uint32_t> s_p4_internal_free{0};

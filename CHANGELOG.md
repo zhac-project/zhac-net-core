@@ -7,6 +7,18 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added
+
+- **Firmware version in the Info block (both cores).** `/api/status` now returns
+  a top-level `fw_version` (S3's git-describe build version), and the existing
+  `p4.fw` carries P4's real version (no longer the hardcoded `"0.4.0"`). Versions
+  are baked from `git describe --tags --always --dirty` via `PROJECT_VER`. The
+  SYNC fw_ver compat check (which gated on a `0.4.x` prefix) is dropped — it
+  would false-warn on every release string; protocol compatibility is conveyed
+  by `proto_mask`. `s_p4_fw_ver` widened to 32 bytes; www-spa shows both rows.
+
+## [v2026061401]
+
 ### Fixed
 
 - **hap_bridge — force re-SYNC on detected P4 restart** — P4's heartbeat uptime

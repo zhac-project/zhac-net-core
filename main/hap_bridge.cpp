@@ -16,6 +16,7 @@
 #include "esp_attr.h"
 #include "esp_system.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"   // esp_app_get_description()->version (S3 FW version)
 #include "hap_master.h"
 #include "hap_session.h"
 #include "hap_json.h"
@@ -419,7 +420,8 @@ void send_sync_req() {
     uint32_t sid = esp_random();
     uint8_t tx_buf[256];
     uint16_t len = 0;
-    if (!hap_json_encode_sync_req(tx_buf, sizeof(tx_buf), &len, sid, "0.4.0")) {
+    if (!hap_json_encode_sync_req(tx_buf, sizeof(tx_buf), &len, sid,
+                                  esp_app_get_description()->version)) {
         ESP_LOGE(TAG, "SYNC_REQ encode failed");
         return;
     }
@@ -873,10 +875,10 @@ void task_hap(void*) {
                 s_p4_fw_ver[n] = '\0';
                 xSemaphoreGive(s_p4_metrics_mutex);
             }
-            if (info.fw_ver[0] != '0' || info.fw_ver[2] != '4') {
-                ESP_LOGW(TAG, "SYNC version mismatch: S3=0.4.0 P4=%s — protocol may be incompatible",
-                         info.fw_ver);
-            }
+            // fw_ver is now a git-describe release string (e.g. v2026061501),
+            // not a protocol version — don't gate on it (that old check would
+            // false-warn on every release). Protocol compatibility is conveyed
+            // by proto_mask; the peer build is just recorded for the Info page.
             ESP_LOGI(TAG, "SYNC_ACK received — P4 has %d devices, fw=%s",
                      info.device_count, info.fw_ver);
         },
