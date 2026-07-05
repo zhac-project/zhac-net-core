@@ -79,48 +79,59 @@ idf.py -p /dev/ttyUSB0 spiffs-flash   # SPIFFS only (after SPA rebuild)
 
 ## API authentication
 
-> **TODO — revisit before production.** Auth currently defaults **OFF**
-> (`auth_init()` in `main/main.cpp`, `auth_en = 0`). While off, **any client on
-> the LAN/Wi-Fi can drive the controller unauthenticated** — REST, WebSocket,
-> OTA, Zigbee reset, and arbitrary Lua via `script.run`. This is FINDINGS.md
-> **A1 / F1**, deliberately left open for zero-config development. Re-enable
-> (set `auth_en = 1`, or build a hardened image) before shipping.
+Auth is **secure-by-default**: on a fresh unit (no stored preference) the REST +
+WebSocket API require a token. The default is set by
+`CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED` (Kconfig, default `y`); a choice the
+operator later makes in the WebUI is stored in NVS (`zhac_auth/enabled`) and
+always overrides the build default across reboots and updates.
 
-The enforcement machinery is already in place and activates the moment auth is
-enabled — only the default is off.
+### The token
+
+- On first boot the unit gets an API token and persists it in NVS
+  (`zhac_auth/token`). By default it is a **unique 32-hex-char (128-bit) random
+  token per device**; a fleet image can instead seed a **known** bootstrap token
+  at build time via `CONFIG_ZHAC_DEFAULT_API_TOKEN` (leave it empty in public
+  builds — a shared, committed token is a foot-gun).
+- The token is printed to the **serial console on boot** (never to `/api/logs`):
+  `*** ZHAC API auth ENABLED — token (serial-only): <hex> ***`.
 
 ### How it works
 
-- A random 128-bit token is generated on first boot and persisted in NVS
-  (`zhac_auth/token`). Auth on/off lives in `zhac_auth/enabled`.
-- **REST**: every mutating route is gated by `REQUIRE_AUTH` and checks the
+- **REST**: every mutating route is gated by `REQUIRE_AUTH`, which checks the
   `X-Api-Key` header with a constant-time compare. A sliding-window lockout
   throttles failed attempts.
-- **WebSocket**: the `/ws` handshake requires the token as a `?token=` query
-  param (browsers can't set WS headers). With auth off, `/ws` is open.
-- `GET /api/status` and the static SPA assets stay unauthenticated so the UI
-  can always load.
+- **WebSocket**: the first frame on `/ws` must be an auth handshake —
+  `{"cmd":"auth","args":{"token":"<hex>"}}` — before any other command runs (the
+  token rides a WS frame, not the URL). This replaced the earlier `?token=`
+  URL-query scheme (FINDINGS.md **F18**).
+- `GET /api/status` and the static SPA assets stay unauthenticated so the UI can
+  always load. Provisioning routes (`/api/wifi/*`) **are** gated — so a fresh
+  unit needs its token before it can be onboarded (see below).
 
-### Enabling auth
+### Onboarding a fresh unit
 
-1. **Get the token.** When auth is enabled the token is printed to the
-   **serial console on every boot** (never to `/api/logs`):
-   `*** ZHAC API auth ENABLED — token (serial-only): <hex> ***`
-2. **Enable it** — either from the UI (**Settings → "Auth (bearer token)"**
-   toggle, persists `enabled=1`) or by flipping the default in `auth_init()`
-   for a hardened build.
-3. **Give the browser the token** — **Settings → "This browser's token"**,
-   paste, Save (writes `localStorage.zhac_token`, reconnects). For a browser
-   without the UI field yet, DevTools console:
-   `localStorage.setItem('zhac_token','<hex>'); location.reload()`.
-4. Token rotation is available via `/api/system` (`system.token.rotate`).
+Because provisioning is auth-gated, you need the token before WiFi setup:
 
-### Known hardening gaps (tracked in FINDINGS.md)
+- **Community / single unit** — read the random token from the serial console on
+  first boot, then use it to provision.
+- **Fleet image** — set a known `CONFIG_ZHAC_DEFAULT_API_TOKEN` so every unit
+  comes up with the same label credential; provision with it, then rotate.
 
-- **A1 / F1** — auth defaults off (above).
-- **F18 / A9** — the WS token travels in the URL query string (leaks to proxy
-  / access logs); a `Sec-WebSocket-Protocol` token or short-lived ticket is the
-  planned replacement.
+Give the browser the token in **Settings → "This browser's token"** (paste,
+Save — writes `localStorage.zhac_token` and reconnects), or from DevTools:
+`localStorage.setItem('zhac_token','<hex>'); location.reload()`.
+
+### Changing / disabling auth
+
+- **Rotate the token** — WebUI, or `POST /api/system/token/rotate` (generates a
+  fresh token and de-authes live sockets).
+- **Toggle auth off** (e.g. a development image) — WebUI **Settings**, or
+  `POST /api/settings` with `{"auth_enabled": false}`; the choice persists in NVS
+  and survives updates. For a permanently-open build, set
+  `CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED=n`.
+
+### Remaining hardening gaps (tracked in FINDINGS.md)
+
 - **F2** — the token (and all NVS secrets) sit in plaintext flash unless Secure
   Boot + Flash Encryption are enabled; see `sdkconfig.prod.defaults`.
 - **Release log level** — release builds MUST keep `CONFIG_LOG_DEFAULT_LEVEL`

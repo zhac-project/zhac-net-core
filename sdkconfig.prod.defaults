@@ -46,3 +46,13 @@ CONFIG_ESP_DEBUG_OCDAWARE=n
 # because Flash Encryption above renders the partition ciphertext. If you
 # ship WITHOUT flash encryption, also disable it:
 #   CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=n
+
+# ── API authentication ───────────────────────────────────────────────────
+# Auth is already secure-by-default in the base config; keep it enabled. For a
+# fleet image you MAY set a known 32-hex bootstrap token here so every unit
+# comes up with the same label credential the operator changes on first login;
+# otherwise each unit self-generates a random token on first boot. NEVER commit
+# a real token to a public tree — inject it at build time or keep this file
+# private.
+CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED=y
+# CONFIG_ZHAC_DEFAULT_API_TOKEN="<paste output of: openssl rand -hex 16>"

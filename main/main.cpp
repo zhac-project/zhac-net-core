@@ -55,39 +55,90 @@ uint64_t parse_ieee(const char* s) {
 }
 
 // ── API authentication ────────────────────────────────────────────────────
+#include <lwip/sockets.h>   // getpeername / sockaddr for the per-peer auth lockout
+
 char s_api_token[33] = {};
 bool s_auth_enabled = false;
 
-// Auth-failure rate limit (CC-F8). Sliding 60-second window of failed
-// attempts; once we cross AUTH_FAIL_LIMIT in the window every check_auth
-// returns false until the window slides past the oldest entry. Prevents
-// online brute-force of the 32-hex-char token.
-static constexpr uint8_t  AUTH_FAIL_LIMIT  = 5;
+// Auth-failure rate limit (CC-F8). Sliding 60-second window of failed attempts;
+// once a peer crosses AUTH_FAIL_LIMIT in the window its check_auth returns false
+// until the window slides past the oldest entry. Prevents online brute-force of
+// the 32-hex-char token.
+//
+// Per-peer buckets (REPORT.md §2.2): keyed by client IP so a hostile LAN host
+// that trips its own limit can't lock out the legitimate operator. IP 0 is a
+// shared fallback bucket for callers with no peer address (the WebSocket
+// first-message auth path, which has no httpd_req_t here).
+static constexpr uint8_t  AUTH_FAIL_LIMIT     = 5;
 static constexpr uint32_t AUTH_FAIL_WINDOW_MS = 60 * 1000;
-static uint32_t s_auth_fail_ts[AUTH_FAIL_LIMIT] = {};
-static uint8_t  s_auth_fail_head = 0;
+static constexpr uint8_t  AUTH_IP_BUCKETS     = 8;
+struct AuthFailBucket {
+    uint32_t ip;                        // peer IPv4 key (0 = unknown / shared)
+    uint32_t ts[AUTH_FAIL_LIMIT];
+    uint8_t  head;
+    uint32_t last_use_ms;               // 0 = free; else LRU stamp
+};
+static AuthFailBucket    s_auth_buckets[AUTH_IP_BUCKETS] = {};
 static SemaphoreHandle_t s_auth_fail_mutex = nullptr;
 
-static void auth_record_failure() {
+// Peer IPv4 (or a 32-bit fold of an IPv6 tail) for `req`; 0 if unavailable.
+static uint32_t peer_ipv4(httpd_req_t* req) {
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) return 0;
+    struct sockaddr_in6 sa; socklen_t sl = sizeof(sa);
+    if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&sa), &sl) != 0) return 0;
+    if (sa.sin6_family == AF_INET)
+        return reinterpret_cast<struct sockaddr_in*>(&sa)->sin_addr.s_addr;
+    uint32_t k; memcpy(&k, &sa.sin6_addr.s6_addr[12], sizeof(k)); return k;  // v4-mapped / v6 tail
+}
+
+// Caller holds s_auth_fail_mutex for both helpers below.
+static AuthFailBucket* auth_bucket_find(uint32_t ip) {
+    for (auto& b : s_auth_buckets) if (b.last_use_ms != 0 && b.ip == ip) return &b;
+    return nullptr;
+}
+static AuthFailBucket* auth_bucket_get(uint32_t ip, uint32_t now) {   // find-or-alloc (LRU evict)
+    if (AuthFailBucket* b = auth_bucket_find(ip)) { b->last_use_ms = now; return b; }
+    AuthFailBucket* lru = &s_auth_buckets[0];
+    for (auto& e : s_auth_buckets) if (e.last_use_ms < lru->last_use_ms) lru = &e;
+    *lru = AuthFailBucket{};
+    lru->ip = ip; lru->last_use_ms = now;
+    return lru;
+}
+
+static void auth_record_failure(uint32_t ip) {
     if (!s_auth_fail_mutex) return;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     if (xSemaphoreTake(s_auth_fail_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
-    s_auth_fail_ts[s_auth_fail_head] = now;
-    s_auth_fail_head = (s_auth_fail_head + 1) % AUTH_FAIL_LIMIT;
+    AuthFailBucket* b = auth_bucket_get(ip, now);
+    b->ts[b->head] = now;
+    b->head = (b->head + 1) % AUTH_FAIL_LIMIT;
     xSemaphoreGive(s_auth_fail_mutex);
 }
 
-static bool auth_is_locked() {
+static bool auth_is_locked(uint32_t ip) {
     if (!s_auth_fail_mutex) return false;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     if (xSemaphoreTake(s_auth_fail_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
     uint8_t recent = 0;
-    for (int i = 0; i < AUTH_FAIL_LIMIT; i++) {
-        if (s_auth_fail_ts[i] != 0 &&
-            (now - s_auth_fail_ts[i]) < AUTH_FAIL_WINDOW_MS) recent++;
+    if (const AuthFailBucket* b = auth_bucket_find(ip)) {   // no bucket => never failed
+        for (uint32_t t : b->ts) if (t != 0 && (now - t) < AUTH_FAIL_WINDOW_MS) recent++;
     }
     xSemaphoreGive(s_auth_fail_mutex);
     return recent >= AUTH_FAIL_LIMIT;
+}
+
+// True iff `s` is exactly 32 hexadecimal characters — the API token format
+// (used to validate the optional CONFIG_ZHAC_DEFAULT_API_TOKEN build seed).
+static inline bool token_is_hex32(const char* s) {
+    if (!s) return false;
+    for (int i = 0; i < 32; i++) {
+        char c = s[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+    return s[32] == '\0';
 }
 
 void auth_init() {
@@ -100,28 +151,56 @@ void auth_init() {
         return;
     }
 
-    // F1 (FINDINGS.md): auth defaults OFF per operator decision (2026-05-29).
-    // The on-by-default posture broke zero-config onboarding — a fresh unit's
-    // SPA could not reach the token-gated WebSocket. NOTE: default-off
-    // re-opens the A1 risk — until auth is enabled via /api/system
-    // (Settings → "Auth (bearer token)"), any LAN/RF client has full
-    // UNAUTHENTICATED control (OTA, zigbee reset, script.run). All
-    // enforcement machinery (WS handshake gate, constant-time compare,
-    // failure rate-limit, F19 token UI, serial token print) stays intact and
-    // activates the moment auth is enabled; for a hardened image set this
-    // back to 1.
-    uint8_t auth_en = 0;   // default OFF (A1 reopened — see note above)
-    nvs_get_u8(h, "enabled", &auth_en);
+    // Secure-by-default (REPORT.md B2): the REST + WebSocket API is auth-gated
+    // on a fresh unit. The default comes from CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED
+    // (Kconfig, default y); a stored NVS value ALWAYS wins, so a unit whose
+    // operator turned auth off in the WebUI keeps it off across reboots and
+    // firmware updates. Onboarding consequence: /api/wifi/* is auth-gated, so a
+    // fresh unit needs its token before it can be provisioned — two supported
+    // paths (see the CONFIG_ZHAC_DEFAULT_API_TOKEN block below and Kconfig help):
+    //   (1) public/community image: token empty → a unique random token is
+    //       generated per device and printed to SERIAL on first boot; read it
+    //       there to provision, then rotate it from the WebUI.
+    //   (2) fleet/product image: set a known 32-hex bootstrap token in a PRIVATE
+    //       sdkconfig.prod.defaults so every unit comes up with the same label
+    //       credential; the operator logs in with it and rotates it.
+    // All enforcement machinery (WS handshake gate, constant-time compare,
+    // failure rate-limit, F19 token UI, serial token print) is unchanged; only
+    // the fresh-NVS default flipped OFF→ON.
+#ifdef CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED
+    uint8_t auth_en = 1;
+#else
+    uint8_t auth_en = 0;
+#endif
+    nvs_get_u8(h, "enabled", &auth_en);   // stored operator choice wins
     s_auth_enabled = (auth_en != 0);
 
-    // Always generate/load a token so it's ready if auth is enabled later
+    // Load the stored token; if none, seed one and persist it. A build-time
+    // bootstrap token (CONFIG_ZHAC_DEFAULT_API_TOKEN) is used when it is a valid
+    // 32-hex string, otherwise a per-device random token is generated. Either
+    // way it is stable across reboots and rotatable from the WebUI.
     size_t len = sizeof(s_api_token);
     esp_err_t err = nvs_get_str(h, "token", s_api_token, &len);
     if (err != ESP_OK || s_api_token[0] == '\0') {
-        uint8_t rnd[16];
-        esp_fill_random(rnd, sizeof(rnd));
-        for (int i = 0; i < 16; i++) {
-            snprintf(s_api_token + i * 2, 3, "%02x", rnd[i]);
+#ifdef CONFIG_ZHAC_DEFAULT_API_TOKEN
+        const char* seed = CONFIG_ZHAC_DEFAULT_API_TOKEN;
+#else
+        const char* seed = "";
+#endif
+        bool from_config = false;
+        if (token_is_hex32(seed)) {
+            memcpy(s_api_token, seed, 33);   // 32 chars + NUL
+            from_config = true;
+        } else {
+            if (seed[0] != '\0') {
+                ESP_LOGE(TAG, "CONFIG_ZHAC_DEFAULT_API_TOKEN ignored — must be "
+                              "exactly 32 hex chars; generating random token");
+            }
+            uint8_t rnd[16];
+            esp_fill_random(rnd, sizeof(rnd));
+            for (int i = 0; i < 16; i++) {
+                snprintf(s_api_token + i * 2, 3, "%02x", rnd[i]);
+            }
         }
         esp_err_t se = nvs_set_str(h, "token", s_api_token);
         if (se != ESP_OK) ESP_LOGE(TAG, "auth_init: nvs_set token: %s",
@@ -134,8 +213,8 @@ void auth_init() {
         // the UART console via printf, which bypasses the log-ring vprintf
         // hook. Serial is the out-of-band bootstrap channel; a production
         // unit should surface it on a label / captive portal instead.
-        printf("\n*** ZHAC API TOKEN (first boot, serial-only): %s ***\n\n",
-               s_api_token);
+        printf("\n*** ZHAC API TOKEN (first boot, serial-only, %s): %s ***\n\n",
+               from_config ? "from build config" : "random", s_api_token);
         fflush(stdout);
     }
     nvs_close(h);
@@ -210,14 +289,15 @@ static inline bool token_matches_ct(const char* candidate) {
 
 bool check_auth(httpd_req_t* req) {
     if (!s_auth_enabled) return true;
-    if (auth_is_locked()) return false;     // CC-F8 rate-limit
+    uint32_t ip = peer_ipv4(req);
+    if (auth_is_locked(ip)) return false;     // CC-F8 rate-limit (per-peer)
     char key[64] = {};
     if (httpd_req_get_hdr_value_str(req, "X-Api-Key", key, sizeof(key)) != ESP_OK) {
-        auth_record_failure();
+        auth_record_failure(ip);
         return false;
     }
-    if (strlen(key) != 32) { auth_record_failure(); return false; }
-    if (!token_matches_ct(key)) { auth_record_failure(); return false; }
+    if (strlen(key) != 32) { auth_record_failure(ip); return false; }
+    if (!token_matches_ct(key)) { auth_record_failure(ip); return false; }
     return true;
 }
 
@@ -227,9 +307,10 @@ bool check_auth(httpd_req_t* req) {
 // (closes A12). Returns true when auth is disabled.
 bool auth_check_token(const char* token) {
     if (!s_auth_enabled) return true;
-    if (auth_is_locked()) return false;
-    if (!token || strlen(token) != 32) { auth_record_failure(); return false; }
-    if (!token_matches_ct(token)) { auth_record_failure(); return false; }
+    // No httpd_req_t on the WS first-message path — use the shared bucket (ip 0).
+    if (auth_is_locked(0)) return false;
+    if (!token || strlen(token) != 32) { auth_record_failure(0); return false; }
+    if (!token_matches_ct(token)) { auth_record_failure(0); return false; }
     return true;
 }
 

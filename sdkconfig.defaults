@@ -77,3 +77,14 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # to SHA-256 (or Secure Boot v2) rather than relying on transport TLS.
 CONFIG_OTA_ALLOW_HTTP=y
 ZHAC_REMOTE_CLIENT_ENABLE=y
+
+# ── API authentication (REPORT.md B2) ────────────────────────────────────
+# Secure-by-default: a fresh unit requires an API token for REST + WebSocket.
+# With the token seed left empty (below) a unique random token is generated on
+# first boot and printed to the SERIAL console — read it there to provision,
+# then rotate it in the WebUI. Leave CONFIG_ZHAC_DEFAULT_API_TOKEN EMPTY here:
+# a shared committed token would bake one credential into every public build
+# artefact. Set a known bootstrap token only in a private sdkconfig.prod.defaults
+# for a fleet image.
+CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED=y
+CONFIG_ZHAC_DEFAULT_API_TOKEN=""

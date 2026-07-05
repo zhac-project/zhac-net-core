@@ -7,6 +7,36 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Security
+
+- **API auth is now secure-by-default (REPORT.md B2 / F1 reversal).** On a unit
+  with no stored auth preference (fresh NVS / first boot), the REST + WebSocket
+  API now requires a token, controlled by the new `CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED`
+  (Kconfig, default `y`). A stored operator choice in NVS always wins, so units
+  that were provisioned with auth off (or turn it off in the WebUI) keep that
+  setting across reboots and updates. Previously auth defaulted OFF, leaving
+  every endpoint — including firmware OTA, `zigbee.reset`, and `script.write`
+  (Lua = RCE) — open to any LAN/RF client out of the box.
+  - **BREAKING for units that never set an auth preference:** after this update
+    they come up requiring a token. The token is printed to the **serial**
+    console on boot (`*** ZHAC API TOKEN ... ***`); paste it into the WebUI
+    (Settings → "This browser's token") to regain access, or set auth off there.
+  - New `CONFIG_ZHAC_DEFAULT_API_TOKEN` (string, default empty) optionally seeds
+    a **known 32-hex bootstrap token** at build time for fleet images; empty (the
+    public default) generates a unique random token per device. Never commit a
+    real token to the public tree — set it only in a private `sdkconfig.prod.defaults`.
+  - `sdkconfig.defaults` documents the empty-token default; `sdkconfig.prod.defaults`
+    documents the fleet-token option.
+
+### Documentation
+
+- **README auth section rewritten to match reality.** It now documents
+  secure-by-default auth (above), the fresh-unit onboarding flow (serial or
+  fleet token), and the WebSocket first-message handshake
+  `{"cmd":"auth","args":{"token":"…"}}`. It previously described a retired
+  "auth defaults OFF / any LAN client has RCE" posture and the old `?token=`
+  URL scheme that FINDINGS.md **F18** already replaced.
+
 ### Added
 
 - **Firmware version in the Info block (both cores).** `/api/status` now returns
@@ -16,6 +46,26 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   SYNC fw_ver compat check (which gated on a `0.4.x` prefix) is dropped — it
   would false-warn on every release string; protocol compatibility is conveyed
   by `proto_mask`. `s_p4_fw_ver` widened to 32 bytes; www-spa shows both rows.
+
+### Fixed
+
+- **`/api/status` no longer leaks MQTT credentials (REPORT.md §2.2).** The
+  unauthenticated status JSON echoed the raw `mqtt_broker` URI, which can embed
+  `user:pass@host`. `sanitize_broker_url()` strips the userinfo before the echo.
+- **Per-peer auth lockout (REPORT.md §2.2).** The brute-force lockout was a
+  single global window, so one hostile LAN host tripping it locked out the
+  legitimate operator too. It is now keyed by client IP (LRU-bounded buckets; a
+  shared bucket covers the WebSocket first-message path, which has no peer
+  address here).
+- **Provisioning AP auto-drops once STA is stable (REPORT.md §2.2).** The SoftAP
+  stayed up in APSTA for the whole runtime (idle attack surface) unless the
+  operator manually set `ap_disabled`. It now drops to STA-only after STA holds a
+  connection for a 2-minute grace period (cancelled on disconnect; the WiFi-reset
+  button re-opens it).
+- **REST bodies drained, not truncated (REPORT.md §2.2).** ~11 handlers read the
+  body with a single `httpd_req_recv`, truncating multi-segment bodies into
+  spurious 400s, and one used a file-static buffer. Routed through
+  `rest_body_recv` (drains + 413/400s); the file-static buffer is now local.
 
 ## [v2026061401]
 

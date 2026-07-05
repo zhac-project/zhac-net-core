@@ -262,11 +262,8 @@ esp_err_t handle_post_zigbee_reset(httpd_req_t* req) {
 esp_err_t handle_post_zigbee_settings(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     char body[128] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
 
     char rsp[128];
     size_t rsp_len = 0;
@@ -291,11 +288,8 @@ esp_err_t handle_post_ota(httpd_req_t* req) {
     static int64_t s_last_us = 0;
     RATE_LIMIT(req, s_last_us, 60LL * 1000000LL);
     char body[300] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     char rsp[32];
@@ -320,11 +314,8 @@ esp_err_t handle_post_p4_ota(httpd_req_t* req) {
     static int64_t s_last_us = 0;
     RATE_LIMIT(req, s_last_us, 60LL * 1000000LL);
     char body[300] = {};
-    int len = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (len <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int len = rest_body_recv(req, body, sizeof(body));
+    if (len < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[len] = '\0';
 
     char rsp[32];
@@ -350,11 +341,8 @@ esp_err_t handle_post_wifi(httpd_req_t* req) {
     static int64_t s_last_us = 0;
     RATE_LIMIT(req, s_last_us, 30LL * 1000000LL);
     char body[256] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     char rsp[64];
@@ -379,11 +367,8 @@ esp_err_t handle_post_wifi(httpd_req_t* req) {
 esp_err_t handle_post_settings(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     char body[256] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
 
     char rsp[32];
     size_t rsp_len = 0;

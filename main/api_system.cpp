@@ -48,6 +48,24 @@ static const char* TAG_API = "api_system";
 // ── OTA URL validation ────────────────────────────────────────────────────
 // Reject URLs containing control characters (\r, \n, bytes < 0x20) to prevent
 // HTTP request smuggling when the URL is passed to esp_http_client.
+// Strip userinfo ("user:pass@") from a broker URI so the unauthenticated
+// /api/status never leaks MQTT credentials embedded in the URL (REPORT.md §2.2).
+static void sanitize_broker_url(const char* in, char* out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!in || !in[0]) return;
+    const char* sep  = strstr(in, "://");
+    const char* host = sep ? sep + 3 : in;
+    const char* at   = nullptr;
+    for (const char* p = host; *p && *p != '/'; ++p) if (*p == '@') at = p;  // last @ before path
+    size_t prefix    = (size_t)(host - in);          // "scheme://" (0 if no scheme)
+    const char* rest = at ? at + 1 : host;           // host onward, sans userinfo
+    if (prefix >= out_cap) prefix = out_cap - 1;
+    memcpy(out, in, prefix);
+    strncpy(out + prefix, rest, out_cap - 1 - prefix);
+    out[out_cap - 1] = '\0';
+}
+
 static bool url_has_control_chars(const char* url) {
     for (const char* p = url; *p; p++) {
         if ((unsigned char)*p < 0x20) return true;
@@ -74,6 +92,10 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
                       mqtt_broker_nvs, sizeof(mqtt_broker_nvs),
                       mqtt_root_nvs,   sizeof(mqtt_root_nvs),
                       mqtt_cid_nvs,    sizeof(mqtt_cid_nvs));
+    // REPORT.md §2.2: /api/status is unauthenticated — never echo credentials
+    // that may be embedded in the broker URI (mqtt://user:pass@host).
+    char mqtt_broker_safe[128];
+    sanitize_broker_url(mqtt_broker_nvs, mqtt_broker_safe, sizeof(mqtt_broker_safe));
     bool mqtt_enabled_nvs = (mqtt_en_u8 != 0);
     if (!mqtt_root_nvs[0]) strncpy(mqtt_root_nvs, mqtt_gw_get_root_topic(),
                                     sizeof(mqtt_root_nvs) - 1);
@@ -206,7 +228,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         mqtt_gw_is_active()                              ? "true" : "false",
         mqtt_enabled_nvs                                 ? "true" : "false",
         remote_available                                 ? "true" : "false",
-        mqtt_broker_nvs,
+        mqtt_broker_safe,
         mqtt_root_nvs,
         mqtt_cid_nvs,
         log_sinks_get_mqtt_enabled()                     ? "true" : "false",

@@ -86,12 +86,44 @@ static void reconnect_timer_cb(void*);
 static void arm_reconnect_timer(uint32_t backoff_ms);
 
 // ── Event handler ────────────────────────────────────────────────────────
+// Provisioning-AP auto-drop (REPORT.md §2.2). The SoftAP is only needed until
+// WiFi is configured; leaving it up in APSTA for the whole runtime is idle
+// attack surface. Once STA has held a connection for AP_GRACE_MS we drop to
+// STA-only. Armed on GOT_IP, cancelled on STA disconnect (so a flaky link never
+// strands the user); re-provisioning is via the WiFi-reset button (erase creds
+// + reboot into AP).
+static constexpr int64_t  AP_GRACE_MS      = 120000;   // 2 min of stable STA
+static esp_timer_handle_t s_ap_grace_timer = nullptr;
+
+static void ap_grace_cb(void*) {
+    if (s_wifi_connected.load(std::memory_order_acquire) && s_ap_mode) {
+        ESP_LOGI(TAG, "STA stable %llds — dropping provisioning AP (STA-only)",
+                 AP_GRACE_MS / 1000);
+        s_ap_mode = false;
+        esp_wifi_set_mode(WIFI_MODE_STA);
+    }
+}
+
+static void arm_ap_grace_timer(void) {
+    if (!s_ap_grace_timer) {
+        const esp_timer_create_args_t a = {
+            .callback = ap_grace_cb, .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK, .name = "ap_grace",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&a, &s_ap_grace_timer) != ESP_OK) return;
+    }
+    esp_timer_stop(s_ap_grace_timer);                 // no-op if not running
+    esp_timer_start_once(s_ap_grace_timer, AP_GRACE_MS * 1000);
+}
+
 static void wifi_event_handler(void*, esp_event_base_t base,
                                 int32_t id, void* event_data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_connected.store(false, std::memory_order_release);
+        if (s_ap_grace_timer) esp_timer_stop(s_ap_grace_timer);  // link lost — cancel AP auto-drop
         const int retry = s_retry_count.fetch_add(1, std::memory_order_acq_rel) + 1;
         auto* ev = static_cast<wifi_event_sta_disconnected_t*>(event_data);
         uint8_t reason = ev ? ev->reason : 0;
@@ -156,6 +188,11 @@ static void wifi_event_handler(void*, esp_event_base_t base,
             ESP_LOGI(TAG, "ap_disabled=1 — switching to STA-only mode");
             s_ap_mode = false;
             esp_wifi_set_mode(WIFI_MODE_STA);
+        } else if (s_ap_mode) {
+            // REPORT.md §2.2: not manually disabled — auto-drop the AP once STA
+            // has been stable for the grace period (first-boot provisioning
+            // still works; WiFi-reset button re-opens the AP).
+            arm_ap_grace_timer();
         }
 
         // Start SNTP once

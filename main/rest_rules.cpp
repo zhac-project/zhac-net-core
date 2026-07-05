@@ -108,11 +108,8 @@ esp_err_t handle_post_rules(httpd_req_t* req) {
 esp_err_t handle_delete_rules(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     char body[64] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     char buf[512];
@@ -134,11 +131,8 @@ esp_err_t handle_delete_rules(httpd_req_t* req) {
 esp_err_t handle_put_rules(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     char body[128] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     char buf[512];
@@ -165,13 +159,11 @@ esp_err_t handle_put_rule_dsl(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid id");
         return ESP_OK;
     }
-    static char body[512];
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
-    body[received] = '\0';
+    // REPORT.md §2.2: local (not file-static — no cross-request aliasing) and
+    // via rest_body_recv, which drains multi-segment bodies + 413/400s on error.
+    char body[512];
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv already sent the error
 
     // Inject the URL-path id into the body so api_rule_update sees it.
     JsonDocument doc;
@@ -460,8 +452,8 @@ esp_err_t handle_post_groups(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     // PSRAM — safe: single httpd worker task serialises handlers.
     EXT_RAM_BSS_ATTR static char body[1024];
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     static char resp[256];
@@ -509,8 +501,8 @@ esp_err_t handle_put_group(httpd_req_t* req) {
     uint16_t id = uri_group_id(req, false);
     // PSRAM — safe: single httpd worker task serialises handlers.
     EXT_RAM_BSS_ATTR static char body[1024];
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     EXT_RAM_BSS_ATTR static char args[1200];
@@ -565,8 +557,8 @@ esp_err_t handle_post_group_cmd(httpd_req_t* req) {
     REQUIRE_AUTH(req);
     uint16_t id = uri_group_id(req, true);
     static char body[128];
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     static char args[192];

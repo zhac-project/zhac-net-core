@@ -40,6 +40,37 @@ config ZHAC_CORS_WILDCARD
         header, forcing same-origin access only (the WebUI shipped on
         the device).
 
+config ZHAC_API_AUTH_DEFAULT_ENABLED
+    bool "Require REST/WebSocket API auth by default (fresh NVS)"
+    default y
+    help
+        Secure-by-default: on a unit with no stored auth preference (fresh
+        NVS / first boot) the REST + WebSocket API require a token. A value
+        the operator later sets via the WebUI (Settings) or
+        /api/system/token/rotate is stored in NVS and always overrides this
+        default, so toggling auth off in the UI survives reboots and updates.
+
+        Disable (n) ONLY for a deliberately open development image. With auth
+        off, any LAN/RF client has full unauthenticated control — including
+        firmware OTA, Zigbee network reset, and Lua script execution (RCE).
+
+config ZHAC_DEFAULT_API_TOKEN
+    string "Bootstrap API token (32 hex chars, empty = random per device)"
+    default ""
+    help
+        Optional build-time seed for the API token, used on first boot when
+        NVS has none. Must be EXACTLY 32 hexadecimal characters — the API
+        token format — e.g. `openssl rand -hex 16`. An empty or invalid value
+        falls back to a unique random token generated on the device and
+        printed to the serial console at first boot.
+
+        Leave EMPTY in the public sdkconfig.defaults. A shared, committed
+        token bakes one credential into every build artefact and core dump —
+        the same foot-gun that retired compile-time WIFI_PASSWORD. Set a known
+        value ONLY in a private, per-fleet sdkconfig.prod.defaults (e.g. a
+        product line shipping a known bootstrap credential on a label that the
+        operator changes on first login). Rotate it any time from the WebUI.
+
 endmenu
 
 menu "ZHAC Remote"

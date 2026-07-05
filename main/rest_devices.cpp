@@ -246,11 +246,8 @@ esp_err_t handle_put_device(httpd_req_t* req) {
     }
 
     char body[256] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_OK;
-    }
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
     body[received] = '\0';
 
     // For sub==options the original REST handler stored the raw body
