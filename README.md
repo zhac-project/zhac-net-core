@@ -5,7 +5,7 @@ server, REST endpoints, MQTT gateway, and embeds the Web UI into
 its SPIFFS partition. Communicates with the P4 main core over SPI
 via the custom HAP binary protocol.
 
-[ZHAC]: https://github.com/zhac-project/zhac-platform
+[ZHAC]: https://github.com/zhac-project/zhac-docs
 
 ## Responsibilities
 
@@ -66,8 +66,9 @@ export EMBEDDED_ZHC_PATH=$PWD/../embedded-zhc
 idf.py build
 ```
 
-When building from `zhac-platform`, all overrides are exported
-automatically.
+With the sibling layout above, CMake also resolves
+`../zhac-components/components` without `IDF_COMPONENT_OVERRIDE_PATH` — the
+export just makes the override explicit.
 
 ## Flash
 
@@ -139,5 +140,5 @@ See `CONTRIBUTING.md`. All contributions require signing `CLA.md`.
 
 ## Versioning
 
-Releases tagged `vYYYYMMDDVV`. See `zhac-platform` README for the
-scheme.
+Releases tagged `vYYYYMMDDVV` (UTC date + 2-digit revision). Each repo
+tags its own version independently.
