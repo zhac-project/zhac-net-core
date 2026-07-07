@@ -58,12 +58,11 @@ static void sanitize_broker_url(const char* in, char* out, size_t out_cap) {
     const char* host = sep ? sep + 3 : in;
     const char* at   = nullptr;
     for (const char* p = host; *p && *p != '/'; ++p) if (*p == '@') at = p;  // last @ before path
-    size_t prefix    = (size_t)(host - in);          // "scheme://" (0 if no scheme)
+    const size_t prefix = (size_t)(host - in);       // "scheme://" (0 if no scheme)
     const char* rest = at ? at + 1 : host;           // host onward, sans userinfo
-    if (prefix >= out_cap) prefix = out_cap - 1;
-    memcpy(out, in, prefix);
-    strncpy(out + prefix, rest, out_cap - 1 - prefix);
-    out[out_cap - 1] = '\0';
+    // snprintf null-terminates within out_cap (no strncpy-truncation warning):
+    // %.*s copies the scheme prefix, %s the credential-free remainder.
+    snprintf(out, out_cap, "%.*s%s", (int)prefix, in, rest);
 }
 
 static bool url_has_control_chars(const char* url) {
