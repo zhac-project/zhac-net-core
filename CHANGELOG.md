@@ -7,6 +7,19 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **WiFi boot crash — set Wi-Fi mode before interface config (`ESP_ERR_WIFI_MODE`
+  0x3005).** `start_ap_mode()` / `start_sta_mode()` called `configure_ap()` /
+  `configure_sta()` — which call `esp_wifi_set_config(WIFI_IF_AP/STA)` — BEFORE
+  `esp_wifi_set_mode(WIFI_MODE_APSTA)`. Per the ESP-IDF contract,
+  `esp_wifi_set_config` may only be called once the target interface is enabled
+  by the current mode, so on ESP-IDF v6.0 (stricter than earlier IDFs) the
+  AP-config call aborted with `ESP_ERR_WIFI_MODE` at boot — a reboot loop as soon
+  as the flow reached `configure_ap` (e.g. any unit with saved STA credentials).
+  Reordered both paths to set_mode → configure → start. Latent since the initial
+  commit; surfaced by the v6.0 toolchain. **HW-test-pending** (S3 flash + boot).
+
 ### Security
 
 - **API auth is now secure-by-default (REPORT.md B2 / F1 reversal).** On a unit

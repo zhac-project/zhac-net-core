@@ -363,8 +363,11 @@ static void start_ap_mode(void) {
     s_ap_mode = true;
     s_wifi_connected.store(false, std::memory_order_release);
 
+    // Mode BEFORE config: esp_wifi_set_config(WIFI_IF_AP) inside configure_ap()
+    // requires the AP interface to already be enabled in the current mode —
+    // otherwise it fails ESP_ERR_WIFI_MODE (0x3005). APSTA so scan works.
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     configure_ap();
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));  // APSTA so scan works
     ESP_ERROR_CHECK(esp_wifi_start());
 
     snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
@@ -381,10 +384,12 @@ static void start_sta_mode(const char* ssid, const char* pass) {
     s_ap_mode = true;  // AP stays up alongside STA
     s_retry_count.store(0, std::memory_order_release);
 
+    // Mode BEFORE config: esp_wifi_set_config(WIFI_IF_AP/STA) inside
+    // configure_ap()/configure_sta() requires the interface enabled first —
+    // otherwise ESP_ERR_WIFI_MODE (0x3005).
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     configure_ap();
     configure_sta(ssid, pass);
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
