@@ -18,7 +18,8 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   AP-config call aborted with `ESP_ERR_WIFI_MODE` at boot — a reboot loop as soon
   as the flow reached `configure_ap` (e.g. any unit with saved STA credentials).
   Reordered both paths to set_mode → configure → start. Latent since the initial
-  commit; surfaced by the v6.0 toolchain. **HW-test-pending** (S3 flash + boot).
+  commit; surfaced by the v6.0 toolchain. **HW-verified** — the S3 boots past
+  `configure_ap` and reaches the gateway.
 
 ### Security
 
