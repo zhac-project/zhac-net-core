@@ -125,10 +125,35 @@ Save — writes `localStorage.zhac_token` and reconnects), or from DevTools:
 
 - **Rotate the token** — WebUI, or `POST /api/system/token/rotate` (generates a
   fresh token and de-authes live sockets).
-- **Toggle auth off** (e.g. a development image) — WebUI **Settings**, or
-  `POST /api/settings` with `{"auth_enabled": false}`; the choice persists in NVS
-  and survives updates. For a permanently-open build, set
-  `CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED=n`.
+- **Turn auth off at runtime — recommended for development.** WebUI
+  **Settings → Auth**, or `POST /api/settings` with `{"auth_enabled": false}`.
+  The choice persists in NVS and survives reboots and firmware updates, so you
+  set it **once per dev unit** and it stays off across SPA/firmware rebuilds.
+  On a fresh secure-by-default unit you need the token first to reach Settings:
+  read the random token from the **serial console on first boot**, enter it in
+  the SPA's sign-in gate, then toggle auth off. This touches nothing in the repo
+  and leaves the shipped default secure.
+- **Build a development image that boots with auth off (fresh NVS).** Disable the
+  build default — but note `sdkconfig` is **checked in**, so do **not** flip it in
+  place and commit it (that ships an insecure default to everyone). Instead:
+    - `idf.py menuconfig` → *ZHAC* → turn off **“Require REST/WebSocket API auth
+      by default”**, build, then `git checkout sdkconfig` so the change stays
+      local; **or**
+    - keep an un-committed `sdkconfig.dev.defaults` with
+      `CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED=n` and build into a throwaway config
+      so the tracked one is untouched:
+      `idf.py -DSDKCONFIG=build/sdkconfig.dev -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.dev.defaults" build`.
+
+  Either way the committed `sdkconfig.defaults` and `sdkconfig.prod.defaults`
+  stay `=y`. The build default only applies to a **fresh NVS** — a unit that has
+  ever had an auth preference set keeps it; `idf.py erase-flash` (or erase the
+  `zhac_auth` namespace) to re-apply the default.
+
+> **Warning — an auth-off image has no access control.** Any client on the LAN
+> or within Zigbee RF range gets full unauthenticated control of the controller:
+> firmware OTA, Zigbee network reset, and Lua script execution (arbitrary code).
+> Use an open build only on a trusted development network, never on anything
+> reachable from an untrusted host.
 
 ### Remaining hardening gaps (tracked in FINDINGS.md)
 
