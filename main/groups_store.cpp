@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // groups_store.cpp — NVS persistence layer for Zigbee device groups
 #include "groups_store.h"
+#include "json_buf.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -61,35 +62,11 @@ static uint32_t grp_get_bmp(nvs_handle_t h) {
     return bmp;
 }
 
-// Write a JSON-escaped string into buf[pos..cap), returning bytes written.
-// Handles: backslash, double-quote, control chars (\n, \r, \t), and other <0x20 as \u00XX.
-static size_t json_write_str(const char* s, char* buf, size_t pos, size_t cap) {
-    // DS14/Q14 (findings): the previous loop guarded only `pos < cap` at the top
-    // but the 2-byte escapes below write TWO bytes — a 1-byte overflow past `cap`
-    // when pos == cap-1 on an escaped char at the boundary. Check the exact byte
-    // count needed per character before writing.
-    size_t start = pos;
-    for (const char* p = s; *p; p++) {
-        unsigned char c = *p;
-        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
-            if (pos + 2 > cap) break;
-            buf[pos++] = '\\';
-            buf[pos++] = (c == '"')  ? '"' :
-                         (c == '\\') ? '\\' :
-                         (c == '\n') ? 'n' :
-                         (c == '\r') ? 'r' : 't';
-        } else if (c < 0x20) {
-            if (pos + 6 > cap) break;   // \u00XX = 6 bytes
-            int n = snprintf(buf + pos, cap - pos, "\\u%04x", c);
-            if (n < 0) break;
-            pos += (size_t)n;
-        } else {
-            if (pos + 1 > cap) break;
-            buf[pos++] = (char)c;
-        }
-    }
-    return pos - start;
-}
+// CODEX M-06: create the store mutex once during boot, before the httpd /
+// remote server tasks start. The lazy grp_lock_init() below is retained as a
+// backstop, but relying on it alone let two concurrent first-requests each
+// see a null handle and create (then leak) a second mutex.
+void grp_store_init() { grp_lock_init(); }
 
 uint16_t grp_next_id() {
     GrpLockGuard guard;
@@ -114,8 +91,12 @@ uint16_t grp_load_all(GrpRecord* out, uint16_t max) {
         char key[8]; grp_key(key, id);
         GrpRecord r{};
         size_t sz = sizeof(r);
-        if (nvs_get_blob(h, key, &r, &sz) == ESP_OK && r.id == id)
+        if (nvs_get_blob(h, key, &r, &sz) == ESP_OK && sz == sizeof(r) && r.id == id) {
+            // CODEX M-06: validate the persisted invariant before use — a
+            // corrupt/stale blob must not carry member_count > the array bound.
+            if (r.member_count > GRP_MAX_MEMBERS) r.member_count = GRP_MAX_MEMBERS;
             out[loaded++] = r;
+        }
     }
     nvs_close(h);
     return loaded;
@@ -155,11 +136,17 @@ bool grp_delete(uint16_t id) {
     nvs_handle_t h = grp_open(NVS_READWRITE);
     if (!h) return false;
     char key[8]; grp_key(key, id);
-    nvs_erase_key(h, key);
-    uint32_t bmp = grp_get_bmp(h);
-    bmp &= ~(1u << (id - 1));
-    nvs_set_u32(h, "bmp", bmp);
-    esp_err_t err = nvs_commit(h);
+    // CODEX M-06: propagate NVS failures instead of reporting only the final
+    // commit — a failed blob erase or bitmap write otherwise leaves the bitmap
+    // and blobs divergent while the call still returns success.
+    esp_err_t err = nvs_erase_key(h, key);
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;   // already absent — delete is idempotent
+    if (err == ESP_OK) {
+        uint32_t bmp = grp_get_bmp(h);
+        bmp &= ~(1u << (id - 1));
+        err = nvs_set_u32(h, "bmp", bmp);
+    }
+    if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err == ESP_OK;
 }
@@ -176,15 +163,20 @@ bool grp_find(uint16_t id, GrpRecord& out) {
 }
 
 size_t grp_to_json(const GrpRecord& r, char* buf, size_t cap) {
-    size_t pos = 0;
-    pos += snprintf(buf + pos, cap - pos, "{\"id\":%u,\"name\":\"", r.id);
-    json_write_str(r.name, buf, pos, cap);
-    pos += snprintf(buf + pos, cap - pos, "\",\"members\":[");
-    for (uint8_t i = 0; i < r.member_count && pos < cap; i++) {
-        if (i) buf[pos++] = ',';
-        pos += snprintf(buf + pos, cap - pos, "{\"ieee\":\"0x%016llX\",\"ep\":%u}",
-                        (unsigned long long)r.members[i].ieee, r.members[i].ep);
+    // CODEX H-01: all appends go through JsonWriter, which keeps pos <= cap and
+    // fails closed on overflow (returns 0) instead of walking off the buffer.
+    JsonWriter w(buf, cap);
+    w.fmt("{\"id\":%u,\"name\":\"", r.id);
+    w.str(r.name, sizeof(r.name));   // bounded: a stale/corrupt blob's name may lack a NUL
+    w.raw("\",\"members\":[");
+    // Clamp defensively — a corrupt/stale NVS blob must not index past
+    // members[GRP_MAX_MEMBERS].
+    uint8_t mc = r.member_count > GRP_MAX_MEMBERS ? GRP_MAX_MEMBERS : r.member_count;
+    for (uint8_t i = 0; i < mc; i++) {
+        if (i) w.ch(',');
+        w.fmt("{\"ieee\":\"0x%016llX\",\"ep\":%u}",
+              (unsigned long long)r.members[i].ieee, r.members[i].ep);
     }
-    pos += snprintf(buf + pos, cap - pos, "]}");
-    return pos < cap ? pos : 0;
+    w.raw("]}");
+    return w.finish();
 }

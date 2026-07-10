@@ -19,6 +19,11 @@ struct GrpRecord {
     GrpMember members[GRP_MAX_MEMBERS];
 };
 
+// Create the store mutex once, from the single-task boot context, before the
+// httpd / remote server tasks start. Avoids two concurrent first-requests each
+// lazily creating (and leaking) a mutex. Idempotent.
+void grp_store_init();
+
 // Returns the next available group ID (1-based), or 0 if all slots are full.
 uint16_t grp_next_id();
 

@@ -9,6 +9,25 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **API JSON serialization — bounded, fail-closed writer (CODEX H-01/H-02).**
+  `grp_to_json()`, `api_group_list()` and `api_alerts_get()` used the unchecked
+  `pos += snprintf(buf+pos, cap-pos, ...)` idiom: on truncation `pos` can exceed
+  `cap`, so `buf+pos` walks past the buffer and `cap-pos` underflows to a huge
+  size_t — a maximum-size group (16 members) into the list handler's `tmp[256]`
+  reproduced a **stack-buffer-overflow** under AddressSanitizer, and
+  `grp_to_json` also always emitted `"name":""` (a discarded escaped-length).
+  All three now serialise through a new checked `JsonWriter` (`main/json_buf.h`)
+  that keeps `pos <= cap`, escapes strings inline, and returns 0 on overflow —
+  callers fail closed with valid JSON (dropping entries that don't fit rather
+  than corrupting the buffer or returning an oversized `rsp_len`). `grp_to_json`
+  clamps `member_count` and bounds the name read. New ASan+UBSan host suite
+  `test/host/test_json_safety.cpp` (16 checks).
+- **Groups store — validate on load, propagate NVS failures, init the mutex at
+  boot (CODEX M-06).** `grp_load_all()` rejects a persisted `member_count` past
+  the array bound; `grp_delete()` reports a failed blob-erase / bitmap-write
+  instead of only the final commit; and the store mutex is created once from the
+  single-task boot path (`grp_store_init()` in `app_main`), so two concurrent
+  first requests can no longer each create and leak a mutex.
 - **WiFi boot crash — set Wi-Fi mode before interface config (`ESP_ERR_WIFI_MODE`
   0x3005).** `start_ap_mode()` / `start_sta_mode()` called `configure_ap()` /
   `configure_sta()` — which call `esp_wifi_set_config(WIFI_IF_AP/STA)` — BEFORE

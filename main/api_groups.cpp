@@ -8,6 +8,7 @@
 #include "s3_internal.h"
 #include "log_ring.h"
 #include "groups_store.h"
+#include "json_buf.h"
 #include "hap_json.h"
 #include "hap_protocol.h"
 #include "ws_server.h"
@@ -61,18 +62,32 @@ extern "C" ApiStatus api_group_list(const char* /*body*/, size_t /*body_len*/,
     EXT_RAM_BSS_ATTR static GrpRecord all[GRP_MAX_GROUPS];
     grp_store_lock();
     uint16_t cnt = grp_load_all(all, GRP_MAX_GROUPS);
-    size_t pos = 0;
-    pos += snprintf(rsp_buf + pos, rsp_cap - pos, "{\"groups\":[");
-    for (uint16_t i = 0; i < cnt && pos < rsp_cap; i++) {
-        if (i) rsp_buf[pos++] = ',';
-        char tmp[256];
+    // CODEX H-01: every append goes through JsonWriter (never advances past
+    // rsp_cap). Each group is serialised into scratch and appended only if it
+    // fits WITH room reserved for a separating comma and the closing "]}", so
+    // the response is always valid JSON even when it fills and later groups are
+    // dropped rather than silently corrupting the buffer.
+    JsonWriter w(rsp_buf, rsp_cap);
+    w.raw("{\"groups\":[");
+    uint16_t emitted = 0, dropped = 0;
+    for (uint16_t i = 0; i < cnt; i++) {
+        char tmp[768];   // > one maximum group (16 members + 32-char name)
         size_t n = grp_to_json(all[i], tmp, sizeof(tmp));
-        if (pos + n < rsp_cap) { memcpy(rsp_buf + pos, tmp, n); pos += n; }
+        if (n == 0) { dropped++; continue; }
+        if (w.len() + (emitted ? 1u : 0u) + n + 2 > rsp_cap) { dropped++; continue; }
+        if (emitted) w.ch(',');
+        w.raw(tmp);
+        emitted++;
     }
-    pos += snprintf(rsp_buf + pos, rsp_cap - pos, "]}");
+    w.raw("]}");
     grp_store_unlock();
-    if (rsp_len) *rsp_len = pos;
-    return API_OK;
+    if (dropped) {
+        ESP_LOGW("api_groups", "group.list: %u group(s) dropped — response cap %zu too small",
+                 (unsigned)dropped, rsp_cap);
+    }
+    size_t len = w.finish();
+    if (rsp_len) *rsp_len = len;
+    return len ? API_OK : API_INTERNAL_ERROR;
 }
 
 extern "C" ApiStatus api_group_create(const char* body, size_t body_len,

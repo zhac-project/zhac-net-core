@@ -19,6 +19,7 @@
 #include "nvs_helpers.h"
 #include "log_ring.h"
 #include "groups_store.h"
+#include "json_buf.h"
 #include "hap_json.h"
 #include "hap_protocol.h"
 #include "ws_server.h"
@@ -278,28 +279,40 @@ extern "C" ApiStatus api_alerts_get(const char* /*body*/, size_t /*body_len*/,
                     ? 0
                     : s_alert_log_head;
 
-    int pos = 0;
-    pos += snprintf(rsp_buf + pos, rsp_cap - pos, "[");
+    // CODEX H-02: JsonWriter fails closed and never advances past rsp_cap. Each
+    // entry is built into scratch and appended only if it fits WITH room
+    // reserved for a comma and the closing "]", so the response is always valid
+    // JSON and *rsp_len is never greater than the buffer (the old code returned
+    // an oversized length, letting the HTTP layer read out of bounds).
+    JsonWriter w(rsp_buf, rsp_cap);
+    w.raw("[");
+    uint8_t emitted = 0, dropped = 0;
     for (uint8_t i = 0; i < count; i++) {
         const AlertLogEntry& e = s_alert_log[(start + i) % ALERT_LOG_MAX];
-        if (i > 0) pos += snprintf(rsp_buf + pos, rsp_cap - pos, ",");
-        // alert.msg originates from P4 and may include device-supplied
-        // strings — escape `"`, `\`, control bytes per RFC 8259.
-        char msg_esc[sizeof(e.alert.msg) * 2 + 1];
-        hap_json_escape_str(e.alert.msg, msg_esc, sizeof(msg_esc));
-        pos += snprintf(rsp_buf + pos, rsp_cap - pos,
-            "{\"code\":%u,\"ieee\":\"0x%016llX\",\"msg\":\"%s\",\"ts\":%" PRIu32 "}",
-            static_cast<uint8_t>(e.alert.code),
-            (unsigned long long)e.alert.ieee,
-            msg_esc,
-            e.wall_ts);
-        if (pos >= (int)rsp_cap - 64) break;
+        // alert.msg originates from P4 and may include device-supplied strings.
+        char ent[sizeof(e.alert.msg) * 2 + 96];
+        JsonWriter ew(ent, sizeof(ent));
+        ew.fmt("{\"code\":%u,\"ieee\":\"0x%016llX\",\"msg\":\"",
+               static_cast<unsigned>(e.alert.code),
+               (unsigned long long)e.alert.ieee);
+        ew.str(e.alert.msg, sizeof(e.alert.msg));   // RFC 8259 escaping, bounded
+        ew.fmt("\",\"ts\":%" PRIu32 "}", e.wall_ts);
+        size_t n = ew.finish();
+        if (n == 0) { dropped++; continue; }
+        if (w.len() + (emitted ? 1u : 0u) + n + 1 > rsp_cap) { dropped++; continue; }
+        if (emitted) w.ch(',');
+        w.raw(ent);
+        emitted++;
     }
-    pos += snprintf(rsp_buf + pos, rsp_cap - pos, "]");
+    w.raw("]");
     xSemaphoreGive(s_alert_log_mutex);
-
-    if (rsp_len) *rsp_len = (size_t)pos;
-    return API_OK;
+    if (dropped) {
+        ESP_LOGW(TAG_API, "alerts: %u dropped — response cap %zu too small",
+                 (unsigned)dropped, rsp_cap);
+    }
+    size_t len = w.finish();
+    if (rsp_len) *rsp_len = len;
+    return len ? API_OK : API_INTERNAL_ERROR;
 }
 
 extern "C" ApiStatus api_logs_get(const char* /*body*/, size_t /*body_len*/,
