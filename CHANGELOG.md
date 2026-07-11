@@ -9,6 +9,15 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **sdkconfig — correct the `CONFIG_` prefix on the remote-client default
+  (CODEX M-04).** `sdkconfig.defaults` had `ZHAC_REMOTE_CLIENT_ENABLE=y` without
+  the `CONFIG_` prefix, so Kconfig ignored it and a clean build fell back to
+  `default n` — the tracked/generated `sdkconfig` masked the mismatch in
+  incremental builds. Now `CONFIG_ZHAC_REMOTE_CLIENT_ENABLE=y`, so clean and
+  incremental builds agree. `CONFIG_ZHAC_DEFAULT_API_TOKEN` stays empty in the
+  committed defaults — a unique random token is generated per device on first
+  boot; a shared committed token would bake one credential into every public
+  build (set a fleet bootstrap token only in a private overlay, outside git).
 - **API JSON serialization — bounded, fail-closed writer (CODEX H-01/H-02).**
   `grp_to_json()`, `api_group_list()` and `api_alerts_get()` used the unchecked
   `pos += snprintf(buf+pos, cap-pos, ...)` idiom: on truncation `pos` can exceed

@@ -76,7 +76,7 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # Production deployments wanting integrity verification should switch
 # to SHA-256 (or Secure Boot v2) rather than relying on transport TLS.
 CONFIG_OTA_ALLOW_HTTP=y
-ZHAC_REMOTE_CLIENT_ENABLE=y
+CONFIG_ZHAC_REMOTE_CLIENT_ENABLE=y
 
 # ── API authentication (REPORT.md B2) ────────────────────────────────────
 # Secure-by-default: a fresh unit requires an API token for REST + WebSocket.
