@@ -386,10 +386,26 @@ bool hap_roundtrip_v2(HapMsgType type,
     HapFrame f{};
     f.type        = type;
     f.seq         = seq;
-    f.flags       = HAP_FLAG_NO_ACK;
+    // NEEDS_ACK (was NO_ACK): a lost request frame used to be completely
+    // silent — no retransmit, no log on either side, only this waiter's
+    // timeout after the full 5 s (the P4 never saw the request, so its log
+    // shows nothing). Once SHADOW_OPTIMISTIC forwarding raised the ambient
+    // SPI traffic, that silent loss became user-visible as sporadic
+    // device.list 500s blocking the SPA login gate. With NEEDS_ACK the
+    // session retransmits at 1 s up to 5×, and the peer's seen-ring dedups
+    // a duplicate delivery — a single lost frame now costs ~1 s, not a
+    // failed roundtrip.
+    f.flags       = HAP_FLAG_NEEDS_ACK;
     f.payload     = req;
     f.payload_len = req_len;
-    hap_session_send(f);
+    if (!hap_session_send(f)) {
+        // Retransmit window full — local congestion, not link evidence
+        // (don't bump the dead-link streak). Fail fast so the caller can
+        // retry instead of burning the full roundtrip timeout on a frame
+        // that was never queued.
+        waiter_release(w);
+        return false;
+    }
 
     const bool got = xSemaphoreTake(w->sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     const bool ok  = got && w->ok;
@@ -400,10 +416,12 @@ bool hap_roundtrip_v2(HapMsgType type,
     } else {
         ESP_LOGW(TAG, "hap_roundtrip_v2 timeout type=0x%02x seq=%u after %" PRIu32 "ms",
                  static_cast<uint8_t>(type), seq, timeout_ms);
-        // Data requests are NO_ACK, so the window-based on_link_dead never fires for them.
-        // Repeated roundtrip timeouts while heartbeats still flow = a half-dead link (P4 tore
-        // its session down and is awaiting SYNC). Force a re-SYNC to recover — clearing s_synced
-        // makes the hap_task loop resend SYNC_REQ. exchange() so we only act on the true→false edge.
+        // Requests are NEEDS_ACK now, so a truly dead link also surfaces via the
+        // session's retransmit-exhaust on_link_dead. This streak heuristic stays as
+        // belt-and-braces for the half-dead case it was built for (P4 tore its session
+        // down and is awaiting SYNC: it ACKs nothing, heartbeats may still flow).
+        // Force a re-SYNC to recover — clearing s_synced makes the hap_task loop
+        // resend SYNC_REQ. exchange() so we only act on the true→false edge.
         const uint8_t streak = static_cast<uint8_t>(
             s_roundtrip_dead_streak.fetch_add(1, std::memory_order_release) + 1);
         if (streak >= HAP_ROUNDTRIP_DEAD_STREAK &&

@@ -9,6 +9,21 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **HAP roundtrip requests now retransmit on loss (`NEEDS_ACK`); device.list
+  pages retry once.** Roundtrip request frames were sent `NO_ACK` — a request
+  lost on the SPI leg was completely silent (no retransmit, no log on either
+  side; the P4 never saw it) and only surfaced as the waiter's 5 s timeout,
+  which `api_devices` escalated to a 500 that blocked the SPA login gate.
+  Requests are now `NEEDS_ACK`: the session retransmits at 1 s (up to 5×) and
+  the peer's seen-ring dedups duplicates, so a single lost frame costs ~1 s
+  instead of a failed roundtrip. `hap_roundtrip_v2` also fails fast when the
+  retransmit window is full instead of burning the full timeout, and
+  `devlist_fetch_all` retries a failed page once (deadline-gated — the
+  documented worst-case stall bound is unchanged) so one bad page no longer
+  fails the whole device list. Symptom: intermittent "hap_roundtrip_v2
+  timeout … device.list page N roundtrip failed → 500" with a silent P4,
+  more frequent once SHADOW_OPTIMISTIC forwarding raised ambient SPI traffic.
+
 - **sdkconfig — correct the `CONFIG_` prefix on the remote-client default
   (CODEX M-04).** `sdkconfig.defaults` had `ZHAC_REMOTE_CLIENT_ENABLE=y` without
   the `CONFIG_` prefix, so Kconfig ignored it and a clean build fell back to

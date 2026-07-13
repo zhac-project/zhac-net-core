@@ -203,8 +203,23 @@ static size_t devlist_fetch_all(char* out, size_t out_cap) {
         uint8_t req[2] = { static_cast<uint8_t>(start & 0xFF),
                            static_cast<uint8_t>((start >> 8) & 0xFF) };
         size_t got = 0;
-        if (!hap_roundtrip_v2(HapMsgType::GET_DEVICES, req, sizeof(req),
-                              chunk, kDevListChunkCap, &got, 5000)) {
+        // One retry per page, deadline-gated: with NEEDS_ACK requests a single
+        // lost frame self-heals via session retransmit, but a double loss can
+        // still burn one 5 s timeout — don't fail the whole list (and the SPA
+        // login gate behind it) over one bad page. The deadline check keeps
+        // the documented worst-case stall (budget + one in-flight roundtrip)
+        // unchanged.
+        bool page_ok = false;
+        for (int attempt = 0; attempt < 2 && !page_ok; attempt++) {
+            if (attempt > 0) {
+                if (esp_timer_get_time() > deadline_us) break;
+                ESP_LOGW(TAG_API, "device.list page %d retry (start=%u)",
+                         page, (unsigned)start);
+            }
+            page_ok = hap_roundtrip_v2(HapMsgType::GET_DEVICES, req, sizeof(req),
+                                       chunk, kDevListChunkCap, &got, 5000);
+        }
+        if (!page_ok) {
             ESP_LOGE(TAG_API, "device.list page %d roundtrip failed (start=%u)",
                      page, (unsigned)start);
             free(chunk);
