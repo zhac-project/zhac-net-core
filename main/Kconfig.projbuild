@@ -71,6 +71,22 @@ config ZHAC_DEFAULT_API_TOKEN
         product line shipping a known bootstrap credential on a label that the
         operator changes on first login). Rotate it any time from the WebUI.
 
+config ZHAC_DEFAULT_PASSWORD
+    string "Bootstrap admin password (empty = first-boot setup card in WebUI)"
+    default ""
+    help
+        Optional build-time seed for the WebUI admin password (8-63 chars),
+        applied on first boot when NVS holds none. The WebUI login exchanges
+        this password for the API token; only a salted iterated hash is
+        stored, never the plaintext.
+
+        Leave EMPTY in the public sdkconfig.defaults — a committed password
+        is a shared credential baked into every build artefact (same rule as
+        ZHAC_DEFAULT_API_TOKEN). With no seed, a fresh unit shows a one-time
+        "set admin password" card on the first WebUI visit instead; no serial
+        cable needed. Set a known value ONLY in a private per-fleet
+        sdkconfig.prod.defaults. Changeable any time in Settings.
+
 endmenu
 
 menu "ZHAC Remote"

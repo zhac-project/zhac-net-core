@@ -198,6 +198,10 @@ uint64_t parse_ieee(const char* s);
 bool     check_auth(httpd_req_t* req);
 bool     auth_check_token(const char* token);   // F18: WS first-message auth
 void     auth_init();
+// Admin password (human credential — login exchanges it for the API token).
+bool     auth_password_is_set();
+bool     auth_password_store(const char* pw);               // 8..63 chars; persists salted hash
+bool     auth_password_check(httpd_req_t* req, const char* pw);  // shares the auth lockout
 
 // ── Functions defined in hap_bridge.cpp ──────────────────────────────────
 void alert_log_load();

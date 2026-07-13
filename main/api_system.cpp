@@ -187,6 +187,7 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"synced\":%s"
          ",\"metrics_enabled\":%s"
          ",\"auth_enabled\":%s"
+         ",\"auth_setup_required\":%s"
          ",\"fw_version\":\"%s\""
          ",\"p4_unresponsive\":%s"
          ",\"p4\":{"
@@ -241,6 +242,10 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         s_synced.load(std::memory_order_acquire)         ? "true" : "false",
         s_metrics_enabled                                ? "true" : "false",
         s_auth_enabled                                   ? "true" : "false",
+        // Drives the SPA first-boot "set admin password" card. Discloses only
+        // that no password exists yet — the same fact the open setup endpoint
+        // makes true; both close the moment the password is set.
+        (s_auth_enabled && !auth_password_is_set())      ? "true" : "false",
         s3_fw_ver,
         // F-01 fix: api_token field removed — /api/status is
         // unauthenticated, so echoing the bootstrap token here let any

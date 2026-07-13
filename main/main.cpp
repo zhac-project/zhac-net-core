@@ -24,6 +24,7 @@
 #include "metrics/metrics.h"
 #include "esp_timer.h"
 #include "esp_random.h"
+#include "psa/crypto.h"   // IDF v6 / mbedtls 4: legacy mbedtls/sha256.h is private — PSA is the public hash API
 #include "esp_attr.h"
 #include "esp_https_ota.h"
 #include "esp_crt_bundle.h"   // F3: verify OTA server cert against CA bundle
@@ -129,6 +130,98 @@ static bool auth_is_locked(uint32_t ip) {
     return recent >= AUTH_FAIL_LIMIT;
 }
 
+// ── Admin password (human credential) ────────────────────────────────────
+// The 32-hex API token is machine-friendly but hostile to humans (fished
+// from the serial log, impossible to remember). The WebUI now authenticates
+// with a PASSWORD which the login endpoint exchanges for the existing API
+// token — the token stays the only wire credential (REST X-Api-Key, WS
+// first-message auth), so every gate below is untouched. Storage is a
+// salted iterated-SHA-256 hash in NVS, never plaintext:
+//   H0 = SHA256(salt ‖ pw);  Hi = SHA256(Hi−1 ‖ salt ‖ pw);  8192 rounds.
+// Deliberately not PBKDF2 (MBEDTLS_PKCS5_C isn't guaranteed in the IDF
+// default config); the iterated construction with a per-device random salt
+// is adequate for this threat model — a LAN credential whose NVS can only
+// be read with physical access, which (non-flash-encrypted) already implies
+// full compromise per the serial-print rationale in auth_init().
+static constexpr int PW_KDF_ROUNDS = 8192;
+static constexpr size_t PW_MIN_LEN = 8, PW_MAX_LEN = 63;
+static uint8_t s_pw_salt[16];
+static uint8_t s_pw_hash[32];
+static bool    s_pw_set = false;
+
+// Returns false if the PSA backend refuses (out is zeroed) — callers fail
+// closed: verify mismatches, store aborts before persisting a garbage hash.
+static bool pw_kdf(const char* pw, const uint8_t salt[16], uint8_t out[32]) {
+    const size_t pwlen = strlen(pw);
+    uint8_t buf[32 + 16 + PW_MAX_LEN];       // Hi−1 ‖ salt ‖ pw
+    uint8_t h[32];
+    size_t olen = 0;
+    memcpy(buf + 32, salt, 16);
+    memcpy(buf + 48, pw, pwlen);
+    // Round 0 hashes salt‖pw (no previous digest).
+    psa_status_t st = psa_hash_compute(PSA_ALG_SHA_256, buf + 32, 16 + pwlen,
+                                       h, sizeof(h), &olen);
+    for (int i = 1; st == PSA_SUCCESS && i < PW_KDF_ROUNDS; i++) {
+        memcpy(buf, h, 32);
+        st = psa_hash_compute(PSA_ALG_SHA_256, buf, 32 + 16 + pwlen,
+                              h, sizeof(h), &olen);
+    }
+    if (st != PSA_SUCCESS || olen != 32) {
+        ESP_LOGE(TAG, "pw_kdf: psa_hash_compute failed (%d)", (int)st);
+        memset(out, 0, 32);
+        return false;
+    }
+    memcpy(out, h, 32);
+    return true;
+}
+
+bool auth_password_is_set() { return s_pw_set; }
+
+// Persist a new password (salted hash only). Enforces the length policy so
+// every caller (setup, change, build seed) gets the same rule.
+bool auth_password_store(const char* pw) {
+    if (!pw) return false;
+    const size_t n = strlen(pw);
+    if (n < PW_MIN_LEN || n > PW_MAX_LEN) return false;
+
+    uint8_t salt[16], hash[32];
+    esp_fill_random(salt, sizeof(salt));
+    if (!pw_kdf(pw, salt, hash)) return false;   // never persist a garbage hash
+
+    nvs_handle_t h;
+    if (nvs_open("zhac_auth", NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_blob(h, "pw_salt", salt, sizeof(salt));
+    esp_err_t e2 = (e1 == ESP_OK) ? nvs_set_blob(h, "pw_hash", hash, sizeof(hash)) : e1;
+    esp_err_t e3 = (e2 == ESP_OK) ? nvs_commit(h) : e2;
+    nvs_close(h);
+    if (e3 != ESP_OK) { ESP_LOGE(TAG, "password store: nvs failed"); return false; }
+
+    const bool was_set = s_pw_set;
+    memcpy(s_pw_salt, salt, sizeof(salt));
+    memcpy(s_pw_hash, hash, sizeof(hash));
+    s_pw_set = true;
+    ESP_LOGW(TAG, "admin password %s", was_set ? "changed" : "set");
+    return true;
+}
+
+// Verify a login attempt. Shares the per-peer sliding-window lockout with
+// check_auth() so password guessing is rate-limited exactly like token
+// guessing; the KDF's ~ms cost also slows online brute force. Constant-time
+// digest compare — no early-out on the first mismatching byte.
+bool auth_password_check(httpd_req_t* req, const char* pw) {
+    uint32_t ip = peer_ipv4(req);
+    if (auth_is_locked(ip)) return false;
+    if (!s_pw_set || !pw) { auth_record_failure(ip); return false; }
+    const size_t n = strlen(pw);
+    if (n < 1 || n > PW_MAX_LEN) { auth_record_failure(ip); return false; }
+    uint8_t h[32];
+    if (!pw_kdf(pw, s_pw_salt, h)) { auth_record_failure(ip); return false; }
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++) diff |= h[i] ^ s_pw_hash[i];
+    if (diff != 0) { auth_record_failure(ip); return false; }
+    return true;
+}
+
 // True iff `s` is exactly 32 hexadecimal characters — the API token format
 // (used to validate the optional CONFIG_ZHAC_DEFAULT_API_TOKEN build seed).
 static inline bool token_is_hex32(const char* s) {
@@ -144,6 +237,12 @@ static inline bool token_is_hex32(const char* s) {
 
 void auth_init() {
     if (!s_auth_fail_mutex) s_auth_fail_mutex = xSemaphoreCreateMutex();
+
+    // PSA crypto must be initialised before the first pw_kdf (password seed
+    // below, or the first login). Idempotent; failure only disables the
+    // password path (kdf fails closed), never the token path.
+    psa_status_t pst = psa_crypto_init();
+    if (pst != PSA_SUCCESS) ESP_LOGE(TAG, "psa_crypto_init failed (%d)", (int)pst);
 
     nvs_handle_t h;
     esp_err_t oe = nvs_open("zhac_auth", NVS_READWRITE, &h);
@@ -218,7 +317,32 @@ void auth_init() {
                from_config ? "from build config" : "random", s_api_token);
         fflush(stdout);
     }
+    // Admin password: load the stored salt+hash (absent on units provisioned
+    // before the password flow, and on fresh NVS — those show the WebUI
+    // first-boot setup card via /api/status `auth_setup_required`).
+    {
+        size_t sl = sizeof(s_pw_salt), hl = sizeof(s_pw_hash);
+        if (nvs_get_blob(h, "pw_salt", s_pw_salt, &sl) == ESP_OK && sl == sizeof(s_pw_salt) &&
+            nvs_get_blob(h, "pw_hash", s_pw_hash, &hl) == ESP_OK && hl == sizeof(s_pw_hash)) {
+            s_pw_set = true;
+        }
+    }
     nvs_close(h);
+
+#ifdef CONFIG_ZHAC_DEFAULT_PASSWORD
+    // Optional build-time password seed (personal/fleet builds). Same rule as
+    // the token seed: the committed sdkconfig.defaults keeps it EMPTY — a
+    // shared password baked into a public artefact is a credential, not auth.
+    // Never logged; only its acceptance is.
+    if (!s_pw_set && CONFIG_ZHAC_DEFAULT_PASSWORD[0] != '\0') {
+        if (auth_password_store(CONFIG_ZHAC_DEFAULT_PASSWORD)) {
+            ESP_LOGI(TAG, "admin password seeded from build config");
+        } else {
+            ESP_LOGE(TAG, "CONFIG_ZHAC_DEFAULT_PASSWORD ignored — must be %u..%u chars",
+                     (unsigned)PW_MIN_LEN, (unsigned)PW_MAX_LEN);
+        }
+    }
+#endif
 
     if (s_auth_enabled) {
         ws_server_set_api_token(s_api_token);

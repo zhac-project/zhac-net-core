@@ -7,6 +7,24 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added
+
+- **Admin password login for the WebUI.** The 32-hex API token was hostile to
+  humans (fished from the serial log, impossible to remember). The WebUI now
+  authenticates with a password: `POST /api/auth/login` exchanges it for the
+  API token, which stays the only wire credential (REST `X-Api-Key`, WS
+  first-message auth) — no enforcement below the login layer changed. Storage
+  is a salted iterated-SHA-256 hash in NVS (8192 rounds, per-device random
+  salt), never plaintext. First boot with no password shows a one-time
+  "set admin password" card (`POST /api/auth/setup`, open only while no
+  password exists — the standard onboarding window); `POST /api/auth/password`
+  (authenticated + current password required) changes it and rotates the API
+  token, signing other browsers out. Password attempts share the per-peer
+  sliding-window lockout with token checks. New optional
+  `CONFIG_ZHAC_DEFAULT_PASSWORD` build seed (same empty-in-public rule as the
+  token seed); `/api/status` gains `auth_setup_required`. Serial token print
+  and the raw-token workflow remain as the recovery/advanced path.
+
 ### Fixed
 
 - **HAP roundtrip requests now retransmit on loss (`NEEDS_ACK`); device.list

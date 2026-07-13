@@ -550,6 +550,133 @@ esp_err_t handle_get_static(httpd_req_t* req) {
     return ESP_OK;
 }
 
+// ── POST /api/auth/* — password login flow ───────────────────────────────
+// The WebUI authenticates with a human PASSWORD; a successful login returns
+// the API token, which stays the only wire credential (REST X-Api-Key, WS
+// first-message auth) — no gate below this layer changed. `login` and
+// `setup` are intentionally UNauthenticated: they ARE the auth exchange.
+// Password verification shares the per-peer sliding-window lockout with
+// token checks (inside auth_password_check), and the KDF's per-attempt cost
+// slows online guessing further. `setup` only works while no password
+// exists — the standard first-boot onboarding window (Shelly/Tasmota/HA
+// pattern: the first client to reach a factory-fresh unit claims it).
+
+extern "C" bool auth_rotate_token(char* out, size_t out_cap);   // main.cpp
+
+static esp_err_t handle_post_auth_login(httpd_req_t* req) {
+    SET_CORS_HEADERS(req);
+    char body[192] = {};
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;
+    JsonDocument doc;
+    if (deserializeJson(doc, body, (size_t)received) ||
+        !doc["password"].is<const char*>()) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    if (!s_auth_enabled) {
+        // Auth disabled — nothing to exchange (the SPA never shows the gate).
+        httpd_resp_sendstr(req, "{\"ok\":true,\"auth\":false}");
+        return ESP_OK;
+    }
+    if (!auth_password_is_set()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_sendstr(req, "{\"error\":\"setup_required\"}");
+        return ESP_OK;
+    }
+    if (!auth_password_check(req, doc["password"].as<const char*>())) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+        return ESP_OK;
+    }
+    char rsp[64];
+    int n = snprintf(rsp, sizeof(rsp), "{\"ok\":true,\"token\":\"%s\"}", s_api_token);
+    httpd_resp_send(req, rsp, n);
+    return ESP_OK;
+}
+
+static esp_err_t handle_post_auth_setup(httpd_req_t* req) {
+    SET_CORS_HEADERS(req);
+    httpd_resp_set_type(req, "application/json");
+    if (auth_password_is_set()) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_sendstr(req, "{\"error\":\"already_set\"}");
+        return ESP_OK;
+    }
+    char body[192] = {};
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;
+    JsonDocument doc;
+    if (deserializeJson(doc, body, (size_t)received) ||
+        !doc["password"].is<const char*>()) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request");
+        return ESP_OK;
+    }
+    const char* pw = doc["password"].as<const char*>();
+    const size_t n = strlen(pw);
+    if (n < 8 || n > 63) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"password must be 8-63 characters\"}");
+        return ESP_OK;
+    }
+    if (!auth_password_store(pw)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "persist failed");
+        return ESP_OK;
+    }
+    char rsp[64];
+    int rn = snprintf(rsp, sizeof(rsp), "{\"ok\":true,\"token\":\"%s\"}", s_api_token);
+    httpd_resp_send(req, rsp, rn);
+    return ESP_OK;
+}
+
+static esp_err_t handle_post_auth_password(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char body[320] = {};
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;
+    JsonDocument doc;
+    if (deserializeJson(doc, body, (size_t)received) ||
+        !doc["new"].is<const char*>()) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    // Token possession is not enough to change the password: require the
+    // current password too (defends a stolen token from becoming a
+    // permanent foothold). Units that never had a password (pre-password
+    // units authed by token) skip the check — there is nothing to verify.
+    if (auth_password_is_set() &&
+        !auth_password_check(req, doc["current"] | "")) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"error\":\"wrong_password\"}");
+        return ESP_OK;
+    }
+    const char* npw = doc["new"].as<const char*>();
+    const size_t nl = strlen(npw);
+    if (nl < 8 || nl > 63) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"password must be 8-63 characters\"}");
+        return ESP_OK;
+    }
+    if (!auth_password_store(npw)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "persist failed");
+        return ESP_OK;
+    }
+    // Rotate the API token so every other logged-in browser/WS client is
+    // invalidated (auth_rotate_token also deauths live WS sessions). The
+    // caller re-saves the fresh token from this response.
+    char fresh[33] = {};
+    if (!auth_rotate_token(fresh, sizeof(fresh))) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rotate failed");
+        return ESP_OK;
+    }
+    char rsp[64];
+    int rn = snprintf(rsp, sizeof(rsp), "{\"ok\":true,\"token\":\"%s\"}", fresh);
+    httpd_resp_send(req, rsp, rn);
+    return ESP_OK;
+}
+
 // ── OPTIONS /* — CORS preflight ──────────────────────────────────────────
 // Wildcard handler for browser preflight (OPTIONS) requests.
 // Returns 204 No Content with CORS headers so the browser can proceed.
@@ -591,6 +718,10 @@ void task_http(void*) {
         { "/api/logs",                    HTTP_GET,     handle_get_logs                   },
         { "/api/diagnostics/unhandled",   HTTP_GET,     handle_get_diagnostics_unhandled  },
         { "/metrics",                     HTTP_GET,     handle_get_metrics                },
+        // — auth (login/setup ARE the auth exchange — deliberately ungated) —
+        { "/api/auth/login",              HTTP_POST,    handle_post_auth_login            },
+        { "/api/auth/setup",              HTTP_POST,    handle_post_auth_setup            },
+        { "/api/auth/password",           HTTP_POST,    handle_post_auth_password         },
         // — system —
         { "/api/settings",                HTTP_POST,    handle_post_settings              },
         { "/api/ota",                     HTTP_POST,    handle_post_ota                   },
@@ -638,7 +769,7 @@ void task_http(void*) {
         // — SPIFFS catch-all — MUST be last (wildcard catches everything).
         { "/*",                           HTTP_GET,     handle_get_static                 },
     };
-    static_assert(sizeof(kRoutes) / sizeof(kRoutes[0]) == 38,
+    static_assert(sizeof(kRoutes) / sizeof(kRoutes[0]) == 41,
                   "S-F4: REST route count drift — update api_routes.def too?");
 
     for (const auto& r : kRoutes) {
