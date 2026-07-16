@@ -8,6 +8,7 @@
 #include "s3_internal.h"
 #include "log_ring.h"
 #include "groups_store.h"
+#include "json_buf.h"
 #include "hap_json.h"
 #include "hap_protocol.h"
 #include "ws_server.h"
@@ -502,8 +503,11 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
     const char* name_str = doc["name"] | (const char*)nullptr;
     if (!name_str || name_str[0] == '\0') return API_BAD_REQUEST;
     char name[30];
-    strncpy(name, name_str, sizeof(name) - 1);
-    name[sizeof(name) - 1] = '\0';
+    // UTF-8-safe: a byte-blind strncpy could split a multibyte char at this
+    // bound; the poisoned name would persist on the P4 and turn every
+    // device.list page into an invalid-UTF-8 WS text frame (socket-killer,
+    // same failure as the group.list name bug).
+    utf8_safe_copy(name, sizeof(name), name_str);
 
     uint8_t hap_buf[80];
     uint16_t hap_len = 0;

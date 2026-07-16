@@ -7,6 +7,36 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Invalid UTF-8 in stored names killed every WebSocket session (local SPA
+  "not connected" loop + cloud hub-link reconnect loop).** `group.create` /
+  `group.update` truncated the user-supplied name with a byte-blind
+  `strncpy` into `GrpRecord::name[32]`; a Cyrillic name ≥16 chars (2 B/char)
+  was cut mid-sequence, persisting a dangling UTF-8 lead byte in NVS.
+  `JsonWriter::str()` then emitted the byte raw, so every `group.list` reply
+  was an invalid-UTF-8 WS TEXT frame — and RFC 6455 §8.1 validators respond
+  by closing the socket: Chrome killed the local SPA connection (~2 s
+  add→refresh→group.list→removed loop, UI stuck on "not connected") and
+  Tomcat killed the cloud hub link (~5 s TLS-reconnect loop, cloud logged
+  `reconcile failed … hub_socket_closed` while awaiting the group.list
+  reply). REST paths were unaffected (browsers don't UTF-8-police HTTP
+  bodies), which is why creating the group looked fine. Fix is two layers:
+  (1) emit-time — `JsonWriter::str()` now validates UTF-8 strictly (RFC 3629:
+  overlongs, surrogates, >U+10FFFF, truncations rejected — matching what WS
+  validators enforce) and replaces any invalid sequence with the JSON escape
+  `�`, healing already-poisoned NVS blobs at serialize time with no
+  migration; valid names pass byte-identical. (2) store-time — new
+  `utf8_safe_copy()` truncates on a code-point boundary, applied to group
+  create/update and to `device.rename` (`name[30]`, same latent bug with a
+  wider blast radius: the poisoned name would persist on the P4 and corrupt
+  every `device.list` page). `api_group_list`'s per-group scratch grew
+  768 → 1024 B so a legacy poisoned name expanded to `�` escapes cannot
+  make a maximum group silently vanish from the list. Host coverage: 13 new
+  ASan/UBSan assertions (valid Cyrillic/3-byte/4-byte pass-through, dangling
+  lead, orphan continuation, overlong, surrogate, out-of-range lead,
+  max-bound truncation, boundary-safe copy, poisoned-blob healing).
+
 ### Added
 
 - **Admin password login for the WebUI.** The 32-hex API token was hostile to

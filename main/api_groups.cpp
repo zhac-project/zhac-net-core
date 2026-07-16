@@ -71,7 +71,11 @@ extern "C" ApiStatus api_group_list(const char* /*body*/, size_t /*body_len*/,
     w.raw("{\"groups\":[");
     uint16_t emitted = 0, dropped = 0;
     for (uint16_t i = 0; i < cnt; i++) {
-        char tmp[768];   // > one maximum group (16 members + 32-char name)
+        // Sized for a maximum group (16 members + name) INCLUDING the worst
+        // case where a legacy poisoned name expands to � escapes (31
+        // bytes × 6 ≈ 186 B for the name alone, ~830 B total) — at 768 such a
+        // group failed closed and silently vanished from the list.
+        char tmp[1024];
         size_t n = grp_to_json(all[i], tmp, sizeof(tmp));
         if (n == 0) { dropped++; continue; }
         if (w.len() + (emitted ? 1u : 0u) + n + 2 > rsp_cap) { dropped++; continue; }
@@ -98,7 +102,10 @@ extern "C" ApiStatus api_group_create(const char* body, size_t body_len,
     if (deserializeJson(doc, body, body_len)) return API_BAD_REQUEST;
 
     GrpRecord r{};
-    strncpy(r.name, doc["name"] | "", sizeof(r.name) - 1);
+    // UTF-8-safe: byte-blind strncpy split a multibyte char at the name[32]
+    // bound, persisting invalid UTF-8 — every later group.list WS text frame
+    // then closed the socket (Chrome + Tomcat validate UTF-8 per RFC 6455).
+    utf8_safe_copy(r.name, sizeof(r.name), doc["name"] | "");
     grp_parse_members_from_body(body, r);
 
     // P4-T29: atomic id-alloc + persist (was next_id()+save() with a TOCTOU
@@ -137,7 +144,7 @@ extern "C" ApiStatus api_group_update(const char* body, size_t body_len,
     GrpRecord r{};
     if (!grp_find(id, r)) return API_NOT_FOUND;
 
-    if (!doc["name"].isNull()) strncpy(r.name, doc["name"] | "", sizeof(r.name) - 1);
+    if (!doc["name"].isNull()) utf8_safe_copy(r.name, sizeof(r.name), doc["name"] | "");
     if (!doc["members"].isNull()) grp_parse_members_from_body(body, r);
 
     if (!grp_save(r)) return API_INTERNAL_ERROR;
