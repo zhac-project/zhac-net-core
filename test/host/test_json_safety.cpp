@@ -239,6 +239,56 @@ int main() {
         CHECK(clean, "serialized JSON contains no invalid UTF-8 bytes");
     }
 
+    // ── F: grp_to_json NUL-terminates so a NUL-bounded consumer can't over-read.
+    //    api_group_list accumulates the list with `w.raw(tmp)`, and
+    //    JsonWriter::raw(const char*) copies until a NUL. grp_to_json's last op
+    //    was `w.raw("]}")` (a put, no terminator), so tmp[n] was uninitialized
+    //    stack — raw() walked PAST the JSON into garbage and injected invalid
+    //    UTF-8 into the group.list frame → browser closed the WS in a reconnect
+    //    loop. Non-deterministic (depends on stack contents); surfaced only once
+    //    a member lengthened the JSON and shifted the over-read onto bad bytes.
+    {
+        printf("\nF grp_to_json termination (no raw()/%%s over-read)\n");
+        GrpRecord g = make_group("Kitchen", 1);
+        char buf[512];
+        memset(buf, 0xAA, sizeof(buf));   // poison the tail: no interior NUL...
+        buf[sizeof(buf) - 1] = '\0';      // ...except a far sentinel to bound the read
+        size_t n = grp_to_json(g, buf, sizeof(buf) - 1);
+        CHECK(n > 0, "serializes a group with a member");
+        CHECK(buf[n] == '\0', "output is NUL-terminated at n (no over-read for raw()/%s)");
+        CHECK(strlen(buf) == n, "strlen == byte length (NUL-bounded read yields exactly the JSON)");
+
+        // Reproduce api_group_list's accumulation: w.raw(tmp) is NUL-bounded.
+        char out[1024];
+        JsonWriter w(out, sizeof(out));
+        w.raw(buf);                       // pre-fix: walks past n into 0xAA tail
+        size_t on = w.finish();
+        CHECK(on == n, "raw(tmp) appends exactly the JSON, no trailing stack garbage");
+        bool clean = true;
+        for (size_t i = 0; i < on && i < sizeof(out); i++)
+            if ((unsigned char)out[i] == 0xAA) clean = false;
+        CHECK(clean, "no 0xAA garbage byte leaked into the appended frame");
+    }
+
+    // ── G: JsonWriter::raw(s, len) copies exactly len bytes — no NUL scan, so a
+    //    non-terminated source with high bytes is appended safely (over-read-proof).
+    {
+        printf("\nG JsonWriter::raw(s, len) length-bounded append\n");
+        char src[4] = { (char)0xD0, (char)0x9A, 'z', 'q' };   // no NUL in [0,3)
+        char out[32];
+        JsonWriter w(out, sizeof(out));
+        w.raw(src, 3);                       // copy exactly D0 9A 'z'
+        size_t n = w.finish();
+        out[n < sizeof(out) ? n : sizeof(out) - 1] = '\0';
+        CHECK(n == 3, "raw(s,3) copies exactly 3 bytes (length-bounded, no NUL scan)");
+        CHECK((unsigned char)out[0] == 0xD0 && out[2] == 'z', "bytes copied verbatim");
+
+        char tiny[3];
+        JsonWriter t(tiny, sizeof(tiny));
+        t.raw("abcdef", 6);
+        CHECK(!t.ok() && t.finish() == 0, "raw(s,len) fails closed when len exceeds cap");
+    }
+
     printf("\n%s — %d failure(s)\n", s_fail ? "FAILED" : "PASSED", s_fail);
     return s_fail ? 1 : 0;
 }

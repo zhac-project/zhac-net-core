@@ -76,10 +76,23 @@ class JsonWriter {
 public:
     JsonWriter(char* buf, size_t cap) : buf_(buf), cap_(cap) {}
 
-    // Raw literal (no escaping).
+    // Raw literal (no escaping). NUL-terminated source ONLY — copies until the
+    // first NUL. Do NOT pass a buffer whose length you know but which may not be
+    // terminated at that length (it will over-read into whatever follows); use
+    // the (s, len) overload for that.
     JsonWriter& raw(const char* s) {
         if (!ok_) return *this;
         for (; *s; ++s) if (!put(*s)) break;
+        return *this;
+    }
+
+    // Length-bounded raw copy — exactly `len` bytes, no NUL scan. Use when
+    // appending another writer's output (whose byte length you already have):
+    // a NUL-bounded raw() over-reads a non-terminated buffer past its content
+    // into uninitialized memory, which corrupted the group.list WS frame.
+    JsonWriter& raw(const char* s, size_t len) {
+        if (!ok_) return *this;
+        for (size_t i = 0; i < len; ++i) if (!put(s[i])) break;
         return *this;
     }
     JsonWriter& ch(char c) { if (ok_) put(c); return *this; }

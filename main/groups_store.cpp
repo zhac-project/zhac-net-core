@@ -178,5 +178,13 @@ size_t grp_to_json(const GrpRecord& r, char* buf, size_t cap) {
               (unsigned long long)r.members[i].ieee, r.members[i].ep);
     }
     w.raw("]}");
-    return w.finish();
+    size_t len = w.finish();
+    // NUL-terminate the output. api_group_list accumulates the list with
+    // JsonWriter::raw() and other consumers may use %s / strlen; without a
+    // terminator (the writer's last op is a put(), which writes no NUL) they
+    // over-read past the JSON into uninitialized memory and inject garbage into
+    // the WS frame. finish() returns 0 on overflow → buf[0]='\0' is a valid
+    // empty C-string. (Callers that copy by the returned length are unaffected.)
+    if (len < cap) buf[len] = '\0';
+    return len;
 }

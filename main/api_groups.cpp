@@ -80,7 +80,7 @@ extern "C" ApiStatus api_group_list(const char* /*body*/, size_t /*body_len*/,
         if (n == 0) { dropped++; continue; }
         if (w.len() + (emitted ? 1u : 0u) + n + 2 > rsp_cap) { dropped++; continue; }
         if (emitted) w.ch(',');
-        w.raw(tmp);
+        w.raw(tmp, n);   // length-bounded: tmp is not guaranteed NUL-terminated
         emitted++;
     }
     w.raw("]}");
@@ -113,6 +113,7 @@ extern "C" ApiStatus api_group_create(const char* body, size_t body_len,
     if (!grp_create(r)) return API_INTERNAL_ERROR;
 
     size_t n = grp_to_json(r, rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;   // don't emit `"data":` with an empty body
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -129,6 +130,7 @@ extern "C" ApiStatus api_group_get(const char* body, size_t body_len,
     if (!grp_find(id, r)) return API_NOT_FOUND;
 
     size_t n = grp_to_json(r, rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;   // don't emit `"data":` with an empty body
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
@@ -149,6 +151,7 @@ extern "C" ApiStatus api_group_update(const char* body, size_t body_len,
 
     if (!grp_save(r)) return API_INTERNAL_ERROR;
     size_t n = grp_to_json(r, rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;   // don't emit `"data":` with an empty body
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }

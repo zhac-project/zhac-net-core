@@ -9,6 +9,29 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **`group.list` over-read: unterminated per-group buffer corrupted the WS
+  frame (round two of the "not connected" loop, this time on member add).**
+  `api_group_list` accumulates the response by serialising each group into a
+  stack scratch and appending it with `JsonWriter::raw(tmp)` — which copies
+  until a NUL. But `grp_to_json`'s last write was `raw("]}")` (a `put()`, which
+  writes no terminator), so `tmp[n]` was uninitialised stack: `raw()` walked
+  past the JSON into garbage until it randomly hit a `0x00`, injecting stray
+  bytes (frequently invalid UTF-8) into the frame → the browser closed the WS
+  (RFC 6455 §8.1) in a reconnect loop, identical symptom to the name-UTF-8 bug
+  but a distinct root cause. Non-deterministic (depends on stack contents),
+  which is why an empty group happened to render while adding a member — a
+  ~35-byte-longer body — shifted the over-read onto bytes that broke it. Fixed
+  three ways: (1) `grp_to_json` now NUL-terminates its output; (2) a new
+  length-bounded `JsonWriter::raw(s, len)` copies exactly `n` bytes with no NUL
+  scan, and both list accumulators (`api_group_list`, `api_alerts_get` — the
+  latter was accidentally safe only because its entry ended in a `fmt()` that
+  left a NUL) now use it; (3) `api_group_create/get/update` return
+  `API_INTERNAL_ERROR` instead of `API_OK` when serialisation overflows, so the
+  WS layer never emits a `"data":` with an empty body. Host test extended (a
+  poisoned, unterminated scratch buffer must not leak tail bytes through the
+  accumulator). Earlier UTF-8 host coverage had masked this by NUL-terminating
+  the scratch itself before asserting.
+
 - **Invalid UTF-8 in stored names killed every WebSocket session (local SPA
   "not connected" loop + cloud hub-link reconnect loop).** `group.create` /
   `group.update` truncated the user-supplied name with a byte-blind

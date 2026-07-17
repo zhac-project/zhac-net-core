@@ -306,7 +306,7 @@ extern "C" ApiStatus api_alerts_get(const char* /*body*/, size_t /*body_len*/,
         if (n == 0) { dropped++; continue; }
         if (w.len() + (emitted ? 1u : 0u) + n + 1 > rsp_cap) { dropped++; continue; }
         if (emitted) w.ch(',');
-        w.raw(ent);
+        w.raw(ent, n);   // length-bounded: don't rely on ent being NUL-terminated
         emitted++;
     }
     w.raw("]");
