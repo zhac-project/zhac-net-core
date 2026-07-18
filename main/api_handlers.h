@@ -156,6 +156,8 @@ ApiStatus api_device_groups_add(const char* body, size_t body_len,
                                 char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 ApiStatus api_device_groups_remove(const char* body, size_t body_len,
                                    char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+ApiStatus api_device_groups_refresh(const char* body, size_t body_len,
+                                    char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
 // WS device.options.set / PUT /api/devices/{ieee} with sub="options" —
 // args {ieee, occupancy_timeout?, debounce_ms?, flood_protection?, throttle_ms?}.

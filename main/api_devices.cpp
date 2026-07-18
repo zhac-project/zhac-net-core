@@ -675,6 +675,48 @@ extern "C" ApiStatus api_device_groups_remove(const char* body, size_t body_len,
     return dgm_add_remove(body, body_len, rsp_buf, rsp_cap, rsp_len, /*remove=*/true);
 }
 
+// WS `device.groups.refresh` — args {ieee, ep?}. Reads the device's ACTUAL ZCL
+// group table (Get Group Membership readback on the P4), reconciles the mirror
+// to it, and returns the authoritative list. (increment 2b)
+extern "C" ApiStatus api_device_groups_refresh(const char* body, size_t body_len,
+                                               char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
+    JsonDocument doc; uint64_t ieee = 0;
+    ApiStatus st = parse_ieee_body(body, body_len, doc, ieee);
+    if (st != API_OK) return st;
+    uint8_t ep = doc["ep"] | (uint8_t)1;
+
+    char q[80];
+    int qn = snprintf(q, sizeof(q), "{\"ieee\":\"0x%016llX\",\"ep\":%u}",
+                      (unsigned long long)ieee, ep ? ep : 1);
+    if (qn <= 0 || (size_t)qn >= sizeof(q)) return API_INTERNAL_ERROR;
+
+    char rsp[256]; size_t rn = 0;
+    if (!hap_roundtrip_v2(HapMsgType::GROUP_MEMBER_QUERY, (const uint8_t*)q, (uint16_t)qn,
+                          rsp, sizeof(rsp), &rn, 6000)) {
+        int n = snprintf(rsp_buf, rsp_cap, "%s", "{\"ok\":false,\"err\":\"no response\"}");
+        if (rsp_len) *rsp_len = (size_t)n;
+        return API_OK;
+    }
+    JsonDocument rd;
+    if (rn == 0 || deserializeJson(rd, rsp, rn) != DeserializationError::Ok ||
+        !(rd["ok"] | false)) {
+        int n = snprintf(rsp_buf, rsp_cap, "%s", "{\"ok\":false,\"err\":\"query failed\"}");
+        if (rsp_len) *rsp_len = (size_t)n;
+        return API_OK;
+    }
+    uint16_t gids[DGM_MAX_GIDS]; uint8_t count = 0;
+    for (JsonVariant v : rd["gids"].as<JsonArray>()) {
+        if (count >= DGM_MAX_GIDS) break;
+        gids[count++] = (uint16_t)(v.as<uint32_t>() & 0xFFFF);
+    }
+    dgm_set(ieee, gids, count);   // reconcile the mirror to the device's real table
+
+    size_t n = dgm_groups_json(ieee, rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;
+    if (rsp_len) *rsp_len = n;
+    return API_OK;
+}
+
 // WS `device.options.set` — args {ieee, occupancy_timeout?, debounce_ms?,
 // flood_protection?, throttle_ms?}. Stores the body to NVS verbatim; P4 is notified
 // via DEVICE_OPTIONS_SET only when one of the forwarded fields is set.

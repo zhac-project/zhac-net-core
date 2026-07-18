@@ -16,8 +16,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   membership mirror (`dgm_store`, NVS `zhac_gm`); all three return the updated
   `{"groups":[...]}` tracked list, so the UI shows what a device is in without
   polling it. Host-tested (dgm_store pure table ops: add/dedup/cap/remove/
-  set-reconcile/forget under ASan+UBSan). The authoritative "refresh from device"
-  (ZCL Get Group Membership readback) is a later increment. HW-test-pending.
+  set-reconcile/forget under ASan+UBSan). `device.groups.refresh` (inc 2b) reads
+  the device's ACTUAL ZCL group table via the P4 (GROUP_MEMBER_QUERY roundtrip →
+  ZCL Get Group Membership) and reconciles the mirror to it (`dgm_set`), so the
+  list can be made authoritative on demand. HW-test-pending.
 
 ### Fixed
 

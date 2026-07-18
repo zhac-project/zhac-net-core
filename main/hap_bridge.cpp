@@ -333,6 +333,7 @@ static HapMsgType expected_response_for(HapMsgType req) {
         case HapMsgType::DEVICE_OPTIONS_SET:return HapMsgType::DEVICE_OPTIONS_SET_ACK;
         case HapMsgType::ZIGBEE_CFG_SET:    return HapMsgType::ZIGBEE_CFG_SET_ACK;
         case HapMsgType::SET_ATTRIBUTE:     return HapMsgType::SET_ACK;
+        case HapMsgType::GROUP_MEMBER_QUERY: return HapMsgType::GROUP_MEMBER_LIST;
         case HapMsgType::RULE_CREATE:
         case HapMsgType::RULE_UPDATE:
         case HapMsgType::RULE_UPDATE_DSL:
