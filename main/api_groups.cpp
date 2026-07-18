@@ -181,6 +181,14 @@ extern "C" ApiStatus api_group_cmd(const char* body, size_t body_len,
     GrpRecord r{};
     if (!grp_find(id, r) || r.member_count == 0) return API_NOT_FOUND;
 
+    // Command mode: the SPA sends {cluster, cmd} for a ZCL command (On/Off/
+    // Toggle/Identify) to fan out to each member. Legacy callers send {key, val}
+    // for an attribute set. Disambiguated by the presence of `cmd`. (Previously
+    // this handler only read key/val, so the SPA's cluster/cmd were dropped and
+    // every button defaulted to key="state", val=0 → all buttons sent Off.)
+    const bool     cmd_mode    = !doc["cmd"].isNull();
+    const uint16_t zcl_cluster = doc["cluster"] | (uint16_t)0;
+    const uint8_t  zcl_cmd     = (uint8_t)(doc["cmd"] | 0);
     char key_str[24] = "state";
     strncpy(key_str, doc["key"] | "state", sizeof(key_str) - 1);
     int val = doc["val"] | 0;
@@ -192,10 +200,17 @@ extern "C" ApiStatus api_group_cmd(const char* body, size_t body_len,
         HapSetAttrReq attr{};
         attr.ieee    = r.members[i].ieee;
         attr.ep      = r.members[i].ep;
-        attr.cluster = 0;
-        attr.attr    = 0;
         attr.val     = val;
-        {
+        if (cmd_mode) {
+            // Raw ZCL command: cluster + cmd (carried in attr.attr), flagged by
+            // the reserved "__zclcmd__" key so the P4 sends the command rather
+            // than doing an attribute set.
+            attr.cluster = zcl_cluster;
+            attr.attr    = zcl_cmd;
+            memcpy(attr.key, "__zclcmd__", sizeof("__zclcmd__"));
+        } else {
+            attr.cluster = 0;
+            attr.attr    = 0;
             const size_t cap = sizeof(attr.key) - 1;
             const size_t n   = strnlen(key_str, cap);
             memcpy(attr.key, key_str, n);

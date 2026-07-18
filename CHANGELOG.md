@@ -9,6 +9,15 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **Collections command buttons (On/Off/Toggle/Identify) all sent "Off".**
+  `api_group_cmd` read only `{key, val}` and hardcoded cluster 0, dropping the
+  SPA's `{cluster, cmd}`, so every button defaulted to key="state"/val=0 = Off.
+  It now detects command mode (presence of `cmd`) and fans out the raw ZCL
+  command to each member — cluster + cmd carried via the reserved `__zclcmd__`
+  key that the P4 honors (On/Off/Toggle on cluster 0x0006, Identify on 0x0003).
+  Legacy `{key, val}` attribute sets still work. Needs the paired zhac-main-core
+  + zigbee_mgr changes. HW-test-pending.
+
 - **`group.list` over-read: unterminated per-group buffer corrupted the WS
   frame (round two of the "not connected" loop, this time on member add).**
   `api_group_list` accumulates the response by serialising each group into a
