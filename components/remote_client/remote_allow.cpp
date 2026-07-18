@@ -30,6 +30,7 @@ constexpr const char* kRemoteAllowedCmds[] = {
     "device.list", "device.get", "device.bind",
     "device.rename", "device.attr.set", "device.options.set",
     "device.reinterview", "device.configure",
+    "device.groups.list", "device.groups.add", "device.groups.remove",
     // Rules
     "rule.list", "rule.create", "rule.delete", "rule.enable", "rule.update",
     // Scripts — list/read/delete/check; run + write are privileged (RCE)

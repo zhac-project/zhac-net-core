@@ -40,6 +40,7 @@
 #include "nvs_helpers.h"
 #include "log_ring.h"
 #include "groups_store.h"
+#include "dgm_store.h"
 #include "task_stacks.h"
 #include "remote_client.h"  // inline no-op when Kconfig off
 
@@ -961,6 +962,7 @@ extern "C" void app_main() {
     // context, before the httpd/remote servers can issue concurrent first
     // requests that would otherwise each lazily create (and leak) a mutex.
     grp_store_init();
+    dgm_store_init();   // per-device ZCL group-membership mirror (device.groups.*)
 
     // Metrics engine — zero-init shard storage. Safe to call at any
     // time before the first counter/value/timer emission.

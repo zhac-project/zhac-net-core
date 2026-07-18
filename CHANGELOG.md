@@ -7,6 +7,18 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added
+
+- **device.groups.* — native ZCL group membership API + mirror (increment 2).**
+  New `device.groups.list` / `.add` / `.remove` (WS + generic REST, remote-allow-
+  listed). add/remove send the ZCL Groups command to the device (reusing the
+  HW-validated SET_ATTRIBUTE cluster-0x0004 path) AND update a per-device
+  membership mirror (`dgm_store`, NVS `zhac_gm`); all three return the updated
+  `{"groups":[...]}` tracked list, so the UI shows what a device is in without
+  polling it. Host-tested (dgm_store pure table ops: add/dedup/cap/remove/
+  set-reconcile/forget under ASan+UBSan). The authoritative "refresh from device"
+  (ZCL Get Group Membership readback) is a later increment. HW-test-pending.
+
 ### Fixed
 
 - **Collections command buttons (On/Off/Toggle/Identify) all sent "Off".**

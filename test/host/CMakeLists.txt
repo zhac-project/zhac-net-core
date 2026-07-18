@@ -21,5 +21,13 @@ target_include_directories(json_safety_host PRIVATE
     ${MAIN}
     ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
 
+add_executable(dgm_store_host
+    test_dgm_store.cpp
+    ${MAIN}/dgm_store.cpp)
+target_include_directories(dgm_store_host PRIVATE
+    ${MAIN}
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
+
 enable_testing()
 add_test(NAME json_safety COMMAND json_safety_host)
+add_test(NAME dgm_store  COMMAND dgm_store_host)

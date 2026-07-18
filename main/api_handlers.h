@@ -148,6 +148,15 @@ ApiStatus api_device_rename(const char* body, size_t body_len,
 ApiStatus api_device_attr_set(const char* body, size_t body_len,
                                char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
+// device.groups.list/add/remove — native ZCL group membership (increment 2).
+// args {ieee} (list) or {ieee, ep?, gid} (add/remove). Returns {"groups":[...]}.
+ApiStatus api_device_groups_list(const char* body, size_t body_len,
+                                 char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+ApiStatus api_device_groups_add(const char* body, size_t body_len,
+                                char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+ApiStatus api_device_groups_remove(const char* body, size_t body_len,
+                                   char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
 // WS device.options.set / PUT /api/devices/{ieee} with sub="options" —
 // args {ieee, occupancy_timeout?, debounce_ms?, flood_protection?, throttle_ms?}.
 ApiStatus api_device_options_set(const char* body, size_t body_len,

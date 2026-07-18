@@ -63,6 +63,9 @@ ZHAC_API_ROUTE("device.attr.set",            api_device_attr_set,             PO
 ZHAC_API_ROUTE("device.options.set",         api_device_options_set,          POST, "/api/device/options/set")
 ZHAC_API_ROUTE("device.reinterview",         api_device_reinterview,          POST, "/api/device/reinterview")
 ZHAC_API_ROUTE("device.configure",           api_device_configure,            POST, "/api/device/configure")
+ZHAC_API_ROUTE("device.groups.list",         api_device_groups_list,          POST, "/api/device/groups/list")
+ZHAC_API_ROUTE("device.groups.add",          api_device_groups_add,           POST, "/api/device/groups/add")
+ZHAC_API_ROUTE("device.groups.remove",       api_device_groups_remove,        POST, "/api/device/groups/remove")
 
 // ── Rules ───────────────────────────────────────────────────────────
 ZHAC_API_ROUTE("rule.list",                  api_rule_list,                   GET,  "/api/rule/list")
