@@ -6,6 +6,8 @@ managed_components/
 dependencies.lock
 sdkconfig.old
 sdkconfig.ci.*
+# local secret overlay (bootstrap API token etc.) — never committed
+sdkconfig.local.defaults
 compile_commands.json
 .cache/
 .vscode/
