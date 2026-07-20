@@ -56,6 +56,14 @@ dependencies:
   mqtt_gw:
     path: "../../zhac-components/components/mqtt_gw"
 
+  # esp-mqtt. ESP-IDF v6.0 no longer bundles this as a built-in component
+  # (its components/mqtt has no CMakeLists.txt), which is why it used to be
+  # vendored under components/mqtt. Taken from the registry instead, so
+  # mqtt_gw and (when enabled) the RainMaker MQTT glue share ONE client.
+  # Must stay UNCONDITIONAL: mqtt_gw needs it in every build, including
+  # RainMaker-disabled ones.
+  espressif/mqtt: "^1.0.0"
+
   # embedded-zhc is NOT a Component-Manager dependency — it ships its
   # own CMake tree. Pulled via FetchContent / EMBEDDED_ZHC_PATH in the
   # root CMakeLists.txt.
