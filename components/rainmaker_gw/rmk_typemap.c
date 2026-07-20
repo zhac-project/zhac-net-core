@@ -49,3 +49,43 @@ int rmk_mired_to_kelvin(int mired) {
 int rmk_kelvin_to_mired(int k) { k = clampi(k, 2700, 6500); return 1000000 / k; }
 double rmk_div100(int v100) { return (double)v100 / 100.0; }
 bool rmk_contact_to_rm(bool zhac_contact) { return zhac_contact; }
+
+typedef struct { const char* key; const char* rm_name; const char* rm_type;
+                 const char* rm_ui; char dt; int min,max,step; rmk_conv_t conv; } map_row_t;
+static const map_row_t kMap[] = {
+    {"state",       "Power",       "esp.param.power",                  "esp.ui.toggle", 'b', 0,0,0,       RMK_CONV_NONE},
+    {"brightness",  "Brightness",  "esp.param.brightness",             "esp.ui.slider", 'i', 0,100,1,     RMK_CONV_BRI},
+    {"color_temp",  "CCT",         "esp.param.cct",                    "esp.ui.slider", 'i', 2700,6500,100,RMK_CONV_CCT},
+    {"temperature", "Temperature", "esp.param.temperature",            NULL,            'f', 0,0,0,       RMK_CONV_DIV100},
+    {"humidity",    "Humidity",    "esp.param.humidity",               NULL,            'f', 0,0,0,       RMK_CONV_DIV100},
+    {"occupancy",   "Motion",      "esp.param.motion-detection-state", "esp.ui.toggle", 'b', 0,0,0,       RMK_CONV_NONE},
+    {"contact",     "Contact",     "esp.param.contact-detection-state","esp.ui.toggle", 'b', 0,0,0,       RMK_CONV_CONTACT},
+};
+static const char* primary_for(rmk_devtype_t t) {
+    switch (t) {
+    case RMK_DEV_LIGHTBULB: case RMK_DEV_SWITCH: return "esp.param.power";
+    case RMK_DEV_MOTION_SENSOR:  return "esp.param.motion-detection-state";
+    case RMK_DEV_CONTACT_SENSOR: return "esp.param.contact-detection-state";
+    case RMK_DEV_TEMP_SENSOR:    return "esp.param.temperature";
+    default: return "";
+    }
+}
+size_t rmk_build_params(rmk_devtype_t t, const rmk_expose_t* ex, size_t n,
+                        rmk_param_t* out, size_t cap) {
+    size_t cnt = 0;
+    const char* prim = primary_for(t);
+    for (size_t i = 0; i < n && cnt < cap; i++) {
+        for (size_t r = 0; r < sizeof kMap / sizeof kMap[0]; r++) {
+            if (strcmp(ex[i].name, kMap[r].key)) continue;
+            rmk_param_t* p = &out[cnt++];
+            p->zhac_key = kMap[r].key;   p->rm_name = kMap[r].rm_name;
+            p->rm_type  = kMap[r].rm_type; p->rm_ui = kMap[r].rm_ui;
+            p->data_type = kMap[r].dt;   p->writable = ex[i].writable;
+            p->min = kMap[r].min; p->max = kMap[r].max; p->step = kMap[r].step;
+            p->conv = kMap[r].conv;
+            p->primary = (strcmp(kMap[r].rm_type, prim) == 0);
+            break;
+        }
+    }
+    return cnt;
+}

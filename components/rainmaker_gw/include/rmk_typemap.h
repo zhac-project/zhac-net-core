@@ -16,6 +16,22 @@ int    rmk_mired_to_kelvin(int mired);  // clamp 2700..6500
 int    rmk_kelvin_to_mired(int k);
 double rmk_div100(int v100);
 bool   rmk_contact_to_rm(bool zhac_contact);  // polarity pinned here
+
+typedef enum { RMK_CONV_NONE=0, RMK_CONV_BRI, RMK_CONV_CCT, RMK_CONV_DIV100, RMK_CONV_CONTACT } rmk_conv_t;
+typedef struct {
+    const char* zhac_key;   // shadow key to read/write
+    const char* rm_name;    // param name shown in app ("Power")
+    const char* rm_type;    // "esp.param.power"
+    const char* rm_ui;      // "esp.ui.toggle" | "esp.ui.slider" | NULL
+    char data_type;         // 'b','i','f'
+    bool writable;
+    int min, max, step;     // 0,0,0 = no bounds
+    rmk_conv_t conv;
+    bool primary;
+} rmk_param_t;
+#define RMK_MAX_PARAMS 8
+size_t rmk_build_params(rmk_devtype_t t, const rmk_expose_t* ex, size_t n,
+                        rmk_param_t* out, size_t cap);
 #ifdef __cplusplus
 }
 #endif

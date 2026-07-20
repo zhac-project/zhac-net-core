@@ -61,4 +61,38 @@ static void test_conversions() {
     assert(rmk_contact_to_rm(true) == true);
     printf("conversions ok\n");
 }
-int main(){ test_classifier(); test_conversions(); printf("ALL OK\n"); return 0; }
+static const rmk_param_t* find_p(const rmk_param_t* p, size_t n, const char* type) {
+    for (size_t i=0;i<n;i++) if (!strcmp(p[i].rm_type,type)) return &p[i];
+    return nullptr;
+}
+static void test_param_plan() {
+    rmk_param_t out[RMK_MAX_PARAMS];
+    { rmk_expose_t ex[] = {E("state",true), E("brightness",true), E("color_temp",true)};
+      size_t n = rmk_build_params(RMK_DEV_LIGHTBULB, ex, 3, out, RMK_MAX_PARAMS);
+      const rmk_param_t* pw = find_p(out,n,"esp.param.power");
+      assert(pw && pw->primary && pw->writable && pw->data_type=='b'
+             && !strcmp(pw->rm_ui,"esp.ui.toggle") && !strcmp(pw->zhac_key,"state"));
+      const rmk_param_t* br = find_p(out,n,"esp.param.brightness");
+      assert(br && br->min==0 && br->max==100 && br->step==1 && br->conv==RMK_CONV_BRI);
+      const rmk_param_t* cct = find_p(out,n,"esp.param.cct");
+      assert(cct && cct->min==2700 && cct->max==6500 && cct->conv==RMK_CONV_CCT); }
+    { rmk_expose_t ex[] = {E("temperature",false), E("humidity",false)};
+      size_t n = rmk_build_params(RMK_DEV_TEMP_SENSOR, ex, 2, out, RMK_MAX_PARAMS);
+      const rmk_param_t* t = find_p(out,n,"esp.param.temperature");
+      assert(t && t->primary && !t->writable && t->data_type=='f' && t->conv==RMK_CONV_DIV100);
+      assert(find_p(out,n,"esp.param.humidity")); }         // extra expose carried
+    { rmk_expose_t ex[] = {E("occupancy",false)};
+      size_t n = rmk_build_params(RMK_DEV_MOTION_SENSOR, ex, 1, out, RMK_MAX_PARAMS);
+      const rmk_param_t* m = find_p(out,n,"esp.param.motion-detection-state");
+      assert(m && m->primary && !m->writable); }
+    { rmk_expose_t ex[] = {E("contact",false)};
+      size_t n = rmk_build_params(RMK_DEV_CONTACT_SENSOR, ex, 1, out, RMK_MAX_PARAMS);
+      const rmk_param_t* c = find_p(out,n,"esp.param.contact-detection-state");
+      assert(c && c->conv==RMK_CONV_CONTACT); }
+    // unknown exposes are skipped, never overflow
+    { rmk_expose_t ex[] = {E("state",true), E("weird1",false), E("weird2",false)};
+      size_t n = rmk_build_params(RMK_DEV_SWITCH, ex, 3, out, RMK_MAX_PARAMS);
+      assert(n == 1 && find_p(out,n,"esp.param.power")); }
+    printf("param plan ok\n");
+}
+int main(){ test_classifier(); test_conversions(); test_param_plan(); printf("ALL OK\n"); return 0; }
