@@ -38,3 +38,14 @@ const char* rmk_devtype_str(rmk_devtype_t t) {
     default:                     return "esp.device.other";
     }
 }
+
+static int clampi(int v, int lo, int hi){ return v < lo ? lo : (v > hi ? hi : v); }
+int rmk_bri_to_rm(int zb)   { zb = clampi(zb, 0, 254); return (zb * 100 + 127) / 254; }
+int rmk_bri_from_rm(int rm) { rm = clampi(rm, 0, 100); return (rm * 254 + 50) / 100; }
+int rmk_mired_to_kelvin(int mired) {
+    if (mired <= 0) return 6500;
+    return clampi(1000000 / mired, 2700, 6500);
+}
+int rmk_kelvin_to_mired(int k) { k = clampi(k, 2700, 6500); return 1000000 / k; }
+double rmk_div100(int v100) { return (double)v100 / 100.0; }
+bool rmk_contact_to_rm(bool zhac_contact) { return zhac_contact; }

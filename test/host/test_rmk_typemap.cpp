@@ -38,4 +38,27 @@ static void test_classifier() {
     assert(strcmp(rmk_devtype_str(RMK_DEV_OTHER), "esp.device.other") == 0);
     printf("classifier ok\n");
 }
-int main(){ test_classifier(); printf("ALL OK\n"); return 0; }
+static void test_conversions() {
+    assert(rmk_bri_to_rm(0) == 0);
+    assert(rmk_bri_to_rm(254) == 100);
+    assert(rmk_bri_to_rm(127) == 50);
+    assert(rmk_bri_to_rm(300) == 100);           // clamp
+    assert(rmk_bri_from_rm(0) == 0);
+    assert(rmk_bri_from_rm(100) == 254);
+    assert(rmk_bri_from_rm(50) == 127);
+    for (int rm = 0; rm <= 100; rm++)            // round-trip stability
+        assert(rmk_bri_to_rm(rmk_bri_from_rm(rm)) == rm);
+    assert(rmk_mired_to_kelvin(250) == 4000);
+    assert(rmk_mired_to_kelvin(500) == 2700);    // 2000K clamps up
+    assert(rmk_mired_to_kelvin(100) == 6500);    // 10000K clamps down
+    assert(rmk_mired_to_kelvin(0) == 6500);      // div-by-zero guard -> max
+    assert(rmk_kelvin_to_mired(4000) == 250);
+    assert(rmk_div100(2550) == 25.5);
+    assert(rmk_div100(-500) == -5.0);
+    // POLARITY (spec §3): z2m contact==true means CLOSED. RainMaker
+    // contact-detection-state: pinned as detected == closed == true.
+    // If HW/app check (Task 14) disproves, flip HERE + here only.
+    assert(rmk_contact_to_rm(true) == true);
+    printf("conversions ok\n");
+}
+int main(){ test_classifier(); test_conversions(); printf("ALL OK\n"); return 0; }
