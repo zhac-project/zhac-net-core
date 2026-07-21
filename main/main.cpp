@@ -947,6 +947,20 @@ static esp_err_t rmk_write_adapter(uint64_t ieee, const char* key,
     return (st == API_OK) ? ESP_OK : ESP_FAIL;
 }
 
+// ── RainMaker bridge boot-restore hook (Task 18) ────────────────────────────
+// Mirrors the Task 17 DI wiring immediately above: rmk_bridge.c's boot-time
+// persisted-device restore (fired once, from rmk_bridge_attach(), on the
+// first READY transition reached this boot) needs main/api_rainmaker.cpp's
+// rmk_expose_device_from_ieee() helper, which needs a live HAP
+// GET_DEVICE_BY_ID fetch (hap_protocol/hap_json) to rebuild each device's
+// RainMaker param set — rmk_store persists only the ieee set, not each
+// device's exposes. components/rainmaker_gw's CMakeLists.txt deliberately
+// has no REQUIRES on hap_protocol/hap_json/hap_master (same "stay
+// HAP-agnostic" layering rule rmk_attr_write_fn documents above), so this
+// is injected the same way: this thin extern + the
+// rmk_bridge_set_boot_restore() call below.
+extern "C" void rmk_boot_restore(void);   // main/api_rainmaker.cpp
+
 // Provided by metrics_mqtt.cpp — C linkage so main can forward-declare
 // without pulling in a tiny header.
 extern "C" void metrics_mqtt_publisher_start();
@@ -1016,6 +1030,11 @@ extern "C" void app_main() {
     // no-op stub (rmk_bridge.c) — so no #ifdef guard is needed at this
     // call site.
     rmk_bridge_set_attr_writer(rmk_write_adapter);
+
+    // Task 18: register the boot-restore hook the same way — safe/cheap
+    // unconditionally on a flag-off build too (rmk_bridge_set_boot_restore's
+    // flag-off half is a no-op stub, rmk_bridge.c).
+    rmk_bridge_set_boot_restore(rmk_boot_restore);
 
     // Open hot-path NVS namespaces once and keep handles cached (S4)
     nvs_open("zhac_opt", NVS_READWRITE, &s_nvs_zhac_opt);  // best-effort; 0 means uncached

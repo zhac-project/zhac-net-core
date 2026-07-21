@@ -14,6 +14,7 @@
 #include "ws_server.h"
 #include "mqtt_gw.h"
 #include "wifi_mgr.h"
+#include "rmk_bridge.h"   // rmk_bridge_on_device_renamed (Task 18)
 #include "ArduinoJson.h"
 #include <cstdio>
 #include <cstring>
@@ -523,6 +524,17 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
                            rsp.get(), kDevInfoRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
+
+    // Task 18: keep an exposed RainMaker device's in-app display name in
+    // sync with a ZHAC-side rename, so the phone app doesn't show a stale
+    // name until the next reboot/re-expose. Cheap + safe to call
+    // unconditionally (no-op if ieee isn't exposed or the flag is off) —
+    // same "always call, flag-off stub is a no-op" convention as
+    // rmk_bridge_on_device_gone(), already wired at the DEVICE_LEAVE site
+    // (Task 16) and NOT duplicated here. `name` is already UTF-8-sanitized
+    // above (utf8_safe_copy).
+    rmk_bridge_on_device_renamed(ieee, name);
+
     size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
     memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';

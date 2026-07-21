@@ -156,6 +156,25 @@ static void rmk_event_handler(void* arg, esp_event_base_t base, int32_t id, void
 
 void rainmaker_gw_init(void) {
 #if CONFIG_ZHAC_RAINMAKER_ENABLE
+    // Task 18 (uplink.set "switching TO rainmaker" path): this function can
+    // now be called a second time in the same boot — once automatically
+    // here in app_main() if the persisted uplink was already RAINMAKER, and
+    // again later if the user round-trips uplink away and back (rainmaker
+    // -> none/custom_mqtt -> rainmaker) via api_rainmaker.cpp's uplink.set.
+    // The SDK cannot be de-initialized (the design constraint this whole
+    // task works around), so a second full run of this function would
+    // double-register the RMAKER_EVENT/RMAKER_COMMON_EVENT handlers, create
+    // a second "ZHAC-Test" switch device, and call esp_rmaker_start() again
+    // — none of which the SDK is documented to support. Guard on s_state:
+    // any non-DISABLED value means a node already exists this boot
+    // (successfully progressing, or stuck CLAIM_FAILED) — go no further.
+    // This is what makes uplink.set's "late init is a no-op if it already
+    // ran this boot" comment actually true rather than aspirational.
+    if (s_state != RMK_ST_DISABLED) {
+        ESP_LOGI(TAG, "rainmaker_gw_init: already initialized this boot (state=%d) — no-op",
+                 (int)s_state);
+        return;
+    }
     if (zhac_uplink_get() != ZHAC_UPLINK_RAINMAKER) {
         ESP_LOGI(TAG, "ZHAC_RAINMAKER_ENABLE=y but uplink selector != "
                       "RAINMAKER — bridge stays inactive");

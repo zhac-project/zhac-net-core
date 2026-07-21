@@ -257,6 +257,53 @@ ApiStatus api_group_delete(const char* body, size_t body_len,
 ApiStatus api_group_cmd(const char* body, size_t body_len,
                          char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
+// ── RainMaker bridge (Task 18) ───────────────────────────────────────────
+// All seven ops here work on a flag-off build (CONFIG_ZHAC_RAINMAKER_ENABLE
+// unset): the uplink selector + mqtt_gw exist regardless, and every
+// rainmaker_gw_*/rmk_bridge_* call they make has a safe flag-off stub. Only
+// `uplink.set {mode:"rainmaker"}` behaves differently — it still persists
+// the selection but replies with an "err" field instead of actually
+// starting an agent that was never compiled in (main/api_rainmaker.cpp).
+
+// GET /api/uplink/get — args-less. Reply: {"uplink":"none|custom_mqtt|rainmaker"}.
+ApiStatus api_uplink_get(const char* body, size_t body_len,
+                          char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
+// POST /api/uplink/set — args: {"mode":"none|custom_mqtt|rainmaker"}.
+// Reply: {"uplink":"..."} normally; adds "reboot_required":true when
+// switching away from rainmaker, or "err" when requesting rainmaker on a
+// flag-off build.
+ApiStatus api_uplink_set(const char* body, size_t body_len,
+                          char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
+// GET /api/rainmaker/status — args-less.
+// Reply: {"state":"disabled|init_claim|connecting|unassociated|ready|backoff|claim_failed",
+//         "node_id":"...","devices":N}.
+ApiStatus api_rainmaker_status(const char* body, size_t body_len,
+                                char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
+// POST /api/rainmaker/assoc/set — args: {"user_id":"...","secret":"..."}.
+// Reply: {"ok":true|false}.
+ApiStatus api_rainmaker_assoc_set(const char* body, size_t body_len,
+                                   char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
+// GET /api/device/rainmaker/list — args-less.
+// Reply: {"devices":[{"ieee":"0x...","type":"esp.device...."}]}.
+ApiStatus api_device_rainmaker_list(const char* body, size_t body_len,
+                                     char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
+// POST /api/device/rainmaker/add — args: {"ieee":"0x..."}. Cap 10
+// (RMK_MAX_DEVS) — error {"ok":false,"err":"cap reached (10)"} past that.
+// Reply on success: the updated device list (same shape as
+// device.rainmaker.list).
+ApiStatus api_device_rainmaker_add(const char* body, size_t body_len,
+                                    char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
+// POST /api/device/rainmaker/remove — args: {"ieee":"0x..."}.
+// Reply: the updated device list (same shape as device.rainmaker.list).
+ApiStatus api_device_rainmaker_remove(const char* body, size_t body_len,
+                                       char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
 // ── Remote (premium feature, Kconfig-gated) ──────────────────────────────
 #ifdef CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
 ApiStatus api_remote_status(const char* body, size_t body_len,

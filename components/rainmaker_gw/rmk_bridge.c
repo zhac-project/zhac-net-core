@@ -160,6 +160,11 @@ static bool             s_attached = false;
 // reasoning s_reg_mtx itself relies on below.
 static rmk_attr_write_fn s_attr_writer = nullptr;
 
+// Task 18 DI: boot-time restore hook, set once during app_main() (same
+// "pre-init single-threaded use" reasoning as s_attr_writer above), then
+// only ever read from rmk_bridge_attach() — see rmk_bridge.h's own comment.
+static rmk_boot_restore_fn s_boot_restore = nullptr;
+
 // Guards s_reg[] against a concurrent Task-18 caller (expose/unexpose,
 // presumably driven off DEVICE_JOIN/DEVICE_LEAVE, possibly on a different
 // task than task_hap, which is what now drives rmk_bridge_on_attr_update
@@ -629,5 +634,106 @@ void rmk_bridge_attach(void) {
     if (s_attached) return;
     s_attached = true;
     ESP_LOGI(TAG, "bridge OUT direction live (direct-call, main/hap_bridge.cpp BULK_STATE_UPDATE hook)");
+
+    // Task 18: fire the boot-time persisted-device restore exactly once, on
+    // the FIRST READY transition reached this boot — the s_attached guard
+    // above (this function's own pre-existing idempotency) is what makes
+    // "exactly once" hold across rainmaker_gw.c's two RMK_ST_READY call
+    // sites (initial mapping-done vs. a later reconnect). NULL-checked so a
+    // flag-on build that never wired the setter degrades to "no persisted
+    // devices come back" (logged on the main/ side) instead of crashing.
+    if (s_boot_restore) s_boot_restore();
+#endif
+}
+
+// Task 18 DI setter — defined outside the top #if (same pattern as
+// rmk_bridge_set_attr_writer) so main.cpp can call it unconditionally.
+void rmk_bridge_set_boot_restore(rmk_boot_restore_fn fn) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    s_boot_restore = fn;
+#else
+    (void)fn;
+#endif
+}
+
+size_t rmk_bridge_device_count(void) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    // Relaxed read — same "at most one event stale" tolerance already
+    // documented for s_reg_count / rmk_bridge_active() above. rainmaker.status
+    // is a point-in-time status read, not a correctness-critical decision.
+    return s_reg_count;
+#else
+    return 0;
+#endif
+}
+
+size_t rmk_bridge_list(rmk_bridge_dev_info_t* out, size_t cap) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    if (!out || cap == 0) return 0;
+
+    uint64_t              ieees[RMK_MAX_DEVS];
+    esp_rmaker_device_t*  devs[RMK_MAX_DEVS];
+    size_t                n = 0;
+
+    reg_lock();
+    for (size_t i = 0; i < RMK_MAX_DEVS && n < cap; i++) {
+        if (!s_reg[i].in_use) continue;
+        ieees[n] = s_reg[i].ieee;
+        devs[n]  = s_reg[i].device;
+        n++;
+    }
+    reg_unlock();
+
+    // esp_rmaker_device_get_type/_get_name are simple accessors, but this
+    // file's own convention (write-cb, rmk_bridge_on_attr_update) is to
+    // never call an esp_rmaker_* function while holding reg_lock() — kept
+    // here too rather than assuming today's trivial implementation stays
+    // that way forever.
+    for (size_t i = 0; i < n; i++) {
+        out[i].ieee = ieees[i];
+        out[i].type = devs[i] ? esp_rmaker_device_get_type(devs[i]) : "esp.device.other";
+        out[i].name = devs[i] ? esp_rmaker_device_get_name(devs[i]) : "";
+    }
+    return n;
+#else
+    (void)out; (void)cap;
+    return 0;
+#endif
+}
+
+void rmk_bridge_report_node_details_now(void) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    if (rainmaker_gw_state() != RMK_ST_READY) return;   // nothing to report yet/anymore
+    esp_err_t err = esp_rmaker_report_node_details();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "report_node_details failed: %s", esp_err_to_name(err));
+    }
+#endif
+}
+
+void rmk_bridge_on_device_renamed(uint64_t ieee, const char* new_name) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    if (!new_name) return;
+
+    reg_lock();
+    RmkBridgeDev* d = dev_by_ieee_locked(ieee);
+    esp_rmaker_device_t* dev = d ? d->device : nullptr;
+    reg_unlock();
+    if (!dev) return;   // not exposed, or expose_device hasn't attached the SDK device yet
+
+    // Same "never call esp_rmaker_* while holding reg_lock()" discipline as
+    // the rest of this file — dev is a pointer into the SDK's own live
+    // object, safe to use unlocked here (worst case: a concurrent unexpose
+    // deletes it a moment later, and this update either lands just before
+    // that or is a harmless no-op against an object about to be torn down —
+    // the SDK does not document param updates against a mid-delete device as
+    // unsafe, and this path is not on any latency- or correctness-critical
+    // trigger).
+    esp_rmaker_param_t* name_param =
+        esp_rmaker_device_get_param_by_name(dev, ESP_RMAKER_DEF_NAME_PARAM);
+    if (!name_param) return;
+    esp_rmaker_param_update_and_report(name_param, esp_rmaker_str(new_name));
+#else
+    (void)ieee; (void)new_name;
 #endif
 }

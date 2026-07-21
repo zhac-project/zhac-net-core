@@ -7,6 +7,7 @@ set(srcs
     "api_rules.cpp"
     "api_scripts.cpp"
     "api_groups.cpp"
+    "api_rainmaker.cpp"
     "hap_bridge.cpp"
     "log_ring.cpp"
     "rest_devices.cpp"

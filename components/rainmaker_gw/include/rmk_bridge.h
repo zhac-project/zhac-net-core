@@ -163,6 +163,67 @@ typedef esp_err_t (*rmk_attr_write_fn)(uint64_t ieee, const char* key,
 // rmk_bridge.c.
 void rmk_bridge_set_attr_writer(rmk_attr_write_fn fn);
 
+// ── Task 18: API-op accessors + boot-restore / rename / republish hooks ──
+
+// Count of currently-exposed devices (registry, not rmk_store's persisted
+// set — see rmk_bridge_expose_device's own doc for why the registry is the
+// single live source of truth). Backs `rainmaker.status`'s "devices" field.
+// 0 on a flag-off build.
+size_t rmk_bridge_device_count(void);
+
+// One row per currently-exposed device: `type` and `name` are borrowed
+// pointers into the SDK's own live device object (esp_rmaker_device_get_type
+// / _get_name) — valid only transiently (read and format into a reply
+// immediately; never retained past the call that produced them, since a
+// concurrent unexpose can free the underlying device at any time). Backs
+// `device.rainmaker.list` / `.add` / `.remove`'s reply. Returns the number
+// of rows written (<= cap). 0 on a flag-off build.
+typedef struct {
+    uint64_t    ieee;
+    const char* type;   // e.g. "esp.device.lightbulb" (rmk_devtype_str())
+    const char* name;   // current RainMaker display name
+} rmk_bridge_dev_info_t;
+size_t rmk_bridge_list(rmk_bridge_dev_info_t* out, size_t cap);
+
+// Immediate (non-debounced) node-config republish — thin wrapper around
+// esp_rmaker_report_node_details(). esp_rmaker_* types/calls must not leave
+// this component (see this header's own file banner + CMakeLists.txt's
+// PRIVATE optional_requires on espressif__esp_rainmaker), so the DEBOUNCE
+// itself lives in main/api_rainmaker.cpp (which already depends on
+// esp_timer for unrelated reasons) — that file's 2 s one-shot timer calls
+// this function, never esp_rmaker_report_node_details() directly. No-op if
+// the flag is off or the bridge isn't RMK_ST_READY (nothing meaningful to
+// report yet/anymore).
+void rmk_bridge_report_node_details_now(void);
+
+// Boot-time persisted-device restore hook (Task 18's dynamic-exposure half).
+// rmk_bridge_attach() calls this exactly once, on the FIRST READY transition
+// reached this boot (guarded by the same s_attached idempotency this
+// function already relies on) — see rainmaker_gw.c's two RMK_ST_READY call
+// sites. The restore loop itself (rmk_store_load + per-ieee re-expose via a
+// live HAP GET_DEVICE_BY_ID fetch) needs main/api_rainmaker.cpp's
+// rmk_expose_device_from_ieee() helper, which needs hap_protocol/hap_json —
+// this component's CMakeLists.txt deliberately has no REQUIRES on any of
+// those (same "stay HAP-agnostic" layering rule rmk_attr_write_fn documents
+// above), so the capability is injected here the same way: main.cpp
+// registers main/api_rainmaker.cpp's rmk_boot_restore() via this setter
+// right after rmk_bridge_set_attr_writer(). Safe/no-op on a flag-off build
+// (setter defined outside any #if); a flag-on build that never wires the
+// setter just means no persisted devices come back (logged, not fatal).
+typedef void (*rmk_boot_restore_fn)(void);
+void rmk_bridge_set_boot_restore(rmk_boot_restore_fn fn);
+
+// ZHAC-side rename (main/api_devices.cpp's device.rename success path)
+// mirrored onto an exposed device's RainMaker "Name" param, so the phone
+// app reflects the new name without waiting for a reboot/re-expose. No-op
+// (including when the flag is off) if ieee isn't currently exposed.
+// `new_name` should already be UTF-8-sanitized by the caller (api_devices.cpp
+// already runs device.rename's name through utf8_safe_copy before this
+// point — see the WS UTF-8 poison history this codebase has twice fixed).
+// This is the rename-only counterpart to rmk_bridge_on_device_gone() above
+// — DEVICE_LEAVE cleanup already exists (Task 16) and is not touched here.
+void rmk_bridge_on_device_renamed(uint64_t ieee, const char* new_name);
+
 #ifdef __cplusplus
 }
 #endif
