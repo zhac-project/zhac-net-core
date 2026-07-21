@@ -4,55 +4,72 @@
 // rmk_bridge — shadow -> RainMaker param bridge (Task 16 of the RainMaker
 // Bridge plan; bridge OUT direction). Fills the Task-11/13 stub.
 //
-// Compiled as C++ despite the .c name/extension — same reason as
-// rainmaker_gw.c (see this component's CMakeLists.txt for the full
-// rationale on that file): this translation unit needs event_bus.h
-// directly to subscribe to shadow-change events, and event_bus.h is
-// C++-only (`enum class EventType`, `std::function`-typed EventHandler).
-// rmk_bridge.h's own `extern "C"` guard keeps this file's PUBLIC API at
-// plain C linkage regardless, so nothing about the component's external
-// contract changes.
+// Compiled as C++ despite the .c name/extension — same category of reason
+// as rainmaker_gw.c (see this component's CMakeLists.txt for the full
+// rationale on that file): zcl_attribute.h (zap_common — needed here for
+// the ValType enum: VAL_INT/VAL_BOOL/VAL_STR/VAL_FLOAT/VAL_NONE) is
+// C++-only syntax (`#include <cstdint>` etc.), and this file's own code
+// (bare `RmkBridgeDev`/`RmkBridgeParam` struct-as-type-name without a
+// typedef, `nullptr`) is C++-only regardless. rmk_bridge.h's own
+// `extern "C"` guard keeps this file's PUBLIC API at plain C linkage
+// regardless, so nothing about the component's external contract changes.
 //
-// ── Subscription mechanism — brief's Step 1, corrected ──────────────────
-// The brief's original mental model ("mqtt_gw_s3.cpp subscribes to
-// shadow/event-bus updates the same way remote_client does — mirror that")
-// does not hold on this branch. Verified by grep across both
-// zhac-components and this net-core worktree: neither
-// zhac-components/components/mqtt_gw/mqtt_gw_s3.cpp nor
-// components/remote_client/*.cpp calls event_bus_subscribe, references
-// EventType, or touches ZclAttrEvent at all — mqtt_gw_s3.cpp is pure MQTT
-// *transport* (broker connect/publish/subscribe), and remote_client relays
-// WS command envelopes, neither one a shadow-event consumer. The only
-// production event_bus_subscribe call sites anywhere in either repo are in
-// zhac-components/components/simple_rules/simple_rules.cpp — and this
-// net-core worktree's own main/idf_component.yml does not even list
-// simple_rules as a dependency, so there is no shared dispatcher already
-// running on S3 to piggyback on either.
+// ── REVISION — post-review rehook (fix commit) ──────────────────────────
+// The original cut of this file (Task 16 as first committed, `0300281`)
+// subscribed to event_bus for EventType::ZCL_ATTR / SHADOW_OPTIMISTIC,
+// following the brief's corrected-per-environment-facts mental model:
+// "the S3-side device_shadow is updated by the HAP event stream from the
+// P4... study how mqtt_gw_s3.cpp / remote_client learn about shadow
+// updates and mirror that." That investigation *did* correctly establish
+// that neither mqtt_gw_s3.cpp nor remote_client subscribes to event_bus
+// (grep-verified across both repos — see the superseded banner in git
+// history), and that device_shadow.cpp's publish_staged() is a real,
+// correctly-implemented ZCL_ATTR/SHADOW_OPTIMISTIC producer... but never
+// verified that anything on THIS target actually calls INTO device_shadow
+// in the first place. It doesn't: grep across this entire net-core
+// worktree for device_shadow_init / device_shadow_process /
+// device_shadow_update_optimistic turns up zero call sites anywhere
+// outside this file's own (now-corrected) comments. device_shadow is
+// listed in main/idf_component.yml (so it links) but is never initialized
+// or fed on S3 — a linked-but-dead dependency on this target. The
+// event_bus subscription compiled and would have sat there forever,
+// correctly waiting on a queue nothing ever posts to.
 //
-// What IS true and load-bearing (read from
-// zhac-components/components/device_shadow/device_shadow.cpp and
-// components/event_bus/event_bus.cpp directly, not from stale docs — see
-// below): device_shadow's publish_staged() emits EventType::ZCL_ATTR on
-// every processed attribute (the device_shadow_process() path, which is
-// what the S3-side HAP frame handler calls to mirror P4's bulk 0x60
-// updates into the local shadow) and EventType::SHADOW_OPTIMISTIC on
-// device_shadow_update_optimistic() (the no-report-device / optimistic
-// relay path) — both carry the byte-identical ZclAttrEvent payload (ieee,
-// val_type, key, int_val). That part of the brief's model was right; only
-// the "where to copy the subscription from" pointer was stale.
+// The REAL S3-side fan-out for device state, read directly from
+// main/hap_bridge.cpp's `case HapMsgType::BULK_STATE_UPDATE:` (~line 616):
+// it deserializes the P4's JSON payload, extracts a top-level "ieee"
+// field, and calls ws_event_broadcast("attr.bulk", ...) +
+// mqtt_gw_publish("devices/<ieee>/state", ...) directly on the raw
+// payload bytes — no device_shadow, no event_bus, anywhere in that path.
+// The payload shape (per that handler's own comment, and confirmed
+// against hap_json.cpp's hap_json_encode_device_attr_update() — the
+// encoder whose output shape matches what the S3 handler actually reads,
+// as opposed to the differently-shaped hap_json_encode_bulk() whose
+// doc-comment claims the same 0x60 opcode but produces a top-level "devs"
+// array the S3 handler never looks at) is:
+//   {"type":"device_update","ieee":"0xXXXX...","attrs":{"<key>":<val>},
+//    "lqi":<uint8>,"last_seen":<unix_ts>}
+// where each `attrs` value is *already* JSON-natively-typed — a JSON bool
+// for VAL_BOOL, an already-real (unscaled) JSON number for VAL_FLOAT
+// (encode_device_attr_update: `attrs[key] = (float)int_val / 100.0f`), and
+// a plain JSON integer for VAL_INT. No `val_type` tag travels on this
+// wire at all — main/hap_bridge.cpp's new hook (this fix) has to infer it
+// from the JSON variant's own type, and reconstructs this file's expected
+// "raw shadow ×100" VAL_FLOAT convention before calling
+// rmk_bridge_on_attr_update(). See that call site's own comment for a
+// verified (not guessed — traced through the actual vendored
+// components/arduinojson v7.4.3 parser/serializer source) residual
+// ambiguity: a float-valued attribute that happens to be an exact whole
+// number re-serializes without a decimal point and is indistinguishable,
+// on the wire, from a genuine integer.
 //
-// event_bus's OWN header/impl (components/event_bus/include/event_bus.h,
-// event_bus.cpp — the event_bus/README.md is stale on this point, still
-// describing a retired `event_bus_subscribe_queue`/`_drain_queue` pair
-// that doesn't exist in the current header) make the actual contract
-// unambiguous: event_bus_publish() only ever enqueues into each
-// subscriber's private per-slot queue; the EventHandler passed to
-// event_bus_subscribe() is invoked SOLELY inside drain_slot(), reached via
-// event_bus_drain_handle() — "call from the subscriber's own task" per the
-// header comment. Nothing on S3 currently drains anything. So, like
-// simple_rules does for its own (unrelated, cron-driven) needs via its
-// dedicated rule_cron task, this bridge must both subscribe AND run its
-// own small drain task — there is no free ride available to mirror.
+// This file no longer subscribes to anything. rmk_bridge_on_attr_update()
+// is called directly, synchronously, from whatever task processes the
+// BULK_STATE_UPDATE frame (task_hap) — no queue, no second task, so the
+// original event_bus-drain-task busy-spin self-review finding and the
+// "who drains the queue" investigation are both moot (the queue is gone).
+// The registry mutex stays: expose/unexpose (Task 18, unknown thread) can
+// still race this direct-call read path exactly as before.
 #include "sdkconfig.h"
 #include "rmk_bridge.h"
 
@@ -67,16 +84,18 @@
                              // the exposed-set filter; rmk_tbl_* (the NVS-
                              // backed set proper, owned by Task 18) is
                              // never called from this file.
-#include "event_bus.h"
-#include "zcl_attribute.h"  // ValType (VAL_STR/VAL_NONE guard below);
-                             // pulled in transitively via event_bus.h too,
-                             // included directly since it's used by name.
+#include "zcl_attribute.h"  // ValType (VAL_STR/VAL_NONE guard below).
+                             // Reachable via zap_store's own public
+                             // REQUIRES on zap_common (already in this
+                             // component's CMakeLists.txt) — no new
+                             // component dependency needed for this alone.
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
 
 #include "esp_rmaker_core.h"
+#include "esp_rmaker_standard_params.h"  // ESP_RMAKER_DEF_NAME_PARAM,
+                                          // esp_rmaker_name_param_create()
 
 static const char* TAG = "rmk_bridge";
 
@@ -108,19 +127,25 @@ struct RmkBridgeDev {
 };
 
 static RmkBridgeDev    s_reg[RMK_MAX_DEVS];
-static bool            s_attached = false;
-static EventSubHandle  s_h_attr   = EVENT_SUB_INVALID;
-static EventSubHandle  s_h_opt    = EVENT_SUB_INVALID;
+static size_t          s_reg_count = 0;   // count of in_use, fully-committed
+                                           // entries — rmk_bridge_active()'s
+                                           // cheap gate. Read without the
+                                           // lock there (a benign, at-most-
+                                           // one-event-stale relaxed read on
+                                           // a hot per-frame fast path);
+                                           // written only under reg_lock().
+static bool             s_attached = false;
 
 // Guards s_reg[] against a concurrent Task-18 caller (expose/unexpose,
 // presumably driven off DEVICE_JOIN/DEVICE_LEAVE, possibly on a different
-// task than rmk_bridge_evt_task below) racing the OUT handler's read side.
-// Lazy-created, null-guarded before first use — same accepted pattern
-// event_bus.cpp itself uses for s_bus_mtx ("pre-init single-threaded use"):
-// the only theoretical race is two callers both hitting a genuinely first
-// call to this file at once, which in practice means Task 18 racing itself
-// before it has even run once. Held only across registry scan/mutation;
-// released before any esp_rmaker_* SDK call (some may block/log).
+// task than task_hap, which is what now drives rmk_bridge_on_attr_update
+// directly) racing the OUT handler's read side. Lazy-created, null-guarded
+// before first use — same accepted pattern event_bus.cpp itself uses for
+// s_bus_mtx ("pre-init single-threaded use"): the only theoretical race is
+// two callers both hitting a genuinely first call to this file at once,
+// which in practice means Task 18 racing itself before it has even run
+// once. Held only across registry scan/mutation; released before any
+// esp_rmaker_* SDK call (some may block/log).
 static SemaphoreHandle_t s_reg_mtx = nullptr;
 static inline void reg_lock() {
     if (!s_reg_mtx) s_reg_mtx = xSemaphoreCreateMutex();
@@ -162,97 +187,6 @@ static esp_err_t rmk_bridge_write_stub_cb(const esp_rmaker_device_t* device,
     return ESP_OK;
 }
 
-// ── OUT handler: shadow event -> converted, throttled param report ──────
-// Runs on rmk_bridge_evt_task (below) — the event-bus/dispatcher thread
-// for this subscription. Allocation-free: fixed-size registry scan, plain
-// integer/float math in rmk_typemap's conversions, no heap/string work.
-static void rmk_bridge_on_shadow_event(const Event& ev) {
-    // Lifecycle guard (brief's requirement). rmk_bridge_attach() is only
-    // called on entry to RMK_ST_READY, but rainmaker_gw.c can later drop
-    // to RMK_ST_BACKOFF on an MQTT disconnect without ever unsubscribing
-    // (Task 13 has no detach path) — so re-check live on every event
-    // rather than only gating the initial subscribe.
-    if (rainmaker_gw_state() != RMK_ST_READY) return;
-
-    const ZclAttrEvent* a = reinterpret_cast<const ZclAttrEvent*>(ev.data);
-    // VAL_STR aliases int_val with str_val in the same union — reading
-    // int_val for a string-valued attribute would be garbage. VAL_NONE
-    // carries nothing meaningful either. Every rmk_param_t data_type is
-    // 'b'/'i'/'f' (rmk_typemap.h) — no exposed param is ever string-typed
-    // — so both are unconditional skips, not just "unhandled conv".
-    if (a->val_type == VAL_STR || a->val_type == VAL_NONE) return;
-
-    reg_lock();
-    RmkBridgeDev* d = dev_by_ieee_locked(a->ieee);
-    if (!d) { reg_unlock(); return; }   // not exposed — registry IS the filter
-
-    esp_rmaker_param_t* handle = nullptr;
-    esp_rmaker_param_val_t v{};
-    bool changed = false;
-
-    for (size_t i = 0; i < d->param_count; i++) {
-        RmkBridgeParam* bp = &d->params[i];
-        if (strcmp(bp->plan.zhac_key, a->key) != 0) continue;
-        if (!bp->handle) break;   // this param's create() failed earlier
-
-        // Skip-unchanged throttle on the RAW shadow value, checked before
-        // paying for the conversion below.
-        if (bp->has_last && bp->last_reported == a->int_val) break;
-        bp->last_reported = a->int_val;
-        bp->has_last = true;
-
-        switch (bp->plan.conv) {
-        case RMK_CONV_BRI:     v = esp_rmaker_int(rmk_bri_to_rm(a->int_val)); break;
-        case RMK_CONV_CCT:     v = esp_rmaker_int(rmk_mired_to_kelvin(a->int_val)); break;
-        case RMK_CONV_DIV100:  v = esp_rmaker_float((float)rmk_div100(a->int_val)); break;
-        case RMK_CONV_CONTACT: v = esp_rmaker_bool(rmk_contact_to_rm(a->int_val != 0)); break;
-        default:
-            v = (bp->plan.data_type == 'b') ? esp_rmaker_bool(a->int_val != 0)
-                                             : esp_rmaker_int(a->int_val);
-            break;
-        }
-        handle  = bp->handle;
-        changed = true;
-        break;   // zhac_key is unique within one device's param plan
-    }
-    reg_unlock();
-
-    // esp_rmaker_param_update_and_report queues internally (brief's own
-    // note) — called outside the lock so the SDK's internal work (mutex/
-    // queue push into the RainMaker work-queue task) can never block a
-    // future registry access from another task.
-    if (changed && handle) esp_rmaker_param_update_and_report(handle, v);
-}
-
-// ── Dispatch task ─────────────────────────────────────────────────────
-// event_bus's own header comment on event_bus_drain_handle: "call from
-// the subscriber's own task." Nothing on S3 currently runs a shared
-// event-bus pump (see file banner above), so this bridge owns a small
-// dedicated one — exactly as simple_rules owns rule_cron for its own,
-// unrelated per-second timer need, not because a shared task pattern
-// doesn't exist elsewhere.
-//
-// Stack size (4096) is a plain local constant, not registered in
-// zhac-components/components/zap_common/include/task_stacks.h's kTable —
-// that file lives in a different repo (zhac-components, out of this
-// task's edit scope: the controller's file list for this task covers only
-// components/rainmaker_gw/* and rainmaker_gw.c) and is explicitly a
-// stack-monitor lookup table, not a hard requirement for a task to run.
-// The stack monitor just won't show "rmk_bridge_evt" by name until a
-// follow-up task adds it there.
-static void rmk_bridge_evt_task(void*) {
-    for (;;) {
-        // Block up to 200 ms for a ZCL_ATTR event (the common case — every
-        // HAP-relayed bulk attribute update); drains any backlog quickly
-        // once woken (drain_slot only blocks waiting for the FIRST event).
-        event_bus_drain_handle(s_h_attr, 200);
-        // Short poll of the optimistic-shadow queue so a no-report Tuya
-        // command relay (the whole point of SHADOW_OPTIMISTIC) isn't
-        // starved behind a long idle block on the ZCL_ATTR queue above.
-        event_bus_drain_handle(s_h_opt, 50);
-    }
-}
-
 #endif  // CONFIG_ZHAC_RAINMAKER_ENABLE
 
 esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
@@ -286,10 +220,21 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
     if (!dev) {
         ESP_LOGE(TAG, "esp_rmaker_device_create failed for %s", name);
         reg_lock();
-        memset(d, 0, sizeof(*d));   // release the reserved slot
+        // Only release the reservation if it's still ours (same defensive
+        // check as the TOCTOU close below — cheap, and correct either way:
+        // if it was already reclaimed there is nothing of ours left to
+        // release).
+        if (d->in_use && d->ieee == ieee && !d->device) memset(d, 0, sizeof(*d));
         reg_unlock();
         return ESP_FAIL;
     }
+
+    // Standard Name param (RainMaker's own examples: "should be added to
+    // all devices for which you want a user customisable name" —
+    // enables in-app rename). Not tracked in d->params[]/built[] below:
+    // it has no zhac_key / shadow mapping, so it isn't something the OUT
+    // handler ever updates — it's a device-identity param, set once here.
+    esp_rmaker_device_add_param(dev, esp_rmaker_name_param_create(ESP_RMAKER_DEF_NAME_PARAM, name));
 
     esp_rmaker_param_t* primary = nullptr;
     RmkBridgeParam built[RMK_MAX_PARAMS];
@@ -333,10 +278,13 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
 
     esp_rmaker_device_add_cb(dev, rmk_bridge_write_stub_cb, nullptr);
 
+    bool added_to_node = false;
     const esp_rmaker_node_t* node = esp_rmaker_get_node();
     if (node) {
         esp_err_t aerr = esp_rmaker_node_add_device(node, dev);
-        if (aerr != ESP_OK) {
+        if (aerr == ESP_OK) {
+            added_to_node = true;
+        } else {
             ESP_LOGE(TAG, "esp_rmaker_node_add_device failed for %s: %s",
                      name, esp_err_to_name(aerr));
             // Non-fatal: device + params exist and are recorded below so a
@@ -347,10 +295,35 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
         ESP_LOGW(TAG, "esp_rmaker_get_node() returned NULL — %s created but not attached to a node", name);
     }
 
+    // Code-review fix: re-assert the reservation is still ours before
+    // committing. Between the reservation above and here, a concurrent
+    // rmk_bridge_unexpose_device(ieee)/rmk_bridge_on_device_gone(ieee) for
+    // this SAME ieee (racing on a different task — Task 18's threading
+    // model is unknown) could have torn the slot down and even let it be
+    // reserved again by a third, unrelated expose call. Blindly writing
+    // through `d` in that case would resurrect a torn-down entry and/or
+    // corrupt an unrelated device's in-flight registration. Detect it and
+    // discard what was built instead of leaking the SDK objects.
     reg_lock();
+    if (!d->in_use || d->ieee != ieee) {
+        reg_unlock();
+        ESP_LOGW(TAG, "expose_device ieee=0x%016llx: registry slot reclaimed during setup — discarding built device",
+                 (unsigned long long)ieee);
+        if (added_to_node) {
+            const esp_rmaker_node_t* node2 = esp_rmaker_get_node();
+            if (node2) esp_rmaker_node_remove_device(node2, dev);
+        }
+        esp_rmaker_device_delete(dev);   // takes the Name param + every
+                                         // esp_rmaker_device_add_param'd
+                                         // param down with it — no separate
+                                         // per-param delete needed/offered
+                                         // by the SDK for this case.
+        return ESP_ERR_INVALID_STATE;
+    }
     d->device = dev;
     for (size_t i = 0; i < built_count; i++) d->params[i] = built[i];
     d->param_count = built_count;
+    s_reg_count++;
     reg_unlock();
 
     ESP_LOGI(TAG, "exposed ieee=0x%016llx name=%s type=%s params=%u",
@@ -371,6 +344,7 @@ esp_err_t rmk_bridge_unexpose_device(uint64_t ieee) {
     memset(d, 0, sizeof(*d));   // registry entry gone even if the SDK
                                 // calls below fail — never leave a
                                 // half-torn-down device reachable by ieee.
+    if (s_reg_count > 0) s_reg_count--;
     reg_unlock();
 
     if (dev) {
@@ -400,34 +374,90 @@ void rmk_bridge_on_device_gone(uint64_t ieee) {
 #endif
 }
 
+bool rmk_bridge_active(void) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    return rainmaker_gw_state() == RMK_ST_READY && s_reg_count > 0;
+#else
+    return false;
+#endif
+}
+
+// ── OUT handler: attr update -> converted, throttled param report ───────
+// Called directly (no event envelope, no queue, no dispatch task) from
+// main/hap_bridge.cpp's BULK_STATE_UPDATE handler — see this file's top
+// banner for why the event_bus path this used to run on never fired on
+// this target. Allocation-free: fixed-size registry scan, plain
+// integer/float math in rmk_typemap's conversions, no heap/string work.
+void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
+                               uint8_t val_type, int32_t val) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    // Lifecycle guard (brief's original requirement, still applies).
+    if (rainmaker_gw_state() != RMK_ST_READY) return;
+    if (!key) return;
+    // VAL_STR aliases int_val with str_val in the wire's ZclAttrEvent
+    // convention this function's `val` parameter follows — a string value
+    // has no sensible int32_t here. VAL_NONE carries nothing meaningful
+    // either. Every rmk_param_t data_type is 'b'/'i'/'f' (rmk_typemap.h) —
+    // no exposed param is ever string-typed — so both are unconditional
+    // skips, not just "unhandled conv".
+    if (val_type == VAL_STR || val_type == VAL_NONE) return;
+
+    reg_lock();
+    RmkBridgeDev* d = dev_by_ieee_locked(ieee);
+    if (!d) { reg_unlock(); return; }   // not exposed — registry IS the filter
+
+    esp_rmaker_param_t* handle = nullptr;
+    esp_rmaker_param_val_t v{};
+    bool changed = false;
+
+    for (size_t i = 0; i < d->param_count; i++) {
+        RmkBridgeParam* bp = &d->params[i];
+        if (strcmp(bp->plan.zhac_key, key) != 0) continue;
+        if (!bp->handle) break;   // this param's create() failed earlier
+
+        // Skip-unchanged throttle on the RAW shadow value, checked before
+        // paying for the conversion below.
+        if (bp->has_last && bp->last_reported == val) break;
+        bp->last_reported = val;
+        bp->has_last = true;
+
+        switch (bp->plan.conv) {
+        case RMK_CONV_BRI:     v = esp_rmaker_int(rmk_bri_to_rm(val)); break;
+        case RMK_CONV_CCT:     v = esp_rmaker_int(rmk_mired_to_kelvin(val)); break;
+        case RMK_CONV_DIV100:  v = esp_rmaker_float((float)rmk_div100(val)); break;
+        case RMK_CONV_CONTACT: v = esp_rmaker_bool(rmk_contact_to_rm(val != 0)); break;
+        default:
+            v = (bp->plan.data_type == 'b') ? esp_rmaker_bool(val != 0)
+                                             : esp_rmaker_int(val);
+            break;
+        }
+        handle  = bp->handle;
+        changed = true;
+        break;   // zhac_key is unique within one device's param plan
+    }
+    reg_unlock();
+
+    // esp_rmaker_param_update_and_report queues internally (brief's own
+    // note) — called outside the lock so the SDK's internal work (mutex/
+    // queue push into the RainMaker work-queue task) can never block a
+    // future registry access from another task.
+    if (changed && handle) esp_rmaker_param_update_and_report(handle, v);
+#else
+    (void)ieee; (void)key; (void)val_type; (void)val;
+#endif
+}
+
 void rmk_bridge_attach(void) {
 #if CONFIG_ZHAC_RAINMAKER_ENABLE
-    if (s_attached) {
-        ESP_LOGW(TAG, "rmk_bridge_attach: already attached — ignoring");
-        return;
-    }
-    s_h_attr = event_bus_subscribe(EventType::ZCL_ATTR,          rmk_bridge_on_shadow_event);
-    s_h_opt  = event_bus_subscribe(EventType::SHADOW_OPTIMISTIC, rmk_bridge_on_shadow_event);
-    if (s_h_attr == EVENT_SUB_INVALID || s_h_opt == EVENT_SUB_INVALID) {
-        ESP_LOGE(TAG, "event_bus_subscribe failed (attr_ok=%d opt_ok=%d) — "
-                      "bridge OUT direction will miss events of the failed type(s)",
-                 s_h_attr != EVENT_SUB_INVALID, s_h_opt != EVENT_SUB_INVALID);
-    }
-    // event_bus_drain_handle(EVENT_SUB_INVALID, ...) returns 0 immediately
-    // instead of blocking for the timeout (event_bus.cpp: guarded at the
-    // top of the function) — if BOTH subscribes failed, the task loop
-    // below would busy-spin at 100% CPU instead of idling. Only start the
-    // task when at least one handle is real; a fully-failed attach (both
-    // EVENT_SUB_INVALID — the subscriber table for both types completely
-    // full, never observed in practice since this bridge is the first S3
-    // subscriber to either type) leaves the OUT direction inactive, which
-    // is already what the ERROR log above documents.
-    if (s_h_attr != EVENT_SUB_INVALID || s_h_opt != EVENT_SUB_INVALID) {
-        xTaskCreate(rmk_bridge_evt_task, "rmk_bridge_evt", 4096, nullptr, 2, nullptr);
-    } else {
-        ESP_LOGE(TAG, "both subscriptions failed — dispatch task NOT started, OUT direction fully inactive");
-    }
+    // Historically subscribed to event_bus here (superseded — see file
+    // banner). Kept as a thin idempotent marker so rainmaker_gw.c's two
+    // existing RMK_ST_READY call sites don't need editing as part of this
+    // fix; the OUT direction is live purely by virtue of
+    // rmk_bridge_active()/rmk_bridge_on_attr_update() being safe to call
+    // unconditionally the moment a device is exposed and the state machine
+    // reaches READY — no setup step is actually required any more.
+    if (s_attached) return;
     s_attached = true;
-    ESP_LOGI(TAG, "attached to shadow event stream (ZCL_ATTR + SHADOW_OPTIMISTIC)");
+    ESP_LOGI(TAG, "bridge OUT direction live (direct-call, main/hap_bridge.cpp BULK_STATE_UPDATE hook)");
 #endif
 }
