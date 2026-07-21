@@ -88,3 +88,28 @@ CONFIG_ZHAC_REMOTE_CLIENT_ENABLE=y
 # for a fleet image.
 CONFIG_ZHAC_API_AUTH_DEFAULT_ENABLED=y
 CONFIG_ZHAC_DEFAULT_API_TOKEN=""
+
+# ── RainMaker bridge (components/rainmaker_gw, Task 13) ─────────────────
+# These three CONFIG_ESP_RMAKER_* symbols belong to the espressif/esp_rainmaker
+# managed dependency, which is rules-gated on CONFIG_ZHAC_RAINMAKER_ENABLE
+# (main/idf_component.yml; default n). They only EXIST in the Kconfig tree
+# once that dependency actually resolves, so on a default (flag-off) build
+# these lines match no known symbol and are silently inert — they do not
+# force-enable RainMaker by themselves, and a flag-off build's sdkconfig
+# stays exactly as if these lines weren't here.
+# - SELF_CLAIM: esp_rainmaker's claim-type choice defaults to ASSISTED_CLAIM
+#   whenever BT is enabled (true on esp32s3), so this needs an explicit
+#   override. P0 Gate 2/3 proved self-claim + manual user-node mapping on
+#   real hardware.
+# - FACTORY_PARTITION_NAME="nvs": reuses ZHAC's existing main NVS partition
+#   as the RainMaker factory credential store instead of the SDK's default
+#   "fctry" partition, avoiding a partition-table change (which OTA cannot
+#   deliver to units already in the field).
+# - ENABLE_CHALLENGE_RESPONSE=n: defaults to y upstream, but challenge-
+#   response REPLACES the traditional user-node mapping flow that
+#   rainmaker_gw_assoc_start() depends on, and is incompatible with
+#   self-claiming (it expects an already-claimed node going in). Must stay
+#   off for this design's manual-association flow.
+CONFIG_ESP_RMAKER_SELF_CLAIM=y
+CONFIG_ESP_RMAKER_FACTORY_PARTITION_NAME="nvs"
+CONFIG_ESP_RMAKER_ENABLE_CHALLENGE_RESPONSE=n

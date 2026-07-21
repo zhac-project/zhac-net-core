@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include "esp_err.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// RainMaker bridge lifecycle state. This Task-11 skeleton never advances
-// past RMK_ST_DISABLED — the claim/connect state machine that actually
-// drives these transitions lands in Task 13 (consumed further by Tasks 18,
-// 19 per the RainMaker Bridge plan).
+// RainMaker bridge lifecycle state, driven by the claim/connect state
+// machine in rainmaker_gw.c (Task 13 of the RainMaker Bridge plan; consumed
+// further by Tasks 18, 19).
 typedef enum {
     RMK_ST_DISABLED = 0,   // flag off, or flag on but uplink != RAINMAKER
     RMK_ST_INIT_CLAIM,     // claiming/provisioning with the RainMaker cloud
@@ -33,6 +34,21 @@ rmk_state_t rainmaker_gw_state(void);
 
 // RainMaker node ID once claimed. Returns "" (never NULL) until then.
 const char* rainmaker_gw_node_id(void);
+
+// Start (or retry) the user-node mapping (association) workflow — the node
+// side of pairing this device with a RainMaker user account. user_id/secret
+// come from the phone app / esp-rainmaker-cli and are forwarded verbatim to
+// the SDK's esp_rmaker_start_user_node_mapping(). Consumed by the
+// `rainmaker.assoc.set` API op (Task 19).
+//
+// Safe to call unconditionally in both Kconfig states: returns
+// ESP_ERR_INVALID_STATE when the flag is off, the uplink selector isn't
+// RainMaker, or the RainMaker agent was never started / permanently failed
+// to claim (RMK_ST_DISABLED / RMK_ST_CLAIM_FAILED) — there is no live agent
+// to hand the mapping request to in either case. A successful return only
+// means the workflow was triggered, not that the mapping itself succeeded;
+// watch rainmaker_gw_state() for the RMK_ST_READY transition.
+esp_err_t rainmaker_gw_assoc_start(const char* user_id, const char* secret);
 
 #ifdef __cplusplus
 }
