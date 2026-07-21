@@ -498,6 +498,16 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
             const esp_rmaker_node_t* node2 = esp_rmaker_get_node();
             if (node2) esp_rmaker_node_remove_device(node2, dev);
         }
+        // Safe to delete INLINE here — unlike rmk_bridge_unexpose_device's
+        // own teardown below (Task 21 review fix; see that function's
+        // comment for the use-after-free this distinction matters for).
+        // This branch only runs when the reservation was reclaimed BEFORE
+        // the commit a few lines down (`d->param_count = built_count`)
+        // ever ran, so this ieee's registry param_count was 0 for this
+        // whole call — rmk_bridge_on_attr_update's scan loop (bounded by
+        // d->param_count) could never have found `dev`'s params to enqueue
+        // a report against. No pending work-queue item can reference what
+        // gets freed here, so there is nothing to order against.
         esp_rmaker_device_delete(dev);   // takes the Name param + every
                                          // esp_rmaker_device_add_param'd
                                          // param down with it — no separate
@@ -520,6 +530,31 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
 #endif
 }
 
+// Deferred SDK teardown (Task 21 review fix — see rmk_bridge_unexpose_
+// device's own comment for the full use-after-free rationale this closes).
+// `priv` is the esp_rmaker_device_t* to detach and delete.
+// esp_rmaker_node_remove_device()/esp_rmaker_device_delete() were verified
+// from the vendored SDK source (esp_rmaker_node.c / esp_rmaker_device.c),
+// not assumed: both are pure linked-list unlink + free() work, no internal
+// locking, no work-queue calls of their own — safe to run from the work-
+// queue task itself (cannot deadlock waiting on the task it's already
+// running on), and since that queue's single consumer processes one item
+// at a time, this can never execute concurrently with rmk_report_work_fn
+// either — the two are strictly serialized by construction.
+// Guarded exactly like the RmkReportWork block further down (and for the
+// same reason, learned the hard way earlier in this same task): every
+// esp_rmaker_* type is only ever declared inside CONFIG_ZHAC_RAINMAKER_
+// ENABLE, and this function is referenced only from rmk_bridge_unexpose_
+// device's own (already-guarded) body below.
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+static void rmk_teardown_work_fn(void* priv) {
+    esp_rmaker_device_t* dev = static_cast<esp_rmaker_device_t*>(priv);
+    const esp_rmaker_node_t* node = esp_rmaker_get_node();
+    if (node) esp_rmaker_node_remove_device(node, dev);
+    esp_rmaker_device_delete(dev);
+}
+#endif  // CONFIG_ZHAC_RAINMAKER_ENABLE
+
 esp_err_t rmk_bridge_unexpose_device(uint64_t ieee) {
 #if CONFIG_ZHAC_RAINMAKER_ENABLE
     reg_lock();
@@ -529,14 +564,56 @@ esp_err_t rmk_bridge_unexpose_device(uint64_t ieee) {
     memset(d, 0, sizeof(*d));   // registry entry gone even if the SDK
                                 // calls below fail — never leave a
                                 // half-torn-down device reachable by ieee.
+                                // Clearing this FIRST, under the lock, is
+                                // also what makes the deferred teardown
+                                // below race-free: rmk_bridge_on_attr_
+                                // update's own dev_by_ieee_locked lookup
+                                // will miss this ieee from this point on,
+                                // so no NEW report can be enqueued
+                                // referencing dev's params after this line.
     if (s_reg_count > 0) s_reg_count--;
     reg_unlock();
 
     if (dev) {
-        const esp_rmaker_node_t* node = esp_rmaker_get_node();
-        // esp_rmaker_device_delete's own doc: remove from the node first.
-        if (node) esp_rmaker_node_remove_device(node, dev);
-        esp_rmaker_device_delete(dev);
+        // Task 21 review fix — CRITICAL use-after-free, closed by
+        // ORDERING, not locking. This used to call esp_rmaker_node_
+        // remove_device + esp_rmaker_device_delete inline, right here.
+        // But rmk_bridge_on_attr_update (task_hap) can enqueue a
+        // RmkReportWork referencing one of THIS device's param handles
+        // onto the shared work queue, and that queued item might not run
+        // until well after this function returns — deleting the params
+        // inline could free them out from under an already-queued report
+        // (esp_rmaker_device_delete walks every param and free()s it —
+        // esp_rmaker_param.c's esp_rmaker_param_delete). Unlike the
+        // existing, accepted rmk_bridge_write_cb UAF window (bounded
+        // ~3000 ms, documented at that function), this window would be
+        // UNBOUNDED — however long the shared 8-slot queue takes to
+        // drain, each item up to ~10 s.
+        //
+        // Fix: defer the teardown itself onto the SAME work queue instead
+        // of running it inline (rmk_teardown_work_fn above).
+        // work_queue.c's queue is a strict FIFO with a single consumer
+        // task (esp_rmaker_handle_work_queue's xQueueReceive loop), so any
+        // report already enqueued for this device is GUARANTEED to run
+        // BEFORE this teardown request — the two can never interleave the
+        // other way. This closes the race structurally by queue ordering,
+        // with no lock held across the blocking SDK call (which would
+        // recreate the very task_hap stall this task's other fix just
+        // removed) and no refcount needed. The registry clear above
+        // (under reg_lock, before this point) already stops any NEW
+        // report from being enqueued for this ieee — see that comment.
+        esp_err_t qerr = esp_rmaker_work_queue_add_task(rmk_teardown_work_fn, dev);
+        if (qerr != ESP_OK) {
+            // Queue full (8 slots): do NOT fall back to an inline delete
+            // — that would recreate exactly the race this fix closes. A
+            // bounded leak (<= RMK_MAX_DEVS=10 devices' worth of
+            // esp_rmaker_device_t/param objects) is strictly better than
+            // a use-after-free; logged at ERROR so it is visible rather
+            // than silently accepted.
+            ESP_LOGE(TAG, "unexpose ieee=0x%016llx: work-queue full — leaking SDK "
+                          "device/param objects to avoid a UAF race with a pending report",
+                     (unsigned long long)ieee);
+        }
     }
 
     ESP_LOGI(TAG, "unexposed ieee=0x%016llx", (unsigned long long)ieee);
@@ -624,10 +701,17 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
         if (!bp->handle) break;   // this param's create() failed earlier
 
         // Skip-unchanged throttle on the RAW shadow value, checked before
-        // paying for the conversion below.
+        // paying for the conversion below. NOT committed here anymore —
+        // Task 21 review fix: this used to write bp->last_reported/
+        // has_last unconditionally, right here, before the deferred
+        // enqueue below was even attempted. If that enqueue then failed
+        // (OOM or a full work queue), the throttle would already believe
+        // this value had been reported and silently suppress every future
+        // identical value forever — permanent staleness, correctable only
+        // by a DIFFERENT value happening to arrive, with nothing but a
+        // WARN log to show for it. The commit now happens only after the
+        // hand-off is confirmed — see the enqueue call site below.
         if (bp->has_last && bp->last_reported == val) break;
-        bp->last_reported = val;
-        bp->has_last = true;
 
         // Task 17 factored this conversion out to zhac_to_rm_val() so the
         // write-cb's SNAP-BACK path (same conversion, opposite direction's
@@ -669,16 +753,43 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
     // work_queue.c enqueues with a 0-tick xQueueSend: it cannot itself
     // block a caller, and a full 8-slot queue just fails fast (logged,
     // dropped) instead of stalling anything. Ordering is preserved (FIFO
-    // queue, single consumer task) and the skip-unchanged throttle
-    // bookkeeping above is untouched — only the outbound SDK call itself
-    // moves off task_hap.
+    // queue, single consumer task) — see rmk_bridge_unexpose_device's own
+    // comment for how that FIFO ordering is also what closes this task's
+    // second review finding, an unbounded use-after-free on `handle` if a
+    // concurrent unexpose deleted it inline while this report sat queued.
     if (changed && handle) {
         RmkReportWork* w = new (std::nothrow) RmkReportWork{handle, v};
         if (!w) {
             ESP_LOGW(TAG, "OOM deferring RainMaker report for key=%s — dropped", key);
         } else {
             esp_err_t qerr = esp_rmaker_work_queue_add_task(rmk_report_work_fn, w);
-            if (qerr != ESP_OK) {
+            if (qerr == ESP_OK) {
+                // Task 21 review fix: only now — hand-off confirmed — is
+                // the skip-unchanged throttle bookkeeping committed (see
+                // the comment at the loop above for why it must not
+                // commit any earlier). Re-lock and re-validate through
+                // plan_by_handle + an ieee re-check, the exact same
+                // TOCTOU discipline rmk_bridge_write_cb's own post-writer
+                // re-check already uses in this file: a concurrent
+                // unexpose could have reclaimed this ieee's slot (or even
+                // let it be reused by an unrelated device) during the
+                // enqueue call just above. `d` itself stays safe to pass
+                // in regardless — it is a slot inside the static,
+                // process-lifetime s_reg[] array, never freed, only ever
+                // reused. Accepted trade-off: a tight race between two
+                // updates to the same param could now both pass the
+                // pre-enqueue skip-unchanged check above and both get
+                // reported — harmless (RainMaker sees one duplicate
+                // report) versus the alternative this fix removes
+                // (silent, unbounded staleness), which is not.
+                reg_lock();
+                RmkBridgeParam* bp2 = plan_by_handle(d, handle);
+                if (bp2 && d->ieee == ieee) {
+                    bp2->last_reported = val;
+                    bp2->has_last      = true;
+                }
+                reg_unlock();
+            } else {
                 ESP_LOGW(TAG, "work-queue full, dropping RainMaker report for key=%s (%s)",
                          key, esp_err_to_name(qerr));
                 delete w;
