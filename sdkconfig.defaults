@@ -113,3 +113,15 @@ CONFIG_ZHAC_DEFAULT_API_TOKEN=""
 CONFIG_ESP_RMAKER_SELF_CLAIM=y
 CONFIG_ESP_RMAKER_FACTORY_PARTITION_NAME="nvs"
 CONFIG_ESP_RMAKER_ENABLE_CHALLENGE_RESPONSE=n
+# ── RainMaker/TLS internal-SRAM protection (design §5, P0-soak-proven) ──
+# The P0 gate-1 soak PASSED only with this exact set; without it a live
+# TLS session drives internal low-water to ~6 KB (measured, Gate A first
+# boot). ALWAYSINTERNAL=4096 additionally matches net-core master
+# b938516 (matched A/B: +34.5 KB int_min on the shipping firmware).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+# TLS out-buffer shrink (in stays 16 K — AWS won't negotiate smaller
+# fragments). Watch item: node-config JSON >4 KB relies on DYNAMIC_BUFFER.
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
