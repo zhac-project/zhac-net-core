@@ -58,6 +58,39 @@
 // See the comment at the rmk_bridge_unexpose_device() call site in
 // api_device_rainmaker_remove below. No fix attempted — log-and-proceed,
 // flagged for the Gate-B watchlist.
+//
+// ── rmk_bridge_list() vs. deferred teardown — disclosed residual ─────────
+// (Task 21 review, second round.) Not fixed here — out of scope for that
+// review's specific ask (closing the report-vs-teardown race) — but
+// disclosed per its own instruction to document residuals honestly next
+// to this file's existing accepted write_cb UAF note, rather than let a
+// side effect of that fix go unmentioned.
+//
+// components/rainmaker_gw/rmk_bridge.c's rmk_bridge_list() (backs device.
+// rainmaker.list/.add/.remove's reply) captures each esp_rmaker_device_t*
+// under reg_lock, then calls esp_rmaker_device_get_type()/_get_name() on
+// those captured pointers AFTER releasing the lock (that file's own
+// comment: "never call an esp_rmaker_* function while holding reg_lock()
+// ... kept here too rather than assuming today's trivial implementation
+// stays that way forever"). If a concurrent rmk_bridge_unexpose_device
+// for the same device races that unlocked window, its now-deferred
+// teardown could in principle free the device/param memory rmk_bridge_
+// list is about to read.
+//
+// This exact race existed BEFORE the Task 21 deferral too (the old inline
+// esp_rmaker_device_delete could already race rmk_bridge_list's own
+// unlocked window) — it is not new. What the deferral changed is the
+// WIDTH of the window: the old inline delete ran essentially immediately
+// after rmk_bridge_unexpose_device's own unlock (microseconds, pure
+// pointer/free() work); the new deferred teardown only runs once the
+// work-queue task drains it, which can now take as long as every report
+// item ahead of it in the queue — up to ~10 s each under a degraded
+// network. Same race, meaningfully wider window, more likely to actually
+// manifest in practice. Judged out of scope for a targeted UAF-in-the-
+// deferral fix; a real fix (the same reg_lock-across-the-unlocked-work
+// pattern used above, if esp_rmaker_device_get_type/_get_name turn out to
+// also be safe to call locked) is a reasonable follow-up, not attempted
+// here.
 #include "sdkconfig.h"
 #include "api_handlers.h"
 #include "s3_internal.h"
@@ -581,6 +614,15 @@ extern "C" ApiStatus api_device_rainmaker_remove(const char* body, size_t body_l
     // quiesce redesign is out of scope for Task 18 (see rmk_bridge.h's own
     // doc on rmk_bridge_unexpose_device). Log-and-proceed is the accepted
     // mitigation; flagged again in task-18-report.md's Gate-B watchlist.
+    // Task 21 note: rmk_bridge_unexpose_device no longer calls esp_rmaker_
+    // device_delete inline — it now defers that call onto the RainMaker
+    // work queue (see rmk_bridge.c). The delete itself, once it runs, is
+    // no less safe than before; but "once it runs" can now be later than
+    // before (bounded by whatever else is ahead of it in the queue, up to
+    // ~10 s per report item), which — same logic as the rmk_bridge_list
+    // residual noted in this file's own banner above — can only widen
+    // this already-accepted window, not narrow it. Still judged accepted,
+    // same as before; noting the shift rather than letting it go silent.
     esp_err_t uerr = rmk_bridge_unexpose_device(ieee);
     if (uerr != ESP_OK && uerr != ESP_ERR_NOT_FOUND) {
         ESP_LOGW(TAG_RMK, "device.rainmaker.remove ieee=0x%016llX: unexpose returned %s",
