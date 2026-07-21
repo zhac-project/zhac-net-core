@@ -171,17 +171,31 @@ void rmk_bridge_set_attr_writer(rmk_attr_write_fn fn);
 // 0 on a flag-off build.
 size_t rmk_bridge_device_count(void);
 
-// One row per currently-exposed device: `type` and `name` are borrowed
-// pointers into the SDK's own live device object (esp_rmaker_device_get_type
-// / _get_name) — valid only transiently (read and format into a reply
-// immediately; never retained past the call that produced them, since a
-// concurrent unexpose can free the underlying device at any time). Backs
-// `device.rainmaker.list` / `.add` / `.remove`'s reply. Returns the number
-// of rows written (<= cap). 0 on a flag-off build.
+// One row per currently-exposed device: `type` and `name` are OWNED
+// copies (Task 21 review fix, residual #1). They used to be borrowed
+// pointers into the SDK's own live device object — but rmk_bridge_
+// unexpose_device's teardown is now deferred onto the work queue (Task 21
+// row-1 fix), so the window during which a concurrent teardown could free
+// that object out from under a caller still holding a borrowed pointer
+// widened from near-immediate to however long the queue takes to drain.
+// A pointer copy alone would not have fixed this — it would just move the
+// same race to wherever the caller eventually dereferences it (the
+// original problem this whole review thread is about, one level up).
+// rmk_bridge_list() now copies the actual string DATA into these
+// caller-owned buffers while still holding its own lock, so the result is
+// safe to read (and retain) after the call returns, unlike the old
+// contract. Backs `device.rainmaker.list` / `.add` / `.remove`'s reply.
+// Returns the number of rows written (<= cap). 0 on a flag-off build.
 typedef struct {
-    uint64_t    ieee;
-    const char* type;   // e.g. "esp.device.lightbulb" (rmk_devtype_str())
-    const char* name;   // current RainMaker display name
+    uint64_t ieee;
+    char     type[32];   // e.g. "esp.device.lightbulb" (rmk_devtype_str()
+                          // — longest is "esp.device.temperature-sensor",
+                          // 30 chars + NUL)
+    char     name[30];   // current RainMaker display name — matches the
+                          // char[30] buffers this codebase already uses
+                          // for this exact string everywhere else
+                          // (main/api_rainmaker.cpp's `display`, main/
+                          // api_devices.cpp's `name`)
 } rmk_bridge_dev_info_t;
 size_t rmk_bridge_list(rmk_bridge_dev_info_t* out, size_t cap);
 

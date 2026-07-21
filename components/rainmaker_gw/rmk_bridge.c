@@ -884,29 +884,52 @@ size_t rmk_bridge_list(rmk_bridge_dev_info_t* out, size_t cap) {
 #if CONFIG_ZHAC_RAINMAKER_ENABLE
     if (!out || cap == 0) return 0;
 
-    uint64_t              ieees[RMK_MAX_DEVS];
-    esp_rmaker_device_t*  devs[RMK_MAX_DEVS];
-    size_t                n = 0;
-
+    // Task 21 review fix (residual #1) — this used to release reg_lock
+    // right after capturing each s_reg[i].device pointer, then call
+    // esp_rmaker_device_get_type()/_get_name() on those captured pointers
+    // UNLOCKED (the comment that used to sit here even flagged the risk
+    // and chose not to close it: "never call an esp_rmaker_* function
+    // while holding reg_lock() ... kept here too rather than assuming
+    // today's trivial implementation stays that way forever"). rmk_
+    // bridge_unexpose_device's teardown is now deferred (Task 21 row-1
+    // fix), so a concurrent unexpose racing that unlocked window has up
+    // to however long the work queue takes to drain — not the near-
+    // immediate window the old inline delete left — to free the exact
+    // device this loop is about to read through.
+    //
+    // Fix: hold reg_lock across the accessor calls too, and copy the
+    // resulting strings into out[]'s own buffers (rmk_bridge_dev_info_t
+    // is now char[]-owned, not const char*-borrowed — see its own doc
+    // comment in rmk_bridge.h) WHILE still holding the lock. Copying only
+    // the pointer under the lock would not have been enough — the same
+    // lesson rmk_bridge_on_attr_update's own fix already established:
+    // that just moves the race to wherever the caller dereferences the
+    // pointer next, unlocked. Copying the actual DATA in is what closes
+    // it. Verified from the vendored SDK source (esp_rmaker_device.c),
+    // not assumed: both esp_rmaker_device_get_type() and _get_name() are
+    // exactly what their names say — a NULL check plus a single struct-
+    // field dereference and return, no locking, no allocation, no
+    // work-queue calls — so holding reg_lock across them is cheap and
+    // safe, the same gating condition already established for esp_
+    // rmaker_work_queue_add_task in the OUT-path fix.
+    size_t n = 0;
     reg_lock();
     for (size_t i = 0; i < RMK_MAX_DEVS && n < cap; i++) {
         if (!s_reg[i].in_use) continue;
-        ieees[n] = s_reg[i].ieee;
-        devs[n]  = s_reg[i].device;
+        out[n].ieee = s_reg[i].ieee;
+
+        esp_rmaker_device_t* dev = s_reg[i].device;
+        const char* type_src = dev ? esp_rmaker_device_get_type(dev) : nullptr;
+        const char* name_src = dev ? esp_rmaker_device_get_name(dev) : nullptr;
+        strncpy(out[n].type, type_src ? type_src : "esp.device.other", sizeof(out[n].type) - 1);
+        out[n].type[sizeof(out[n].type) - 1] = '\0';
+        strncpy(out[n].name, name_src ? name_src : "", sizeof(out[n].name) - 1);
+        out[n].name[sizeof(out[n].name) - 1] = '\0';
+
         n++;
     }
     reg_unlock();
 
-    // esp_rmaker_device_get_type/_get_name are simple accessors, but this
-    // file's own convention (write-cb, rmk_bridge_on_attr_update) is to
-    // never call an esp_rmaker_* function while holding reg_lock() — kept
-    // here too rather than assuming today's trivial implementation stays
-    // that way forever.
-    for (size_t i = 0; i < n; i++) {
-        out[i].ieee = ieees[i];
-        out[i].type = devs[i] ? esp_rmaker_device_get_type(devs[i]) : "esp.device.other";
-        out[i].name = devs[i] ? esp_rmaker_device_get_name(devs[i]) : "";
-    }
     return n;
 #else
     (void)out; (void)cap;
@@ -934,14 +957,39 @@ void rmk_bridge_on_device_renamed(uint64_t ieee, const char* new_name) {
     reg_unlock();
     if (!dev) return;   // not exposed, or expose_device hasn't attached the SDK device yet
 
-    // Same "never call esp_rmaker_* while holding reg_lock()" discipline as
-    // the rest of this file — dev is a pointer into the SDK's own live
-    // object, safe to use unlocked here (worst case: a concurrent unexpose
-    // deletes it a moment later, and this update either lands just before
-    // that or is a harmless no-op against an object about to be torn down —
-    // the SDK does not document param updates against a mid-delete device as
-    // unsafe, and this path is not on any latency- or correctness-critical
-    // trigger).
+    // Task 21 review sweep (residual #1 fix pass) — this function was
+    // checked against the same capture-under-lock-then-use-after-unlock
+    // shape rmk_bridge_list() had, and found NOT trivially fixable by
+    // that same pattern, unlike rmk_bridge_list(). The difference: rmk_
+    // bridge_list's fix works because the DATA it ultimately needs (type/
+    // name strings) can be copied into caller-owned storage while still
+    // holding reg_lock, after which the SDK pointer itself is disposable.
+    // Here, the thing this function ultimately needs — a live esp_rmaker_
+    // param_t* handle to pass to esp_rmaker_param_update_and_report()
+    // below — is NOT copyable data; it IS the SDK pointer. Extending
+    // reg_lock over esp_rmaker_device_get_param_by_name() (confirmed
+    // trivial from source: NULL-check + bounded linked-list strcmp walk,
+    // no locking/allocation/work-queue calls — same gating condition as
+    // rmk_bridge_list's fix) would only move the exposed pointer from
+    // `dev` to `name_param` — not close anything, per the same lesson
+    // that fix's own comment documents ("a pointer copy would just move
+    // the same race downstream"). And esp_rmaker_param_update_and_report()
+    // itself cannot move under the lock either: it is the exact blocking
+    // call (up to ~10 s, esp_mqtt_client_publish) rmk_bridge_on_attr_
+    // update's own fix had to defer OFF a lock/task entirely — holding
+    // reg_lock across it here would stall every other reg_lock user
+    // (task_hap's on_attr_update included) for the same ~10 s.
+    //
+    // So this function carries the SAME pre-existing, widened-by-
+    // deferral risk class as the already-accepted rmk_bridge_write_cb UAF
+    // window (see that function; also documented in main/api_rainmaker.
+    // cpp next to its own call-site comment) — not newly introduced by
+    // this task, not closed by it either. A real fix would need the same
+    // work-queue-deferral redesign rmk_bridge_on_attr_update's OUT path
+    // got (package name_param + the new name into a work item, defer the
+    // update_and_report call itself), which is a different pattern from
+    // what closed rmk_bridge_list, and out of scope here. Reported, not
+    // fixed, per that instruction.
     esp_rmaker_param_t* name_param =
         esp_rmaker_device_get_param_by_name(dev, ESP_RMAKER_DEF_NAME_PARAM);
     if (!name_param) return;

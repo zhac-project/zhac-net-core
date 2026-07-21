@@ -59,38 +59,33 @@
 // api_device_rainmaker_remove below. No fix attempted — log-and-proceed,
 // flagged for the Gate-B watchlist.
 //
-// ── rmk_bridge_list() vs. deferred teardown — disclosed residual ─────────
-// (Task 21 review, second round.) Not fixed here — out of scope for that
-// review's specific ask (closing the report-vs-teardown race) — but
-// disclosed per its own instruction to document residuals honestly next
-// to this file's existing accepted write_cb UAF note, rather than let a
-// side effect of that fix go unmentioned.
+// ── rmk_bridge_list() vs. deferred teardown — CLOSED (was residual #1) ───
+// (Task 21 review, third round.) Previously disclosed here as an open
+// residual: rmk_bridge_list() captured each esp_rmaker_device_t* under
+// reg_lock, then called esp_rmaker_device_get_type()/_get_name() on those
+// captured pointers AFTER releasing the lock — the deferred teardown
+// (Task 21 row-1 fix) widened that window from near-immediate to
+// queue-drain duration, same as the write_cb note below. NOW FIXED:
+// rmk_bridge_list() holds reg_lock across the accessor calls too and
+// copies the resulting strings into rmk_bridge_dev_info_t's own
+// caller-owned buffers (now char[]-owned, not const char*-borrowed — see
+// that struct's doc comment in rmk_bridge.h) while still locked. Verified
+// from the vendored SDK source, not assumed: both accessors are a
+// NULL-check plus a single struct-field dereference and return — no
+// locking, no allocation, no work-queue calls — so this was safe and
+// cheap. See rmk_bridge_list()'s own comment for the full argument.
 //
-// components/rainmaker_gw/rmk_bridge.c's rmk_bridge_list() (backs device.
-// rainmaker.list/.add/.remove's reply) captures each esp_rmaker_device_t*
-// under reg_lock, then calls esp_rmaker_device_get_type()/_get_name() on
-// those captured pointers AFTER releasing the lock (that file's own
-// comment: "never call an esp_rmaker_* function while holding reg_lock()
-// ... kept here too rather than assuming today's trivial implementation
-// stays that way forever"). If a concurrent rmk_bridge_unexpose_device
-// for the same device races that unlocked window, its now-deferred
-// teardown could in principle free the device/param memory rmk_bridge_
-// list is about to read.
-//
-// This exact race existed BEFORE the Task 21 deferral too (the old inline
-// esp_rmaker_device_delete could already race rmk_bridge_list's own
-// unlocked window) — it is not new. What the deferral changed is the
-// WIDTH of the window: the old inline delete ran essentially immediately
-// after rmk_bridge_unexpose_device's own unlock (microseconds, pure
-// pointer/free() work); the new deferred teardown only runs once the
-// work-queue task drains it, which can now take as long as every report
-// item ahead of it in the queue — up to ~10 s each under a degraded
-// network. Same race, meaningfully wider window, more likely to actually
-// manifest in practice. Judged out of scope for a targeted UAF-in-the-
-// deferral fix; a real fix (the same reg_lock-across-the-unlocked-work
-// pattern used above, if esp_rmaker_device_get_type/_get_name turn out to
-// also be safe to call locked) is a reasonable follow-up, not attempted
-// here.
+// ── rmk_bridge_on_device_renamed() — swept, NOT fixable the same way ─────
+// (Task 21 review, third round — same sweep that closed rmk_bridge_list.)
+// This function has the same capture-under-lock-then-use-after-unlock
+// shape, but is NOT trivially fixable by the pattern that closed rmk_
+// bridge_list: the thing it ultimately needs unlocked — a live esp_
+// rmaker_param_t* handle for esp_rmaker_param_update_and_report(), the
+// same ~10 s-capable blocking call rmk_bridge_on_attr_update's own fix
+// had to defer off any lock — is not copyable data the way a type/name
+// string is. Same risk class as the write_cb window below, widened by
+// the same deferral, not closed. See rmk_bridge.c's own comment at that
+// function for the full argument.
 #include "sdkconfig.h"
 #include "api_handlers.h"
 #include "s3_internal.h"
@@ -236,7 +231,13 @@ static ApiStatus rmk_write_device_list(char* rsp_buf, size_t rsp_cap, size_t* rs
         w.raw("{\"ieee\":\"0x");
         w.fmt("%016llX", (unsigned long long)infos[i].ieee);
         w.raw("\",\"type\":\"");
-        w.raw(infos[i].type ? infos[i].type : "esp.device.other");
+        // infos[i].type is now an owned char[32] (Task 21 review fix,
+        // residual #1) that rmk_bridge_list() always populates — with the
+        // real type or its own "esp.device.other" fallback — never left
+        // empty, so the old `? :` null-check here was already dead code
+        // even before the struct changed shape, and -Werror=address
+        // correctly flags a fixed-size array as never NULL. Simplified.
+        w.raw(infos[i].type);
         w.raw("\"}");
     }
     w.raw("]}");
@@ -320,7 +321,13 @@ static esp_err_t rmk_expose_device_from_ieee(uint64_t ieee) {
     size_t ninfo = rmk_bridge_list(infos, RMK_MAX_DEVS);
     bool collide = false;
     for (size_t i = 0; i < ninfo; i++) {
-        if (infos[i].name && strcmp(infos[i].name, display) == 0) { collide = true; break; }
+        // infos[i].name is now an owned char[30] (Task 21 review fix,
+        // residual #1) — same reasoning as the .type simplification
+        // above: rmk_bridge_list() always populates it (possibly with
+        // "" for a null device, never leaves it unset), so the null-
+        // check was already dead code, and -Werror=address correctly
+        // flags a fixed-size array as never NULL.
+        if (strcmp(infos[i].name, display) == 0) { collide = true; break; }
     }
     if (collide) {
         char base[30];
