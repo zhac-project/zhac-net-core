@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+menu "ZHAC RainMaker bridge"
+
+config ZHAC_RAINMAKER_ENABLE
+    bool "Enable ESP RainMaker uplink bridge"
+    default n
+    help
+        Compile the rainmaker_gw component's real bridge logic and pull the
+        espressif/esp_rainmaker managed dependency (rules-gated in
+        main/idf_component.yml, so a flag-off build resolves zero new
+        components / managed_components entries). OFF (default):
+        rainmaker_gw's public API compiles to inert stubs that always
+        report RMK_ST_DISABLED — no esp_rainmaker code is linked.
+
+        Also requires the runtime uplink selector (zap_store's
+        zhac_uplink_get()) to be set to RainMaker before the bridge
+        actually does anything; this flag alone only controls what gets
+        COMPILED.
+
+config ZHAC_RAINMAKER_NODE_NAME
+    string "RainMaker node name"
+    depends on ZHAC_RAINMAKER_ENABLE
+    default "ZHAC"
+    help
+        Node name reported to the RainMaker cloud during claim/provisioning
+        (Task 13+).
+
+endmenu

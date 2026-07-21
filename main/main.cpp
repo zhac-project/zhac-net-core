@@ -42,6 +42,7 @@
 #include "groups_store.h"
 #include "task_stacks.h"
 #include "remote_client.h"  // inline no-op when Kconfig off
+#include "rainmaker_gw.h"
 
 static const char* TAG = "s3_main";
 
@@ -977,6 +978,13 @@ extern "C" void app_main() {
 
     // WiFi manager handles esp_netif_init() + esp_event_loop_create_default()
     wifi_mgr_init();
+
+    // RainMaker uplink bridge — must run after wifi_mgr_init(): it needs the
+    // default event loop + netif to already exist (P0 spike finding: RainMaker
+    // init before that runs against an uninitialized event loop). No-op
+    // unless CONFIG_ZHAC_RAINMAKER_ENABLE is set AND the persisted uplink
+    // selector (zap_store) is ZHAC_UPLINK_RAINMAKER.
+    rainmaker_gw_init();
 
     // Open hot-path NVS namespaces once and keep handles cached (S4)
     nvs_open("zhac_opt", NVS_READWRITE, &s_nvs_zhac_opt);  // best-effort; 0 means uncached

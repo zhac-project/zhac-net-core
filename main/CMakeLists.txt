@@ -48,6 +48,7 @@ idf_component_register(
         spiffs
         driver
         remote_client
+        rainmaker_gw
 )
 
 # F17 (FINDINGS.md): warnings-as-errors for first-party app code (warning-free
