@@ -148,6 +148,26 @@ ApiStatus api_device_rename(const char* body, size_t body_len,
 ApiStatus api_device_attr_set(const char* body, size_t body_len,
                                char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
+// Core of api_device_attr_set (Phase 4 extraction, Task 15) — takes
+// already-parsed/validated fields instead of a JSON body so a non-JSON
+// caller (Task 17's RainMaker param-write path) can drive the identical
+// SET_ATTRIBUTE→P4 pipeline. Builds HapSetAttrReq{ieee,ep,cluster,attr,
+// val,key}, runs the same 3000 ms SET_ATTRIBUTE roundtrip, and decodes
+// the ack's "ok" into *cmd_ok_out. Does not encode a reply body — that
+// stays the caller's job.
+//
+// Returns API_INTERNAL_ERROR (and leaves *cmd_ok_out untouched) if the
+// request failed to encode or the P4 roundtrip failed/timed out — no
+// reply is implied then, matching api_device_attr_set's original
+// early-return paths. Returns API_OK once an ack was received;
+// *cmd_ok_out reports whether the device accepted the command.
+//
+// `key` must already be validated to fit HapSetAttrReq::key (<=23 chars,
+// NUL-terminated) — this function does not re-check.
+ApiStatus device_attr_set_core(uint64_t ieee, const char* key, int32_t val,
+                                uint8_t ep, uint16_t cluster, uint16_t attr,
+                                bool* cmd_ok_out);
+
 // WS device.options.set / PUT /api/devices/{ieee} with sub="options" —
 // args {ieee, occupancy_timeout?, debounce_ms?, flood_protection?, throttle_ms?}.
 ApiStatus api_device_options_set(const char* body, size_t body_len,

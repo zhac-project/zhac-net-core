@@ -530,12 +530,74 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
     return API_OK;
 }
 
+// Core of `device.attr.set` — extracted from api_device_attr_set (Phase 4
+// refactor, Task 15) so a non-JSON caller (Task 17's RainMaker
+// param-write path) can drive the identical SET_ATTRIBUTE→P4 pipeline.
+// Builds the exact same HapSetAttrReq{ieee,ep,cluster,attr,val,key} the
+// JSON handler used to build inline, runs the same 3000 ms
+// SET_ATTRIBUTE roundtrip, and decodes the ack's "ok" field the same way.
+//
+// Does NOT touch a reply buffer — encoding {"ok":true} /
+// {"ok":false,"err":"..."} stays the caller's job; before this
+// extraction that encoding was simply the tail of api_device_attr_set
+// itself.
+//
+// Returns API_INTERNAL_ERROR, with *cmd_ok_out left untouched, if the
+// request failed to encode or the P4 roundtrip failed/timed out — this
+// mirrors api_device_attr_set's original early-return paths, which
+// produced no reply body either. Returns API_OK once an ack was
+// received; *cmd_ok_out then reports whether the device accepted the
+// command (false covers both an explicit ack "ok":false and an
+// unparsable/empty ack — same fallback the original code used).
+//
+// `key` must already be validated to fit HapSetAttrReq::key (<=23 chars,
+// NUL-terminated); this function does not re-check — the JSON handler's
+// parse/validate step still owns that bound check.
+extern "C" ApiStatus device_attr_set_core(uint64_t ieee, const char* key,
+                                           int32_t val, uint8_t ep,
+                                           uint16_t cluster, uint16_t attr,
+                                           bool* cmd_ok_out) {
+    HapSetAttrReq req{};
+    req.ieee    = ieee;
+    req.ep      = ep;
+    req.cluster = cluster;
+    req.attr    = attr;
+    req.val     = val;
+    strncpy(req.key, key, sizeof(req.key) - 1);
+
+    uint8_t hap_buf[160];
+    uint16_t hap_len = 0;
+    if (!hap_json_encode_set_attr(hap_buf, sizeof(hap_buf), &hap_len, req)) {
+        return API_INTERNAL_ERROR;
+    }
+
+    char ack_buf[64];
+    size_t ack_len = 0;
+    bool got_rsp = hap_roundtrip_v2(HapMsgType::SET_ATTRIBUTE,
+                                     hap_buf, hap_len,
+                                     ack_buf, sizeof(ack_buf), &ack_len, 3000);
+    if (!got_rsp) return API_INTERNAL_ERROR;
+    bool cmd_ok = false;
+    if (ack_len > 0) {
+        JsonDocument doc;
+        if (deserializeJson(doc, ack_buf, ack_len) == DeserializationError::Ok) {
+            cmd_ok = doc["ok"] | false;
+        }
+    }
+    *cmd_ok_out = cmd_ok;
+    return API_OK;
+}
+
 // WS `device.attr.set` — args {ieee, key, value, ep?, cluster?, attr?}.
 // `value` may be bool / integer / string; boolean/integer round-trip
 // through HapSetAttrReq.val directly. String values are numeric-parsed
 // (enum-name strings need a follow-up — HapSetAttrReq has no str field
 // today and the SET_ATTRIBUTE wire path is int-only). `val` is accepted
 // as a legacy alias for `value` so existing REST callers keep working.
+//
+// Post-parse behavior (build SET_ATTRIBUTE, HAP roundtrip, ack decode)
+// lives in device_attr_set_core (Phase 4 extraction, Task 15) — this
+// handler now only parses/validates the body and encodes the reply.
 extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
                                           char* rsp_buf, size_t rsp_cap,
                                           size_t* rsp_len) {
@@ -564,25 +626,12 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
     attr.cluster = doc["cluster"] | (uint16_t)0;
     attr.attr    = doc["attr"]    | (uint16_t)0;
 
-    uint8_t hap_buf[160];
-    uint16_t hap_len = 0;
-    if (!hap_json_encode_set_attr(hap_buf, sizeof(hap_buf), &hap_len, attr)) {
-        return API_INTERNAL_ERROR;
-    }
-
-    char ack_buf[64];
-    size_t ack_len = 0;
-    bool got_rsp = hap_roundtrip_v2(HapMsgType::SET_ATTRIBUTE,
-                                     hap_buf, hap_len,
-                                     ack_buf, sizeof(ack_buf), &ack_len, 3000);
-    if (!got_rsp) return API_INTERNAL_ERROR;
     bool cmd_ok = false;
-    if (ack_len > 0) {
-        JsonDocument doc;
-        if (deserializeJson(doc, ack_buf, ack_len) == DeserializationError::Ok) {
-            cmd_ok = doc["ok"] | false;
-        }
-    }
+    ApiStatus core_st = device_attr_set_core(attr.ieee, attr.key, attr.val,
+                                              attr.ep, attr.cluster, attr.attr,
+                                              &cmd_ok);
+    if (core_st != API_OK) return core_st;
+
     if (cmd_ok) {
         const size_t n = api_write_ok(rsp_buf, rsp_cap);
         if (rsp_len) *rsp_len = n;
