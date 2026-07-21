@@ -355,9 +355,14 @@ extern "C" ApiStatus api_uplink_get(const char* /*body*/, size_t /*body_len*/,
 // ── uplink.set {mode} ──────────────────────────────────────────────────
 // Orchestration matrix (design decision already made — SDK node cannot be
 // de-initialized once esp_rmaker_start() has run):
+//   mode:"rainmaker" on a flag-off build -> rejected with an "err" field
+//                                        BEFORE any side effect (no persist,
+//                                        no mqtt_gw_stop()) — see the
+//                                        #if !CONFIG_ZHAC_RAINMAKER_ENABLE
+//                                        block just below
 //   same mode                        -> no-op, reply current
 //   none/custom_mqtt -> custom_mqtt  -> start mqtt_gw
-//   any -> rainmaker                 -> mqtt_gw_stop() [explicit, pinned
+//   any -> rainmaker (flag-on only)  -> mqtt_gw_stop() [explicit, pinned
 //                                        review item] then rainmaker_gw_init()
 //                                        (late-init no-op if already run this
 //                                        boot — rainmaker_gw.c's Task 18
@@ -366,7 +371,8 @@ extern "C" ApiStatus api_uplink_get(const char* /*body*/, size_t /*body_len*/,
 //                                        agent is NOT touched (cannot be
 //                                        stopped)
 //   custom_mqtt -> none              -> mqtt_gw_stop()
-// zhac_uplink_set() always runs FIRST, before any of the above, for every
+// zhac_uplink_set() always runs FIRST, before any of the above (other than
+// the flag-off rainmaker rejection, which runs before even that), for every
 // real (non-no-op) transition.
 extern "C" ApiStatus api_uplink_set(const char* body, size_t body_len,
                                      char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
@@ -377,6 +383,32 @@ extern "C" ApiStatus api_uplink_set(const char* body, size_t body_len,
     zhac_uplink_t new_mode;
     if (!str_to_uplink(mode_str, &new_mode)) return API_BAD_REQUEST;
 
+#if !CONFIG_ZHAC_RAINMAKER_ENABLE
+    // Reject BEFORE any side effect on a flag-off build (post-merge review
+    // finding). The original cut of this function called zhac_uplink_set()
+    // and then mqtt_gw_stop() unconditionally, reaching the flag-off/
+    // flag-on split only afterward, inside the new_mode==RAINMAKER branch
+    // below — so a flag-off uplink.set{mode:"rainmaker"} tore down a
+    // WORKING custom_mqtt connection, started nothing (rainmaker_gw_init()
+    // is compiled out), and persisted a non-functional selector, stranding
+    // the device with no uplink at all until a manual recovery. This early
+    // return runs before zhac_uplink_get()/_set() or mqtt_gw_stop() are
+    // ever touched, so the existing uplink (persisted selector + live
+    // mqtt_gw state) is left exactly as it was. Compile-time guard, not a
+    // runtime rainmaker_gw_state()==RMK_ST_DISABLED check, for the same
+    // reason this used to be a compile-time split further down: DISABLED is
+    // ALSO the legitimate state on a flag-ON build before any claim
+    // attempt, so it is not a reliable "not compiled in" signal on its
+    // own — #if is unambiguous and cannot silently start lying if this
+    // function's call order ever changes.
+    if (new_mode == ZHAC_UPLINK_RAINMAKER) {
+        int n = snprintf(rsp_buf, rsp_cap,
+                         "{\"uplink\":\"rainmaker\",\"err\":\"rainmaker not compiled in\"}");
+        if (rsp_len) *rsp_len = (size_t)n;
+        return API_OK;
+    }
+#endif
+
     zhac_uplink_t old_mode = zhac_uplink_get();
     if (new_mode == old_mode) {
         int n = snprintf(rsp_buf, rsp_cap, "{\"uplink\":\"%s\"}", uplink_to_str(new_mode));
@@ -385,7 +417,9 @@ extern "C" ApiStatus api_uplink_set(const char* body, size_t body_len,
     }
 
     // Persist FIRST (design decision) — every branch below assumes
-    // zhac_uplink_get() already reflects new_mode.
+    // zhac_uplink_get() already reflects new_mode. Never reached for
+    // new_mode==RAINMAKER on a flag-off build (rejected above, before any
+    // of this runs).
     zhac_uplink_set(new_mode);
 
     if (old_mode == ZHAC_UPLINK_RAINMAKER) {
@@ -404,12 +438,16 @@ extern "C" ApiStatus api_uplink_set(const char* body, size_t body_len,
     }
 
     if (new_mode == ZHAC_UPLINK_RAINMAKER) {
+        // Only reachable on a flag-on build now — the flag-off case was
+        // rejected and returned above, before old_mode was even read, so
+        // mqtt_gw_stop() below never runs as a dead-end teardown with
+        // nothing to replace it.
+        //
         // MUST be the explicit call (pinned review item) — mqtt_gw_stop()
         // is cheap/idempotent even when mqtt wasn't running (old_mode ==
         // NONE); called unconditionally rather than trying to be clever
         // about old_mode.
         mqtt_gw_stop();
-#if CONFIG_ZHAC_RAINMAKER_ENABLE
         // Late init is safe: rainmaker_gw_init() was designed to run
         // post-wifi (long true by this point in boot) and is now
         // idempotent within one boot (rainmaker_gw.c's Task 18 reentrancy
@@ -418,19 +456,6 @@ extern "C" ApiStatus api_uplink_set(const char* body, size_t body_len,
         // this call is a logged no-op, not a double-init.
         rainmaker_gw_init();
         int n = snprintf(rsp_buf, rsp_cap, "{\"uplink\":\"rainmaker\"}");
-#else
-        // Compile-time gate chosen over a runtime rainmaker_gw_state()==
-        // RMK_ST_DISABLED check: DISABLED is ALSO the legitimate state on a
-        // flag-ON build before any claim attempt (or right after the
-        // persisted-uplink-mismatch early return inside
-        // rainmaker_gw_init()) — not a reliable "not compiled in" signal
-        // outside this exact call ordering. A compile-time #if is
-        // unambiguous and matches how rmk_bridge.c/rainmaker_gw.c gate
-        // their own bodies; it cannot silently start lying if this
-        // function's call order ever changes.
-        int n = snprintf(rsp_buf, rsp_cap,
-                         "{\"uplink\":\"rainmaker\",\"err\":\"rainmaker not compiled in\"}");
-#endif
         if (rsp_len) *rsp_len = (size_t)n;
         return API_OK;
     }
