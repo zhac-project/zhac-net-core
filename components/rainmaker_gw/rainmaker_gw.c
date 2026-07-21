@@ -33,6 +33,7 @@
 #include <cstring>
 
 #include "zap_store.h"
+#include "rmk_bridge.h"
 
 #include "esp_event.h"
 #include "esp_rmaker_core.h"
@@ -95,6 +96,7 @@ static void rmk_event_handler(void* arg, esp_event_base_t base, int32_t id, void
         case RMAKER_EVENT_USER_NODE_MAPPING_DONE:
             ESP_LOGI(TAG, "user-node mapping done — bridge READY");
             s_state = RMK_ST_READY;
+            rmk_bridge_attach();   // Task 16: start the shadow -> param OUT direction
             break;
         case RMAKER_EVENT_USER_NODE_MAPPING_RESET:
             ESP_LOGW(TAG, "user-node mapping reset — bridge UNASSOCIATED");
@@ -124,6 +126,7 @@ static void rmk_event_handler(void* arg, esp_event_base_t base, int32_t id, void
                 if (esp_rmaker_user_node_mapping_get_state() == ESP_RMAKER_USER_MAPPING_DONE) {
                     ESP_LOGI(TAG, "MQTT connected, mapping already done — READY");
                     s_state = RMK_ST_READY;
+                    rmk_bridge_attach();   // Task 16: idempotent — also reached on reconnect
                 } else {
                     ESP_LOGI(TAG, "MQTT connected — UNASSOCIATED, awaiting user-node mapping");
                     s_state = RMK_ST_UNASSOCIATED;
