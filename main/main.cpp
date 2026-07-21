@@ -43,6 +43,7 @@
 #include "task_stacks.h"
 #include "remote_client.h"  // inline no-op when Kconfig off
 #include "rainmaker_gw.h"
+#include "rmk_bridge.h"     // rmk_bridge_set_attr_writer (Task 17 DI wiring)
 
 static const char* TAG = "s3_main";
 
@@ -923,6 +924,29 @@ static void task_stack_mon(void*) {
     }
 }
 
+// ── RainMaker bridge IN: attr-writer adapter (Task 17) ──────────────────────
+// components/rainmaker_gw/rmk_bridge.c cannot #include this file's headers —
+// it lives in a component and must not depend on main/ (component/main
+// layering — see rmk_bridge.h's own comment on rmk_attr_write_fn). Wired
+// instead by dependency injection: rmk_bridge.h declares `rmk_attr_write_fn`,
+// a typedef mirroring device_attr_set_core's REAL signature (api_handlers.h,
+// Task 15) with exactly one substitution — device_attr_set_core returns
+// `ApiStatus` (a main/-only enum rmk_bridge.h cannot name without the same
+// layering violation), so the injected function returns plain esp_err_t
+// instead. This adapter is that thin, honest translation: ESP_OK iff the
+// core call itself succeeded, ESP_FAIL otherwise; *cmd_ok_out is forwarded
+// untouched so rmk_bridge_write_cb keeps the exact "transport failed" vs
+// "device NAK'd" distinction device_attr_set_core already provides —
+// nothing is collapsed or hidden in this adapter.
+static esp_err_t rmk_write_adapter(uint64_t ieee, const char* key,
+                                    int32_t val, uint8_t ep,
+                                    uint16_t cluster, uint16_t attr,
+                                    bool* cmd_ok_out) {
+    ApiStatus st = device_attr_set_core(ieee, key, val, ep, cluster, attr,
+                                         cmd_ok_out);
+    return (st == API_OK) ? ESP_OK : ESP_FAIL;
+}
+
 // Provided by metrics_mqtt.cpp — C linkage so main can forward-declare
 // without pulling in a tiny header.
 extern "C" void metrics_mqtt_publisher_start();
@@ -985,6 +1009,13 @@ extern "C" void app_main() {
     // unless CONFIG_ZHAC_RAINMAKER_ENABLE is set AND the persisted uplink
     // selector (zap_store) is ZHAC_UPLINK_RAINMAKER.
     rainmaker_gw_init();
+
+    // Wire the bridge IN direction (Task 17): register the real
+    // cloud->device write path. Safe/cheap to call unconditionally on a
+    // flag-off build too — rmk_bridge_set_attr_writer's flag-off half is a
+    // no-op stub (rmk_bridge.c) — so no #ifdef guard is needed at this
+    // call site.
+    rmk_bridge_set_attr_writer(rmk_write_adapter);
 
     // Open hot-path NVS namespaces once and keep handles cached (S4)
     nvs_open("zhac_opt", NVS_READWRITE, &s_nvs_zhac_opt);  // best-effort; 0 means uncached

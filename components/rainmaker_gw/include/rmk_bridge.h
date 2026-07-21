@@ -133,6 +133,36 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
 // sites. No-op if the flag is off.
 void rmk_bridge_attach(void);
 
+// ── Bridge IN: injected device-attr writer (Task 17) ─────────────────────
+// rmk_bridge.c lives in this component and must not #include main/'s
+// headers — but the real write path needs main/api_handlers.h's
+// device_attr_set_core (Task 15). Wired by dependency injection instead:
+// this typedef mirrors device_attr_set_core's REAL signature (which grew
+// beyond the RainMaker-bridge plan's original 4-arg sketch to carry
+// ep/cluster/attr plus an out-param for the ack "ok" bit) with exactly one
+// substitution — the return type. device_attr_set_core returns `ApiStatus`,
+// a main/-only enum this header cannot name without the same layering
+// violation, so the injected function returns plain esp_err_t instead.
+// main/main.cpp registers a thin adapter matching this exact typedef that
+// calls device_attr_set_core() and maps its ApiStatus onto ESP_OK/ESP_FAIL;
+// *cmd_ok_out is passed through untouched so the write-cb keeps the same
+// "transport failed" vs "device NAK'd" distinction the JSON handler has.
+typedef esp_err_t (*rmk_attr_write_fn)(uint64_t ieee, const char* key,
+                                       int32_t val, uint8_t ep,
+                                       uint16_t cluster, uint16_t attr,
+                                       bool* cmd_ok_out);
+
+// Register the real cloud -> device writer. Call unconditionally from
+// app_main() right after rainmaker_gw_init() (main.cpp) — safe/no-op on a
+// flag-off build: this setter is defined outside any #if so it always
+// links, and storing the pointer when the flag is off is harmless since
+// rmk_bridge_expose_device's own flag-off stub never registers a write-cb
+// with the SDK in the first place, so nothing would ever call it back. A
+// NULL fn (or never calling this setter) makes the write-cb fail closed
+// with ESP_ERR_INVALID_STATE rather than silently no-op — see
+// rmk_bridge.c.
+void rmk_bridge_set_attr_writer(rmk_attr_write_fn fn);
+
 #ifdef __cplusplus
 }
 #endif

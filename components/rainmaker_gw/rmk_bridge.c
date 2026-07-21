@@ -70,6 +70,21 @@
 // "who drains the queue" investigation are both moot (the queue is gone).
 // The registry mutex stays: expose/unexpose (Task 18, unknown thread) can
 // still race this direct-call read path exactly as before.
+//
+// ── Task 17 addendum — bridge IN (write path) ────────────────────────────
+// Replaces rmk_bridge_write_stub_cb (log-only, ack-and-forget) with a real
+// cloud -> device write: look up the target param by its SDK handle, run
+// the OUT path's kMap-driven conversion backwards (app value -> zhac raw),
+// call the injected device_attr_set_core adapter (dependency injection —
+// see rmk_bridge.h; this file must not #include main/'s headers), and on
+// success ack the app's OWN value (no re-conversion round-trip — the
+// existing anti-oscillation rule). On failure, SNAP-BACK: S3 keeps no
+// device-shadow store to read a ground-truth value from, so "truth" here
+// is this registry's own last_reported (the last value the OUT direction
+// is known to have reported), converted through the same zhac_to_rm_val()
+// the OUT handler itself uses — see rmk_bridge_write_cb below for the lock
+// discipline (registry lock is never held across the injected writer's
+// blocking, up to 3 s HAP roundtrip).
 #include "sdkconfig.h"
 #include "rmk_bridge.h"
 
@@ -136,6 +151,15 @@ static size_t          s_reg_count = 0;   // count of in_use, fully-committed
                                            // written only under reg_lock().
 static bool             s_attached = false;
 
+// Injected cloud->device writer (Task 17 — bridge IN direction). Set once,
+// synchronously, during app_main()'s single-threaded boot (main.cpp calls
+// rmk_bridge_set_attr_writer() right after rainmaker_gw_init(), long before
+// the RainMaker work-queue task could deliver a real write — the bridge
+// isn't even claimed/associated yet at that point), then only ever read —
+// no lock needed for this pointer, the same "pre-init single-threaded use"
+// reasoning s_reg_mtx itself relies on below.
+static rmk_attr_write_fn s_attr_writer = nullptr;
+
 // Guards s_reg[] against a concurrent Task-18 caller (expose/unexpose,
 // presumably driven off DEVICE_JOIN/DEVICE_LEAVE, possibly on a different
 // task than task_hap, which is what now drives rmk_bridge_on_attr_update
@@ -168,26 +192,166 @@ static RmkBridgeDev* free_slot_locked(void) {
     return nullptr;
 }
 
-// Log-only STUB write callback (architecture cut, Task 16 brief item 3):
-// Task 17 replaces this with a real zhc_adapter command dispatch. Mirrors
-// Task 13's rmk_write_cb byte-for-byte — ack the value straight back so a
-// phone-app toggle doesn't visually revert — but does NOT touch shadow or
-// Zigbee state, since there is no command path wired yet.
-static esp_err_t rmk_bridge_write_stub_cb(const esp_rmaker_device_t* device,
-                                          const esp_rmaker_param_t* param,
-                                          const esp_rmaker_param_val_t val,
-                                          void* priv_data,
-                                          esp_rmaker_write_ctx_t* ctx) {
-    (void)priv_data;
+// Lock held by caller. Finds the plan entry within a specific device (`d`,
+// itself obtained by the caller as the write-cb's priv_data — see
+// rmk_bridge_expose_device's esp_rmaker_device_create() call) whose SDK
+// param handle is `param`. Returns nullptr if `d`'s slot was reclaimed
+// (in_use false — a concurrent unexpose/on_device_gone raced us; `d` itself
+// is always safe to dereference, it's a slot inside the static, process-
+// lifetime s_reg[] array, never freed) or no param in it matches. Callers
+// treat both the same as "not writable" — mirrors the brief's own
+// `if (!p || !p->writable) return ESP_ERR_INVALID_ARG;`.
+static RmkBridgeParam* plan_by_handle(RmkBridgeDev* d, const esp_rmaker_param_t* param) {
+    if (!d->in_use) return nullptr;
+    for (size_t i = 0; i < d->param_count; i++)
+        if (d->params[i].handle == param) return &d->params[i];
+    return nullptr;
+}
+
+// device(zhac raw, shadow-style ×100-fixed-point-for-float convention) ->
+// app(esp_rmaker) conversion. Single source of truth for both directions:
+// the OUT handler (rmk_bridge_on_attr_update) and the write-cb's SNAP-BACK
+// path (Task 17 — "converted back app-side the same way the OUT path
+// does") both call this exact function so the two can never drift apart.
+static esp_rmaker_param_val_t zhac_to_rm_val(const rmk_param_t* plan, int32_t val) {
+    switch (plan->conv) {
+    case RMK_CONV_BRI:     return esp_rmaker_int(rmk_bri_to_rm(val));
+    case RMK_CONV_CCT:     return esp_rmaker_int(rmk_mired_to_kelvin(val));
+    case RMK_CONV_DIV100:  return esp_rmaker_float((float)rmk_div100(val));
+    case RMK_CONV_CONTACT: return esp_rmaker_bool(rmk_contact_to_rm(val != 0));
+    default:
+        return (plan->data_type == 'b') ? esp_rmaker_bool(val != 0)
+                                         : esp_rmaker_int(val);
+    }
+}
+
+// app(esp_rmaker) -> device(zhac raw) conversion for the write-cb — the
+// brief's own 3-way switch (RMK_CONV_BRI / RMK_CONV_CCT / default).
+// RMK_CONV_DIV100 and RMK_CONV_CONTACT never reach here: both only appear
+// on sensor-reading params (temperature/humidity/contact, rmk_typemap.c's
+// kMap) that come back from a real device as read-only, so
+// rmk_bridge_write_cb's `plan.writable` check below rejects a write to one
+// before this is ever called.
+static int32_t rm_to_zhac_val(const rmk_param_t* plan, const esp_rmaker_param_val_t* val) {
+    switch (plan->conv) {
+    case RMK_CONV_BRI: return rmk_bri_from_rm(val->val.i);
+    case RMK_CONV_CCT: return rmk_kelvin_to_mired(val->val.i);
+    default:
+        return (plan->data_type == 'b') ? (val->val.b ? 1 : 0) : val->val.i;
+    }
+}
+
+// Real cloud -> device write callback (Task 17, replaces the Task 16
+// log-only stub). Registered once per exposed device via
+// esp_rmaker_device_add_cb() in rmk_bridge_expose_device(); `priv_data` is
+// the RmkBridgeDev* the SDK was handed back at esp_rmaker_device_create()
+// time (esp_rmaker_core.h: "Pointer to the private data passed while
+// creating the device") — NOT esp_rmaker_device_add_cb()'s third argument,
+// which is actually the (unused, nullptr) read_cb.
+//
+// Runs on the RainMaker SDK's own work-queue task
+// (CONFIG_ESP_RMAKER_WORK_QUEUE_TASK_*) — blocking here for the injected
+// writer's up-to-3000 ms HAP roundtrip (brief §4) is acceptable: that task
+// exists to serialize exactly this kind of app-facing side effect and has
+// no other latency-sensitive job.
+static esp_err_t rmk_bridge_write_cb(const esp_rmaker_device_t* device,
+                                     const esp_rmaker_param_t* param,
+                                     const esp_rmaker_param_val_t val,
+                                     void* priv_data,
+                                     esp_rmaker_write_ctx_t* ctx) {
+    (void)device;
     (void)ctx;
-    ESP_LOGI(TAG, "WRITE-CB (stub, Task 17 pending) device=%s param=%s",
-             esp_rmaker_device_get_name(device),
-             esp_rmaker_param_get_name(param));
-    esp_rmaker_param_update_and_report((esp_rmaker_param_t*)param, val);
-    return ESP_OK;
+    RmkBridgeDev* d = (RmkBridgeDev*)priv_data;
+    if (!d) return ESP_ERR_INVALID_ARG;            // shouldn't happen — expose_device always passes `d`
+    if (!s_attr_writer) return ESP_ERR_INVALID_STATE;  // DI setter never called (see rmk_bridge.h)
+
+    // Copy out what we need under the lock, then release it BEFORE the
+    // (possibly blocking, up to 3 s) writer call below — never hold
+    // reg_lock() across an esp_rmaker_*/HAP roundtrip call (brief §4).
+    reg_lock();
+    RmkBridgeParam* bp = plan_by_handle(d, param);
+    if (!bp || !bp->plan.writable) {
+        reg_unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t    ieee = d->ieee;
+    rmk_param_t plan = bp->plan;   // struct copy — zhac_key etc. point at
+                                    // rmk_typemap.c's static string-literal
+                                    // table (RmkBridgeParam's own comment),
+                                    // so the copy never dangles even if this
+                                    // slot is torn down while we're unlocked.
+    reg_unlock();
+
+    int32_t zv = rm_to_zhac_val(&plan, &val);
+
+    // ep/cluster/attr: mirror api_device_attr_set's own SPA-omitted
+    // defaults (main/api_devices.cpp: doc["ep"]|0, doc["cluster"]|0,
+    // doc["attr"]|0) — 0/0/0 tells the P4 adapter to resolve the target by
+    // `key` alone (device_attr_set_core's own header comment: "key-based
+    // write; P4 adapter resolves by key"). The typemap's zhac_key strings
+    // are static literals <=11 chars (rmk_typemap.c's kMap), well under
+    // HapSetAttrReq::key's <=23-char precondition that device_attr_set_core
+    // does NOT re-validate.
+    bool cmd_ok = false;
+    esp_err_t err = s_attr_writer(ieee, plan.zhac_key, zv,
+                                  /*ep=*/0, /*cluster=*/0, /*attr=*/0,
+                                  &cmd_ok);
+
+    if (err == ESP_OK && cmd_ok) {
+        // Anti-oscillation: ack the app's OWN value, never a re-converted
+        // round-trip (Task 16/13 no-echo rule, brief line 35).
+        esp_rmaker_param_update_and_report((esp_rmaker_param_t*)param, val);
+
+        reg_lock();
+        // Re-validate: up to 3 s elapsed since the copy above — don't write
+        // through a stale pointer if this device/param was torn down
+        // meanwhile (same TOCTOU discipline as rmk_bridge_expose_device's
+        // own "reservation still ours" re-check).
+        RmkBridgeParam* bp2 = plan_by_handle(d, param);
+        if (bp2 && d->ieee == ieee) {
+            bp2->last_reported = zv;
+            bp2->has_last      = true;
+        }
+        reg_unlock();
+        return ESP_OK;
+    }
+
+    // SNAP-BACK: S3 keeps no device-shadow store, so "current truth" is
+    // this registry's last_reported — the last value the OUT direction is
+    // known to have reported for this param — converted the SAME way the
+    // OUT path does (zhac_to_rm_val, shared with rmk_bridge_on_attr_update).
+    // If no prior report exists yet (has_last==false: e.g. the very first
+    // write to a freshly-exposed param before any OUT-direction report has
+    // landed), report nothing — the app keeps showing its own optimistic
+    // value until a real report arrives. Acceptable per brief §3.
+    reg_lock();
+    RmkBridgeParam* bp3 = plan_by_handle(d, param);
+    bool has_snap = bp3 && bp3->has_last;
+    int32_t snap_raw = has_snap ? bp3->last_reported : 0;
+    reg_unlock();
+
+    if (has_snap) {
+        esp_rmaker_param_val_t snap_v = zhac_to_rm_val(&plan, snap_raw);
+        esp_rmaker_param_update_and_report((esp_rmaker_param_t*)param, snap_v);
+    }
+
+    ESP_LOGW(TAG, "write-cb ieee=0x%016llx key=%s FAILED (err=%s cmd_ok=%d)%s",
+             (unsigned long long)ieee, plan.zhac_key, esp_err_to_name(err),
+             (int)cmd_ok, has_snap ? " -- snapped back" : " -- no prior value, left as-is");
+    return (err != ESP_OK) ? err : ESP_FAIL;
 }
 
 #endif  // CONFIG_ZHAC_RAINMAKER_ENABLE
+
+// Task 17 DI setter — see rmk_bridge.h for the full rationale. Defined
+// outside the top #if so main.cpp can call it unconditionally at boot.
+void rmk_bridge_set_attr_writer(rmk_attr_write_fn fn) {
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+    s_attr_writer = fn;
+#else
+    (void)fn;
+#endif
+}
 
 esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
                                    const rmk_expose_t* ex, size_t n) {
@@ -216,7 +380,15 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
     rmk_param_t plan[RMK_MAX_PARAMS];
     size_t pc = rmk_build_params(t, ex, n, plan, RMK_MAX_PARAMS);
 
-    esp_rmaker_device_t* dev = esp_rmaker_device_create(name, rmk_devtype_str(t), nullptr);
+    // priv_data = this registry slot: the SDK hands it back verbatim to
+    // rmk_bridge_write_cb on every write for this device (esp_rmaker_core.h
+    // esp_rmaker_device_create() doc: "Pointer to the private data passed
+    // while creating the device") — NOT esp_rmaker_device_add_cb()'s third
+    // argument below, which is the (unused) read_cb. `d` is a slot inside
+    // the static, process-lifetime s_reg[] array, so this pointer stays
+    // valid to dereference even after a concurrent unexpose zeroes the
+    // slot's *contents* — see rmk_bridge_write_cb's own TOCTOU re-checks.
+    esp_rmaker_device_t* dev = esp_rmaker_device_create(name, rmk_devtype_str(t), d);
     if (!dev) {
         ESP_LOGE(TAG, "esp_rmaker_device_create failed for %s", name);
         reg_lock();
@@ -276,7 +448,10 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
     }
     if (primary) esp_rmaker_device_assign_primary_param(dev, primary);
 
-    esp_rmaker_device_add_cb(dev, rmk_bridge_write_stub_cb, nullptr);
+    // Task 17: real write-cb (was Task 16's log-only stub). Third arg is
+    // read_cb — always nullptr, the SDK never invokes one today (see
+    // esp_rmaker_device_read_cb_t's own doc in esp_rmaker_core.h).
+    esp_rmaker_device_add_cb(dev, rmk_bridge_write_cb, nullptr);
 
     bool added_to_node = false;
     const esp_rmaker_node_t* node = esp_rmaker_get_node();
@@ -421,16 +596,11 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
         bp->last_reported = val;
         bp->has_last = true;
 
-        switch (bp->plan.conv) {
-        case RMK_CONV_BRI:     v = esp_rmaker_int(rmk_bri_to_rm(val)); break;
-        case RMK_CONV_CCT:     v = esp_rmaker_int(rmk_mired_to_kelvin(val)); break;
-        case RMK_CONV_DIV100:  v = esp_rmaker_float((float)rmk_div100(val)); break;
-        case RMK_CONV_CONTACT: v = esp_rmaker_bool(rmk_contact_to_rm(val != 0)); break;
-        default:
-            v = (bp->plan.data_type == 'b') ? esp_rmaker_bool(val != 0)
-                                             : esp_rmaker_int(val);
-            break;
-        }
+        // Task 17 factored this conversion out to zhac_to_rm_val() so the
+        // write-cb's SNAP-BACK path (same conversion, opposite direction's
+        // report) shares the exact logic instead of a hand-copied
+        // duplicate that could silently drift from this one.
+        v = zhac_to_rm_val(&bp->plan, val);
         handle  = bp->handle;
         changed = true;
         break;   // zhac_key is unique within one device's param plan
