@@ -45,6 +45,15 @@ extern "C" void tg_gw_handle_settoken(const uint8_t*, uint16_t);
 extern "C" void tg_gw_handle_setchat (const uint8_t*, uint16_t);
 extern "C" void tg_gw_handle_send    (const uint8_t*, uint16_t);
 
+// Task 21 fix: rmk_bridge_on_device_gone() (called from DEVICE_LEAVE below)
+// only cleans up components/rainmaker_gw's in-memory registry — it cannot
+// touch main/api_rainmaker.cpp's persisted NVS exposed-set (g_table), which
+// lives in a different translation unit that the component layer must not
+// depend on. Without this, a device unpaired while exposed to RainMaker
+// stayed in the persisted set forever. Same forward-declare-at-call-site
+// pattern main.cpp already uses for rmk_boot_restore().
+extern "C" void rmk_on_device_gone(uint64_t ieee);   // main/api_rainmaker.cpp
+
 
 // Heartbeat liveness tracking. Updated by the on_frame HEARTBEAT branch,
 // polled by task_hap. Three consecutive missed intervals (15 s by default)
@@ -815,6 +824,12 @@ void task_hap(void*) {
                     // pass. Cheap no-op (flag-off stub, or ieee simply
                     // never exposed) — safe to call unconditionally.
                     rmk_bridge_on_device_gone(ieee);
+                    // Task 21 fix: also drop ieee from the persisted NVS
+                    // exposed-set (see the forward declaration's own
+                    // comment above) — the in-memory registry cleanup above
+                    // alone left a stale ieee in NVS forever. Same "cheap
+                    // no-op, safe unconditionally" contract.
+                    rmk_on_device_gone(ieee);
                     ws_event_broadcast("device.removed",
                                         reinterpret_cast<const char*>(f.payload),
                                         f.payload_len);

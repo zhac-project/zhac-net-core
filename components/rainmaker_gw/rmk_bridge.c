@@ -111,6 +111,11 @@
 #include "esp_rmaker_core.h"
 #include "esp_rmaker_standard_params.h"  // ESP_RMAKER_DEF_NAME_PARAM,
                                           // esp_rmaker_name_param_create()
+#include "esp_rmaker_work_queue.h"       // Task 21 fix: defer the OUT
+                                          // report off task_hap — see
+                                          // rmk_bridge_on_attr_update's own
+                                          // comment for why.
+#include <new>                            // std::nothrow
 
 static const char* TAG = "rmk_bridge";
 
@@ -562,12 +567,35 @@ bool rmk_bridge_active(void) {
 #endif
 }
 
+// Deferred-report payload for the work-queue hop in rmk_bridge_on_attr_
+// update below (Task 21 fix). Small, self-contained, freed by the work
+// function itself once it runs. Guarded like every other post-registry
+// declaration in this file (the shared #if block above closed before
+// rmk_bridge_set_attr_writer) — esp_rmaker_param_t/esp_rmaker_param_val_t
+// are only ever declared inside CONFIG_ZHAC_RAINMAKER_ENABLE, and both this
+// struct and rmk_report_work_fn are referenced only from
+// rmk_bridge_on_attr_update's own (already-guarded) body below.
+#if CONFIG_ZHAC_RAINMAKER_ENABLE
+struct RmkReportWork {
+    esp_rmaker_param_t*    handle;
+    esp_rmaker_param_val_t val;
+};
+
+static void rmk_report_work_fn(void* priv) {
+    RmkReportWork* w = static_cast<RmkReportWork*>(priv);
+    esp_rmaker_param_update_and_report(w->handle, w->val);
+    delete w;
+}
+#endif  // CONFIG_ZHAC_RAINMAKER_ENABLE
+
 // ── OUT handler: attr update -> converted, throttled param report ───────
 // Called directly (no event envelope, no queue, no dispatch task) from
 // main/hap_bridge.cpp's BULK_STATE_UPDATE handler — see this file's top
 // banner for why the event_bus path this used to run on never fired on
-// this target. Allocation-free: fixed-size registry scan, plain
-// integer/float math in rmk_typemap's conversions, no heap/string work.
+// this target. The registry scan/throttle/conversion below stays
+// allocation-free: fixed-size scan, plain integer/float math, no heap/
+// string work — see the Task 21 fix note near the bottom of this function
+// for the one part of the old behavior that changed.
 void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
                                uint8_t val_type, int32_t val) {
 #if CONFIG_ZHAC_RAINMAKER_ENABLE
@@ -612,11 +640,51 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
     }
     reg_unlock();
 
-    // esp_rmaker_param_update_and_report queues internally (brief's own
-    // note) — called outside the lock so the SDK's internal work (mutex/
-    // queue push into the RainMaker work-queue task) can never block a
-    // future registry access from another task.
-    if (changed && handle) esp_rmaker_param_update_and_report(handle, v);
+    // Task 21 fix: this used to call esp_rmaker_param_update_and_report()
+    // directly, right here, on whatever task called this function — i.e.
+    // task_hap (this function's own banner). The comment that used to sit
+    // here claimed that call "queues internally"; it does not. Traced
+    // through the actual vendored SDK sources (not assumed):
+    // esp_rmaker_param_update_and_report -> esp_rmaker_report_param_
+    // internal -> esp_rmaker_mqtt_publish -> esp_mqtt_glue_publish ->
+    // esp_mqtt_client_publish() — and THAT function's own header doc says
+    // outright: "This API might block for several seconds, either due to
+    // network timeout (10s) or if publishing payloads longer than internal
+    // buffer." A degraded (not yet cleanly disconnected) WiFi/AWS path can
+    // therefore stall the calling task for up to ~10 s PER changed
+    // attribute — and hap_bridge.cpp's BULK_STATE_UPDATE case calls this
+    // function once per attribute in the frame's `attrs` object, so one
+    // multi-attribute report can stall it for several times that. task_hap
+    // is the single dispatch point for every inbound HAP frame AND for
+    // waiter_deliver() (the reply mechanism every WS/REST hap_roundtrip_v2
+    // caller blocks on) — stalling it here is exactly the "bridge failure
+    // touches the LAN path" case the design's failure-mode table (spec
+    // section 6) forbids as an iron rule.
+    //
+    // Fix: hand the one blocking call off to the RainMaker SDK's own work-
+    // queue task (esp_rmaker_work_queue_add_task) instead of running it
+    // inline — the same task rmk_bridge_write_cb's bridge-IN direction
+    // already runs on (see that function's own comment), so this restores
+    // symmetry rather than inventing a new mechanism. The vendored
+    // work_queue.c enqueues with a 0-tick xQueueSend: it cannot itself
+    // block a caller, and a full 8-slot queue just fails fast (logged,
+    // dropped) instead of stalling anything. Ordering is preserved (FIFO
+    // queue, single consumer task) and the skip-unchanged throttle
+    // bookkeeping above is untouched — only the outbound SDK call itself
+    // moves off task_hap.
+    if (changed && handle) {
+        RmkReportWork* w = new (std::nothrow) RmkReportWork{handle, v};
+        if (!w) {
+            ESP_LOGW(TAG, "OOM deferring RainMaker report for key=%s — dropped", key);
+        } else {
+            esp_err_t qerr = esp_rmaker_work_queue_add_task(rmk_report_work_fn, w);
+            if (qerr != ESP_OK) {
+                ESP_LOGW(TAG, "work-queue full, dropping RainMaker report for key=%s (%s)",
+                         key, esp_err_to_name(qerr));
+                delete w;
+            }
+        }
+    }
 #else
     (void)ieee; (void)key; (void)val_type; (void)val;
 #endif

@@ -44,6 +44,18 @@ idf_component_register(
 # all. PRIVATE: no esp_rmaker_* type ever appears in rainmaker_gw.h.
 idf_component_optional_requires(PRIVATE espressif__esp_rainmaker)
 
+# rmaker_work_queue (Task 21 fix): rmk_bridge.c's OUT-direction report now
+# defers its one blocking esp_rmaker_* SDK call to the RainMaker work-queue
+# task via esp_rmaker_work_queue_add_task() instead of running it inline on
+# task_hap (see rmk_bridge_on_attr_update's own comment for the full
+# rationale). esp_rainmaker itself already depends on this component
+# transitively, but declaring it directly here — same
+# idf_component_optional_requires PRIVATE pattern as the line above, for
+# the same Kconfig-gated-resolution reason — is the correct/explicit thing
+# to depend on what is actually #included, not what happens to be reachable
+# through another component's own dependency graph.
+idf_component_optional_requires(PRIVATE espressif__rmaker_work_queue)
+
 # rainmaker_gw.c calls zap_store's zhac_uplink_get() to read the runtime
 # uplink selector. zap_store.h's include chain (zap_common.h: <cstdint>,
 # `enum class`, `static constexpr`) is C++-only syntax, and zap_store.cpp

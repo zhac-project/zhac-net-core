@@ -595,3 +595,33 @@ extern "C" ApiStatus api_device_rainmaker_remove(const char* body, size_t body_l
     schedule_republish();
     return rmk_write_device_list(rsp_buf, rsp_cap, rsp_len);
 }
+
+// ── DEVICE_LEAVE unpair hook (Task 21 audit fix) ─────────────────────────
+// Called unconditionally from main/hap_bridge.cpp's HapMsgType::DEVICE_LEAVE
+// case, right alongside the existing rmk_bridge_on_device_gone() (Task 16 —
+// that one only cleans up components/rainmaker_gw's in-memory registry; it
+// cannot touch g_table, which lives in this file, per this component's own
+// "no main/ headers" layering rule — see rmk_bridge.h's file banner).
+// Without this, a device unpaired from the Zigbee network entirely while
+// still exposed to RainMaker stayed in the persisted "zhac_rmk" NVS set
+// forever: every future boot's rmk_boot_restore() would re-attempt exposing
+// it, fail its GET_DEVICE_BY_ID fetch (harmlessly logged, per that
+// function's own "per-device failure, loop continues" contract — spec
+// section 6's stale-ieee row), and just burn a wasted ~5 s HAP timeout on
+// every single boot from then on, silently, forever.
+//
+// Mirrors api_device_rainmaker_remove's own persisted-set-drop + debounced
+// republish above, conditioned on the ieee having actually been a member:
+// DEVICE_LEAVE fires for EVERY departing device, exposed to RainMaker or
+// not, so an unconditional save+republish here would mean every ordinary
+// Zigbee unpair (the overwhelming common case, nothing to do with
+// RainMaker) pays an NVS write and a debounced cloud republish for no
+// reason — the same "cheap no-op unless there's real work" discipline
+// rmk_bridge_active()/rmk_bridge_on_device_gone() already follow.
+extern "C" void rmk_on_device_gone(uint64_t ieee) {
+    table_lock();
+    bool had = rmk_tbl_remove(&g_table, ieee);
+    if (had) rmk_store_save(&g_table);
+    table_unlock();
+    if (had) schedule_republish();
+}

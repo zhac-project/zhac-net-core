@@ -20,7 +20,11 @@ typedef struct { uint64_t ieee[RMK_MAX_DEVS]; size_t count; } RmkTable;
 // Ensure ieee is a member. Dedups (already-present -> true, no growth).
 // Returns false only when the table is full and ieee is not already present.
 bool   rmk_tbl_add(RmkTable* t, uint64_t ieee);
-// Remove ieee. Returns true iff it was present.
+// Remove ieee. Returns true iff it was present. Implemented as swap-with-
+// last (rmk_store.c) for O(1) removal without shifting the tail — survivor
+// ORDER IS NOT PRESERVED across a removal. Callers (rmk_boot_restore's
+// iteration, rmk_bridge_list's enumeration, etc.) must not assume the
+// table's iteration order is stable or matches insertion order.
 bool   rmk_tbl_remove(RmkTable* t, uint64_t ieee);
 // Returns true iff ieee is currently a member.
 bool   rmk_tbl_contains(const RmkTable* t, uint64_t ieee);
