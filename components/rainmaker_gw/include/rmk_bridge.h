@@ -116,13 +116,28 @@ bool rmk_bridge_active(void);
 //
 // No-op if ieee isn't currently exposed, if no exposed param matches
 // `key`, if `val_type` is VAL_STR/VAL_NONE (no exposed param is ever
-// string-typed), or if the bridge isn't RMK_ST_READY. Skip-unchanged
-// throttled against the last value reported for this (ieee, key). Runs
-// whatever thread the caller runs on (main/hap_bridge.cpp's task_hap) —
-// allocation-free, same discipline as before: the one esp_rmaker_* SDK
-// call happens outside this bridge's own registry lock.
+// string-typed), or if the bridge isn't RMK_ST_READY. Runs whatever thread
+// the caller runs on (main/hap_bridge.cpp's task_hap) — allocation-free,
+// same discipline as before: the one esp_rmaker_* SDK call happens outside
+// this bridge's own registry lock.
+//
+// `force` distinguishes the two callers by intent, because they must be
+// throttled differently against RainMaker's MQTT publish budget (1 token /
+// 5 s refill — see rmk_bridge.c):
+//   - force=false  REPORT path (hap_bridge.cpp's BULK_STATE_UPDATE hook,
+//     i.e. real device reports). Skip-unchanged throttled against the last
+//     value reported for this (ieee, key), AND — for continuous (non-bool)
+//     params like temperature/humidity/brightness — rate-limited to at most
+//     one report per CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S, so a chatty
+//     sensor cannot drain the budget and starve command reports (or trip the
+//     cloud's fair-use daily message cap).
+//   - force=true   COMMAND path (api_device_attr_set, i.e. a SPA/cloud-UI/
+//     REST write the user just made). Bypasses BOTH throttles: a user
+//     command must always re-assert to the cloud, even when last_reported
+//     has drifted from the cloud's actual state (a node reconnect resets the
+//     cloud param to its default while this registry keeps the old value).
 void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
-                               uint8_t val_type, int32_t val);
+                               uint8_t val_type, int32_t val, bool force);
 
 // Idempotent liveness marker — logs once that the bridge OUT direction is
 // live. Historically this subscribed to event_bus (see rmk_bridge.c's file

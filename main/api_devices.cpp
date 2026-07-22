@@ -598,29 +598,15 @@ extern "C" ApiStatus device_attr_set_core(uint64_t ieee, const char* key,
     }
     *cmd_ok_out = cmd_ok;
 
-    // Optimistic RainMaker report for LOCALLY-commanded changes.
-    //
-    // Many devices — notably the whole no-report Tuya class — never emit an
-    // attribute report after obeying a command, so the P4 sends no
-    // BULK_STATE_UPDATE and the bridge's OUT hook in hap_bridge.cpp never
-    // fires. Before this, a socket toggled from the SPA (or by a rule) stayed
-    // stale in the RainMaker app until the device happened to report on its
-    // own — measured at Gate B: 4 commanded transitions produced 0 frames and
-    // 0 reports. The local SPA hides this by flipping its own control
-    // optimistically client-side (see AttrBoolRow's localV); the cloud has no
-    // such trick, so the firmware has to tell it.
-    //
-    // This is the same optimistic contract, applied once at the single point
-    // every local write already funnels through. VAL_INT is passed because
-    // rmk_bridge_on_attr_update uses val_type ONLY to reject VAL_STR/VAL_NONE
-    // — the real conversion is driven by the param's own plan (data_type +
-    // rmk_conv_t), and `val` here is already the raw shadow-convention value.
-    // Compiles to a no-op stub when the RainMaker flag is off.
-    //
-    // Cloud-initiated writes reach here too (write_cb -> this core), which
-    // would double-report; the bridge's skip-unchanged check collapses the
-    // second one, so the duplicate is harmless.
-    if (cmd_ok) rmk_bridge_on_attr_update(ieee, key, VAL_INT, val);
+    // NOTE: the optimistic RainMaker report for locally-commanded changes is
+    // deliberately NOT here. This core is shared by two callers with opposite
+    // needs: the external command entry (api_device_attr_set) and the
+    // RainMaker write-cb path (rmk_bridge_write_cb -> s_attr_writer -> this
+    // core). The write-cb already reports its own value to RainMaker, so
+    // reporting here from that path too would double-publish — and doubling
+    // publishes is exactly what exhausts RainMaker's MQTT budget. The report
+    // now lives in api_device_attr_set (the external entry only), forced past
+    // the bridge throttle. See that call site and rmk_bridge_on_attr_update.
 
     return API_OK;
 }
@@ -668,6 +654,23 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
                                               attr.ep, attr.cluster, attr.attr,
                                               &cmd_ok);
     if (core_st != API_OK) return core_st;
+
+    // Optimistic RainMaker report for an externally-commanded change (this
+    // handler serves the SPA / cloud UI / REST). Many devices — the whole
+    // no-report Tuya class — emit no attribute report after obeying, so the
+    // P4 sends no BULK_STATE_UPDATE and the bridge's OUT hook never fires;
+    // without this the cloud stays stale (the LAN SPA hides it with a
+    // client-side optimistic flip, the cloud has no such trick). FORCED so it
+    // bypasses the bridge's skip-unchanged + rate-limit throttle: a user
+    // command must always re-assert, even when the bridge's last_reported has
+    // drifted from the cloud's actual state. Kept on this external entry — NOT
+    // in device_attr_set_core — because the RainMaker write-cb path also flows
+    // through core and already reports its own value; reporting from core too
+    // would double-publish and drain the MQTT budget. No-op stub when the
+    // RainMaker flag is off. VAL_INT because the bridge uses val_type only to
+    // reject VAL_STR/VAL_NONE; the real conversion is the param plan's job.
+    if (cmd_ok) rmk_bridge_on_attr_update(attr.ieee, attr.key, VAL_INT,
+                                          attr.val, /*force=*/true);
 
     if (cmd_ok) {
         const size_t n = api_write_ok(rsp_buf, rsp_cap);

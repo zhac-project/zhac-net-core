@@ -26,4 +26,25 @@ config ZHAC_RAINMAKER_NODE_NAME
         Node name reported to the RainMaker cloud during claim/provisioning
         (Task 13+).
 
+config ZHAC_RMK_MIN_REPORT_INTERVAL_S
+    int "Minimum seconds between RainMaker reports for a continuous param"
+    depends on ZHAC_RAINMAKER_ENABLE
+    default 30
+    range 5 600
+    help
+        Rate-limit for the bridge OUT direction on CONTINUOUS (non-boolean)
+        params — temperature, humidity, brightness, colour temperature. A
+        Zigbee sensor can report several times per second, but RainMaker's
+        MQTT budget only refills one publish token every 5 seconds (and the
+        public cloud deactivates nodes exceeding ~25,000 messages/day). Left
+        unthrottled, a chatty sensor drains the budget so command reports
+        (socket toggles etc.) get silently dropped — the exact "changes do
+        not apply on the RainMaker side" failure this guards against.
+
+        Only continuous params are throttled: boolean events (on/off,
+        occupancy, contact) and user commands (which set `force`) always
+        report immediately. Raise this if you bridge many continuous sensors;
+        lower it (min 5 s) if you need fresher telemetry and publish little
+        else. This does not affect the LAN Web UI, which is never throttled.
+
 endmenu

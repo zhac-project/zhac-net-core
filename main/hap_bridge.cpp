@@ -762,7 +762,12 @@ void task_hap(void*) {
                                     } else {
                                         continue;   // string/null/object — skip
                                     }
-                                    rmk_bridge_on_attr_update(rmk_ieee, kv.key().c_str(), val_type, ival);
+                                    // force=false: this is a real device
+                                    // report — skip-unchanged + continuous-
+                                    // param rate-limit apply (protects the
+                                    // RainMaker MQTT budget from sensor spam).
+                                    rmk_bridge_on_attr_update(rmk_ieee, kv.key().c_str(),
+                                                              val_type, ival, /*force=*/false);
                                 }
                             }
                         }

@@ -9,6 +9,27 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **RainMaker: local commands didn't reach the cloud ("changes do not apply
+  on the RainMaker side").** Two causes, both in the bridge OUT path. (1) The
+  `tuya_aiquality`-class sensor reported temperature/humidity several times a
+  second and — since each reading differs slightly — skip-unchanged never
+  deduped them, draining RainMaker's MQTT publish budget (refills only one
+  token per 5 s), so socket-command publishes were silently dropped. This also
+  explained the reported asymmetry (device→cloud is a *publish*, budgeted;
+  cloud→device is a *subscribe*, not) and risked the cloud's ~25k-messages/day
+  fair-use node deactivation. (2) The optimistic command report lived in the
+  shared `device_attr_set_core` and relied on skip-unchanged to collapse a
+  `write_cb`→core double-report — the same throttle then suppressed a user's
+  re-command whenever `last_reported` had drifted from the cloud (e.g. a node
+  reconnect resets the cloud param). Fix: `rmk_bridge_on_attr_update` gains a
+  `force` flag — user commands (now reported from `api_device_attr_set`, the
+  external entry only, killing the double-report) bypass both throttles and
+  always re-assert; continuous (non-boolean) sensor params gain a per-param
+  minimum report interval (`CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S`, default
+  30 s) so they can't exhaust the budget, while boolean events stay prompt.
+  Verified on hardware: idle sensor publishes 21→4 per 60 s, budget drops
+  6→0, cloud-UI toggles reflect in the RainMaker cloud within seconds.
+
 - **Collections command buttons (On/Off/Toggle/Identify) all sent "Off".**
   `api_group_cmd` read only `{key, val}` and hardcoded cluster 0, dropping the
   SPA's `{cluster, cmd}`, so every button defaulted to key="state"/val=0 = Off.

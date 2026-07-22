@@ -116,7 +116,16 @@
                                           // report off task_hap — see
                                           // rmk_bridge_on_attr_update's own
                                           // comment for why.
+#include "esp_timer.h"                    // esp_timer_get_time() — monotonic
+                                          // µs clock for the OUT rate-limit.
 #include <new>                            // std::nothrow
+
+// Continuous-param report rate-limit (see rmk_bridge_on_attr_update). Fall
+// back to 30 s if the Kconfig symbol is absent (e.g. a flag-off build where
+// the option is hidden behind `depends on ZHAC_RAINMAKER_ENABLE`).
+#ifndef CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S
+#define CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S 30
+#endif
 
 static const char* TAG = "rmk_bridge";
 
@@ -137,6 +146,9 @@ struct RmkBridgeParam {
                                          // report — the skip-unchanged
                                          // throttle key.
     bool                 has_last;      // false until the first report.
+    int64_t              last_report_us;// esp_timer_get_time() at the last
+                                         // report — the continuous-param
+                                         // rate-limit key. 0 until first.
 };
 
 struct RmkBridgeDev {
@@ -461,10 +473,11 @@ esp_err_t rmk_bridge_expose_device(uint64_t ieee, const char* name,
         esp_rmaker_device_add_param(dev, rp);
         if (p->primary) primary = rp;
 
-        built[built_count].plan          = *p;
-        built[built_count].handle        = rp;
-        built[built_count].last_reported = 0;
-        built[built_count].has_last      = false;
+        built[built_count].plan           = *p;
+        built[built_count].handle         = rp;
+        built[built_count].last_reported  = 0;
+        built[built_count].has_last       = false;
+        built[built_count].last_report_us = 0;
         built_count++;
     }
     if (primary) esp_rmaker_device_assign_primary_param(dev, primary);
@@ -718,7 +731,7 @@ static void rmk_report_work_fn(void* priv) {
 // string work — see the Task 21 fix note near the bottom of this function
 // for the one part of the old behavior that changed.
 void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
-                               uint8_t val_type, int32_t val) {
+                               uint8_t val_type, int32_t val, bool force) {
 #if CONFIG_ZHAC_RAINMAKER_ENABLE
     // Lifecycle guard (brief's original requirement, still applies).
     if (rainmaker_gw_state() != RMK_ST_READY) return;
@@ -730,6 +743,10 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
     // no exposed param is ever string-typed — so both are unconditional
     // skips, not just "unhandled conv".
     if (val_type == VAL_STR || val_type == VAL_NONE) return;
+
+    // Monotonic timestamp for the continuous-param rate-limit in the scan
+    // loop below; read before reg_lock (esp_timer_get_time is lock-free).
+    const int64_t now_us = esp_timer_get_time();
 
     // Task 21 review fix (2nd round) — the registry scan, the conversion,
     // the work-queue enqueue, AND the throttle bookkeeping commit ALL run
@@ -752,8 +769,25 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
         if (!bp->handle) break;   // this param's create() failed earlier
 
         // Skip-unchanged throttle on the RAW shadow value, checked before
-        // paying for the conversion below.
-        if (bp->has_last && bp->last_reported == val) break;
+        // paying for the conversion below. A forced command (user write)
+        // bypasses it: last_reported can have drifted from the cloud's real
+        // state (e.g. a node reconnect reset the cloud param to default), so
+        // re-asserting the same value is exactly what must happen.
+        if (!force && bp->has_last && bp->last_reported == val) break;
+
+        // Continuous-param rate-limit. A Zigbee sensor can report several
+        // times per second; each report is an MQTT publish, and RainMaker's
+        // budget only refills one token every 5 s, so an unthrottled sensor
+        // drains it and command reports get silently dropped (and the cloud's
+        // fair-use policy deactivates nodes over ~25k messages/day). Cap
+        // non-bool params to one report per CONFIG_ZHAC_RMK_MIN_REPORT_
+        // INTERVAL_S. Boolean events (state/occupancy/contact) and forced
+        // commands are never rate-limited — infrequent, must land promptly.
+        if (!force && bp->plan.data_type != 'b' && bp->has_last &&
+            (now_us - bp->last_report_us) <
+                (int64_t)CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S * 1000000) {
+            break;
+        }
 
         // Task 17 factored this conversion out to zhac_to_rm_val() so the
         // write-cb's SNAP-BACK path (same conversion, opposite direction's
@@ -831,8 +865,11 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
         } else {
             esp_err_t qerr = esp_rmaker_work_queue_add_task(rmk_report_work_fn, w);
             if (qerr == ESP_OK) {
-                target->last_reported = val;
-                target->has_last      = true;
+                target->last_reported  = val;
+                target->has_last       = true;
+                target->last_report_us = now_us;  // rate-limit clock: measured
+                                                   // from the last enqueued
+                                                   // report (command or sensor)
             } else {
                 ESP_LOGW(TAG, "work-queue full, dropping RainMaker report for key=%s (%s)",
                          key, esp_err_to_name(qerr));
@@ -842,7 +879,7 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
     }
     reg_unlock();
 #else
-    (void)ieee; (void)key; (void)val_type; (void)val;
+    (void)ieee; (void)key; (void)val_type; (void)val; (void)force;
 #endif
 }
 
