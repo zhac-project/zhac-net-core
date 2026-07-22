@@ -37,6 +37,17 @@ constexpr const char* kRemoteAllowedCmds[] = {
     // Groups
     "group.list", "group.create", "group.get", "group.update",
     "group.delete", "group.cmd",
+    // RainMaker bridge (Task 18) — reads + recoverable mutations, matching
+    // the group.*/device.bind bar: exposing/unexposing a device to
+    // RainMaker (add/remove) and starting an association handshake
+    // (assoc.set) are all reversible from the app/API with no orphan or
+    // destructive-reset risk, same as device.bind or group.delete.
+    // uplink.set is deliberately NOT here — see kRemotePrivilegedCmds
+    // below: it is a fundamental cloud-uplink mode switch (can force a
+    // reboot_required state) closer in kind to settings.set/wifi.connect
+    // than to a routine device-management action.
+    "uplink.get", "rainmaker.status", "rainmaker.assoc.set",
+    "device.rainmaker.list", "device.rainmaker.add", "device.rainmaker.remove",
 };
 
 // F9 (FINDINGS.md): privileged ops the cloud channel must NOT reach by
@@ -50,6 +61,7 @@ constexpr const char* kRemotePrivilegedCmds[] = {
     "ota.s3", "ota.p4", "zigbee.reset",
     "script.run", "script.write",
     "device.delete", "settings.set", "system.token.rotate",
+    "uplink.set",
 };
 
 constexpr const char* kRemoteAllowedEvents[] = {

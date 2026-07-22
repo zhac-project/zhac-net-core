@@ -28,6 +28,15 @@
 #include "api_handlers.h"
 #include "metrics/metrics_macros.h"
 #include "task_stacks.h"
+#include "rmk_bridge.h"   // Task 16 fix: BULK_STATE_UPDATE is the real S3
+                          // fan-out for device state (device_shadow/
+                          // event_bus are never fed on this target — see
+                          // rmk_bridge.c's file banner). rainmaker_gw
+                          // is already a REQUIRES of this "main" component
+                          // (main.cpp includes rainmaker_gw.h), so
+                          // rmk_bridge.h — same component, same
+                          // INCLUDE_DIRS — needs no new CMake dependency.
+#include <cmath>          // lroundf() — VAL_FLOAT reconstruction below
 
 static const char* TAG = "hap_bridge";
 
@@ -35,6 +44,15 @@ static const char* TAG = "hap_bridge";
 extern "C" void tg_gw_handle_settoken(const uint8_t*, uint16_t);
 extern "C" void tg_gw_handle_setchat (const uint8_t*, uint16_t);
 extern "C" void tg_gw_handle_send    (const uint8_t*, uint16_t);
+
+// Task 21 fix: rmk_bridge_on_device_gone() (called from DEVICE_LEAVE below)
+// only cleans up components/rainmaker_gw's in-memory registry — it cannot
+// touch main/api_rainmaker.cpp's persisted NVS exposed-set (g_table), which
+// lives in a different translation unit that the component layer must not
+// depend on. Without this, a device unpaired while exposed to RainMaker
+// stayed in the persisted set forever. Same forward-declare-at-call-site
+// pattern main.cpp already uses for rmk_boot_restore().
+extern "C" void rmk_on_device_gone(uint64_t ieee);   // main/api_rainmaker.cpp
 
 
 // Heartbeat liveness tracking. Updated by the on_frame HEARTBEAT branch,
@@ -682,6 +700,76 @@ void task_hap(void*) {
                                     }
                                 }
                             }
+
+                            // Task 16 fix: RainMaker bridge OUT direction.
+                            // This BULK_STATE_UPDATE frame — not
+                            // device_shadow/event_bus, which are never fed
+                            // on S3 (see rmk_bridge.c's file banner) — is
+                            // the real per-attribute fan-out. Gate the
+                            // whole per-attribute walk behind the one
+                            // cheap rmk_bridge_active() check so a
+                            // non-RainMaker build, or one with zero
+                            // exposed devices, pays nothing beyond that
+                            // call (flag-off: always false, no-op stub).
+                            if (ieee_str && ieee_str[0] && rmk_bridge_active()) {
+                                uint64_t rmk_ieee = parse_ieee(ieee_str);
+                                JsonObjectConst attrs = doc["attrs"];
+                                for (JsonPairConst kv : attrs) {
+                                    JsonVariantConst v = kv.value();
+                                    uint8_t val_type;
+                                    int32_t ival;
+                                    if (v.is<bool>()) {
+                                        val_type = VAL_BOOL;
+                                        ival = v.as<bool>() ? 1 : 0;
+                                    } else if (v.is<int32_t>()) {
+                                        // KNOWN, VERIFIED RESIDUAL AMBIGUITY
+                                        // (see task-16 fix report): this
+                                        // wire shape carries no explicit
+                                        // val_type tag, and a whole-number
+                                        // VAL_FLOAT attribute serializes
+                                        // without a decimal point (traced
+                                        // through the vendored
+                                        // components/arduinojson v7.4.3
+                                        // TextFormatter::writeFloat: the
+                                        // fractional digits are only
+                                        // emitted when the decomposed
+                                        // remainder is nonzero) — such a
+                                        // value is wire-indistinguishable
+                                        // from a genuine integer and lands
+                                        // here, reported un-scaled instead
+                                        // of ×100. Narrow and one-
+                                        // directional: a genuine integer
+                                        // (brightness/color_temp/state) is
+                                        // always encoded via setInteger()
+                                        // and can never spuriously tag as
+                                        // float, so this branch is only
+                                        // ever wrong for an exact-whole-
+                                        // unit float reading (display
+                                        // value error, not a crash).
+                                        val_type = VAL_INT;
+                                        ival = v.as<int32_t>();
+                                    } else if (v.is<float>()) {
+                                        // Reconstruct the raw shadow ×100
+                                        // convention rmk_bridge_on_attr_
+                                        // update expects for VAL_FLOAT —
+                                        // the wire value here is already
+                                        // real/unscaled
+                                        // (hap_json_encode_device_attr_
+                                        // update: `attrs[key] =
+                                        // (float)int_val / 100.0f`).
+                                        val_type = VAL_FLOAT;
+                                        ival = (int32_t)lroundf(v.as<float>() * 100.0f);
+                                    } else {
+                                        continue;   // string/null/object — skip
+                                    }
+                                    // force=false: this is a real device
+                                    // report — skip-unchanged + continuous-
+                                    // param rate-limit apply (protects the
+                                    // RainMaker MQTT budget from sensor spam).
+                                    rmk_bridge_on_attr_update(rmk_ieee, kv.key().c_str(),
+                                                              val_type, ival, /*force=*/false);
+                                }
+                            }
                         }
                     }
                     break;
@@ -736,6 +824,17 @@ void task_hap(void*) {
                     uint64_t ieee = 0;
                     hap_json_decode_device_join(f.payload, f.payload_len, &ieee);
                     ESP_LOGI(TAG, "DEVICE_LEAVE ieee=0x%016llX", (unsigned long long)ieee);
+                    // Task 16 fix: pulls the RainMaker unpair cleanup
+                    // forward from Task 18's own registry-reconciliation
+                    // pass. Cheap no-op (flag-off stub, or ieee simply
+                    // never exposed) — safe to call unconditionally.
+                    rmk_bridge_on_device_gone(ieee);
+                    // Task 21 fix: also drop ieee from the persisted NVS
+                    // exposed-set (see the forward declaration's own
+                    // comment above) — the in-memory registry cleanup above
+                    // alone left a stale ieee in NVS forever. Same "cheap
+                    // no-op, safe unconditionally" contract.
+                    rmk_on_device_gone(ieee);
                     ws_event_broadcast("device.removed",
                                         reinterpret_cast<const char*>(f.payload),
                                         f.payload_len);

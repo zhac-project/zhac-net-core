@@ -94,4 +94,13 @@ ZHAC_API_ROUTE("remote.connect",    api_remote_connect,    POST, "/api/remote/co
 ZHAC_API_ROUTE("remote.disconnect", api_remote_disconnect, POST, "/api/remote/disconnect")
 #endif
 
+// ── RainMaker bridge (Task 18) — all rows work on a flag-off build ────
+ZHAC_API_ROUTE("uplink.get",              api_uplink_get,              GET,  "/api/uplink/get")
+ZHAC_API_ROUTE("uplink.set",              api_uplink_set,              POST, "/api/uplink/set")
+ZHAC_API_ROUTE("rainmaker.status",        api_rainmaker_status,        GET,  "/api/rainmaker/status")
+ZHAC_API_ROUTE("rainmaker.assoc.set",     api_rainmaker_assoc_set,     POST, "/api/rainmaker/assoc/set")
+ZHAC_API_ROUTE("device.rainmaker.list",   api_device_rainmaker_list,   GET,  "/api/device/rainmaker/list")
+ZHAC_API_ROUTE("device.rainmaker.add",    api_device_rainmaker_add,    POST, "/api/device/rainmaker/add")
+ZHAC_API_ROUTE("device.rainmaker.remove", api_device_rainmaker_remove, POST, "/api/device/rainmaker/remove")
+
 #undef ZHAC_API_ROUTE

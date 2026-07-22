@@ -14,6 +14,7 @@
 #include "ws_server.h"
 #include "mqtt_gw.h"
 #include "wifi_mgr.h"
+#include "rmk_bridge.h"   // rmk_bridge_on_device_renamed (Task 18)
 #include "ArduinoJson.h"
 #include <cstdio>
 #include <cstring>
@@ -523,10 +524,90 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
                            rsp.get(), kDevInfoRspCap, &got, 5000)) {
         return API_INTERNAL_ERROR;
     }
+
+    // Task 18: keep an exposed RainMaker device's in-app display name in
+    // sync with a ZHAC-side rename, so the phone app doesn't show a stale
+    // name until the next reboot/re-expose. Cheap + safe to call
+    // unconditionally (no-op if ieee isn't exposed or the flag is off) —
+    // same "always call, flag-off stub is a no-op" convention as
+    // rmk_bridge_on_device_gone(), already wired at the DEVICE_LEAVE site
+    // (Task 16) and NOT duplicated here. `name` is already UTF-8-sanitized
+    // above (utf8_safe_copy).
+    rmk_bridge_on_device_renamed(ieee, name);
+
     size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
     memcpy(rsp_buf, rsp.get(), n);
     rsp_buf[n] = '\0';
     if (rsp_len) *rsp_len = n;
+    return API_OK;
+}
+
+// Core of `device.attr.set` — extracted from api_device_attr_set (Phase 4
+// refactor, Task 15) so a non-JSON caller (Task 17's RainMaker
+// param-write path) can drive the identical SET_ATTRIBUTE→P4 pipeline.
+// Builds the exact same HapSetAttrReq{ieee,ep,cluster,attr,val,key} the
+// JSON handler used to build inline, runs the same 3000 ms
+// SET_ATTRIBUTE roundtrip, and decodes the ack's "ok" field the same way.
+//
+// Does NOT touch a reply buffer — encoding {"ok":true} /
+// {"ok":false,"err":"..."} stays the caller's job; before this
+// extraction that encoding was simply the tail of api_device_attr_set
+// itself.
+//
+// Returns API_INTERNAL_ERROR, with *cmd_ok_out left untouched, if the
+// request failed to encode or the P4 roundtrip failed/timed out — this
+// mirrors api_device_attr_set's original early-return paths, which
+// produced no reply body either. Returns API_OK once an ack was
+// received; *cmd_ok_out then reports whether the device accepted the
+// command (false covers both an explicit ack "ok":false and an
+// unparsable/empty ack — same fallback the original code used).
+//
+// `key` must already be validated to fit HapSetAttrReq::key (<=23 chars,
+// NUL-terminated); this function does not re-check — the JSON handler's
+// parse/validate step still owns that bound check.
+extern "C" ApiStatus device_attr_set_core(uint64_t ieee, const char* key,
+                                           int32_t val, uint8_t ep,
+                                           uint16_t cluster, uint16_t attr,
+                                           bool* cmd_ok_out) {
+    HapSetAttrReq req{};
+    req.ieee    = ieee;
+    req.ep      = ep;
+    req.cluster = cluster;
+    req.attr    = attr;
+    req.val     = val;
+    strncpy(req.key, key, sizeof(req.key) - 1);
+
+    uint8_t hap_buf[160];
+    uint16_t hap_len = 0;
+    if (!hap_json_encode_set_attr(hap_buf, sizeof(hap_buf), &hap_len, req)) {
+        return API_INTERNAL_ERROR;
+    }
+
+    char ack_buf[64];
+    size_t ack_len = 0;
+    bool got_rsp = hap_roundtrip_v2(HapMsgType::SET_ATTRIBUTE,
+                                     hap_buf, hap_len,
+                                     ack_buf, sizeof(ack_buf), &ack_len, 3000);
+    if (!got_rsp) return API_INTERNAL_ERROR;
+    bool cmd_ok = false;
+    if (ack_len > 0) {
+        JsonDocument doc;
+        if (deserializeJson(doc, ack_buf, ack_len) == DeserializationError::Ok) {
+            cmd_ok = doc["ok"] | false;
+        }
+    }
+    *cmd_ok_out = cmd_ok;
+
+    // NOTE: the optimistic RainMaker report for locally-commanded changes is
+    // deliberately NOT here. This core is shared by two callers with opposite
+    // needs: the external command entry (api_device_attr_set) and the
+    // RainMaker write-cb path (rmk_bridge_write_cb -> s_attr_writer -> this
+    // core). The write-cb already reports its own value to RainMaker, so
+    // reporting here from that path too would double-publish — and doubling
+    // publishes is exactly what exhausts RainMaker's MQTT budget. The report
+    // now lives in api_device_attr_set (the external entry only), forced past
+    // the bridge throttle. See that call site and rmk_bridge_on_attr_update.
+
     return API_OK;
 }
 
@@ -536,6 +617,10 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
 // (enum-name strings need a follow-up — HapSetAttrReq has no str field
 // today and the SET_ATTRIBUTE wire path is int-only). `val` is accepted
 // as a legacy alias for `value` so existing REST callers keep working.
+//
+// Post-parse behavior (build SET_ATTRIBUTE, HAP roundtrip, ack decode)
+// lives in device_attr_set_core (Phase 4 extraction, Task 15) — this
+// handler now only parses/validates the body and encodes the reply.
 extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
                                           char* rsp_buf, size_t rsp_cap,
                                           size_t* rsp_len) {
@@ -564,25 +649,29 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
     attr.cluster = doc["cluster"] | (uint16_t)0;
     attr.attr    = doc["attr"]    | (uint16_t)0;
 
-    uint8_t hap_buf[160];
-    uint16_t hap_len = 0;
-    if (!hap_json_encode_set_attr(hap_buf, sizeof(hap_buf), &hap_len, attr)) {
-        return API_INTERNAL_ERROR;
-    }
-
-    char ack_buf[64];
-    size_t ack_len = 0;
-    bool got_rsp = hap_roundtrip_v2(HapMsgType::SET_ATTRIBUTE,
-                                     hap_buf, hap_len,
-                                     ack_buf, sizeof(ack_buf), &ack_len, 3000);
-    if (!got_rsp) return API_INTERNAL_ERROR;
     bool cmd_ok = false;
-    if (ack_len > 0) {
-        JsonDocument doc;
-        if (deserializeJson(doc, ack_buf, ack_len) == DeserializationError::Ok) {
-            cmd_ok = doc["ok"] | false;
-        }
-    }
+    ApiStatus core_st = device_attr_set_core(attr.ieee, attr.key, attr.val,
+                                              attr.ep, attr.cluster, attr.attr,
+                                              &cmd_ok);
+    if (core_st != API_OK) return core_st;
+
+    // Optimistic RainMaker report for an externally-commanded change (this
+    // handler serves the SPA / cloud UI / REST). Many devices — the whole
+    // no-report Tuya class — emit no attribute report after obeying, so the
+    // P4 sends no BULK_STATE_UPDATE and the bridge's OUT hook never fires;
+    // without this the cloud stays stale (the LAN SPA hides it with a
+    // client-side optimistic flip, the cloud has no such trick). FORCED so it
+    // bypasses the bridge's skip-unchanged + rate-limit throttle: a user
+    // command must always re-assert, even when the bridge's last_reported has
+    // drifted from the cloud's actual state. Kept on this external entry — NOT
+    // in device_attr_set_core — because the RainMaker write-cb path also flows
+    // through core and already reports its own value; reporting from core too
+    // would double-publish and drain the MQTT budget. No-op stub when the
+    // RainMaker flag is off. VAL_INT because the bridge uses val_type only to
+    // reject VAL_STR/VAL_NONE; the real conversion is the param plan's job.
+    if (cmd_ok) rmk_bridge_on_attr_update(attr.ieee, attr.key, VAL_INT,
+                                          attr.val, /*force=*/true);
+
     if (cmd_ok) {
         const size_t n = api_write_ok(rsp_buf, rsp_cap);
         if (rsp_len) *rsp_len = n;

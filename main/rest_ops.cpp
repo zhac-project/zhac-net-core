@@ -677,6 +677,112 @@ static esp_err_t handle_post_auth_password(httpd_req_t* req) {
     return ESP_OK;
 }
 
+// ── RainMaker bridge (Task 18) ────────────────────────────────────────────
+// Simple (non-URI-parameterized) routes — same wrapper shape as the /api/wifi
+// and /api/settings handlers above: REQUIRE_AUTH, recv the body (POST only),
+// call the api_* handler, translate ApiStatus to an HTTP status.
+esp_err_t handle_get_uplink(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char buf[64];
+    return rest_api_reply(req, api_uplink_get, nullptr, 0, buf, sizeof(buf), "uplink");
+}
+
+esp_err_t handle_post_uplink(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char body[64] = {};
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;   // rest_body_recv drained + sent 413/400
+    char rsp[128];
+    size_t rsp_len = 0;
+    ApiStatus st = api_uplink_set(body, (size_t)received, rsp, sizeof(rsp), &rsp_len);
+    if (st == API_BAD_REQUEST) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid uplink mode");
+        return ESP_OK;
+    }
+    if (st != API_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "uplink set");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, rsp, (ssize_t)rsp_len);
+    return ESP_OK;
+}
+
+esp_err_t handle_get_rainmaker_status(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char buf[192];
+    return rest_api_reply(req, api_rainmaker_status, nullptr, 0, buf, sizeof(buf), "rainmaker status");
+}
+
+esp_err_t handle_post_rainmaker_assoc(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char body[256] = {};
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;
+    char rsp[32];
+    size_t rsp_len = 0;
+    ApiStatus st = api_rainmaker_assoc_set(body, (size_t)received, rsp, sizeof(rsp), &rsp_len);
+    if (st == API_BAD_REQUEST) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request");
+        return ESP_OK;
+    }
+    if (st != API_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rainmaker assoc");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, rsp, (ssize_t)rsp_len);
+    return ESP_OK;
+}
+
+esp_err_t handle_get_device_rainmaker_list(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char buf[1536];
+    return rest_api_reply(req, api_device_rainmaker_list, nullptr, 0, buf, sizeof(buf), "rainmaker devices");
+}
+
+esp_err_t handle_post_device_rainmaker_add(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char body[64] = {};
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;
+    char rsp[1536];
+    size_t rsp_len = 0;
+    ApiStatus st = api_device_rainmaker_add(body, (size_t)received, rsp, sizeof(rsp), &rsp_len);
+    if (st == API_BAD_REQUEST) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request");
+        return ESP_OK;
+    }
+    if (st != API_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rainmaker device add");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, rsp, (ssize_t)rsp_len);
+    return ESP_OK;
+}
+
+esp_err_t handle_post_device_rainmaker_remove(httpd_req_t* req) {
+    REQUIRE_AUTH(req);
+    char body[64] = {};
+    int received = rest_body_recv(req, body, sizeof(body));
+    if (received < 0) return ESP_OK;
+    char rsp[1536];
+    size_t rsp_len = 0;
+    ApiStatus st = api_device_rainmaker_remove(body, (size_t)received, rsp, sizeof(rsp), &rsp_len);
+    if (st == API_BAD_REQUEST) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request");
+        return ESP_OK;
+    }
+    if (st != API_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rainmaker device remove");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, rsp, (ssize_t)rsp_len);
+    return ESP_OK;
+}
+
 // ── OPTIONS /* — CORS preflight ──────────────────────────────────────────
 // Wildcard handler for browser preflight (OPTIONS) requests.
 // Returns 204 No Content with CORS headers so the browser can proceed.
@@ -764,13 +870,30 @@ void task_http(void*) {
         { "/api/groups/*",                HTTP_GET,     handle_get_group_by_id            },
         { "/api/groups/*",                HTTP_PUT,     handle_put_group                  },
         { "/api/groups/*",                HTTP_DELETE,  handle_delete_group               },
+        // — RainMaker bridge (Task 18) — all work on a flag-off build —
+        { "/api/uplink/get",              HTTP_GET,     handle_get_uplink                 },
+        { "/api/uplink/set",              HTTP_POST,    handle_post_uplink                },
+        { "/api/rainmaker/status",        HTTP_GET,     handle_get_rainmaker_status       },
+        { "/api/rainmaker/assoc/set",     HTTP_POST,    handle_post_rainmaker_assoc       },
+        { "/api/device/rainmaker/list",   HTTP_GET,     handle_get_device_rainmaker_list  },
+        { "/api/device/rainmaker/add",    HTTP_POST,    handle_post_device_rainmaker_add  },
+        { "/api/device/rainmaker/remove", HTTP_POST,    handle_post_device_rainmaker_remove },
         // — CORS preflight (must be registered before the static catch-all) —
         { "/api/*",                       HTTP_OPTIONS, handle_options_cors               },
         // — SPIFFS catch-all — MUST be last (wildcard catches everything).
         { "/*",                           HTTP_GET,     handle_get_static                 },
     };
-    static_assert(sizeof(kRoutes) / sizeof(kRoutes[0]) == 41,
+    static_assert(sizeof(kRoutes) / sizeof(kRoutes[0]) == 48,
                   "S-F4: REST route count drift — update api_routes.def too?");
+    // Each route below becomes its own httpd URI handler, and ws_server adds
+    // "/ws" on top. Overflowing the slot pool is silent at build time and
+    // drops whichever handler registers last — which is the SPA catch-all
+    // "/*", so the entire Web UI 404s while REST/WS still answer. Caught on
+    // hardware once (kRoutes 41 -> 48 against 48 slots); this assert makes the
+    // next occurrence a compile error instead.
+    static_assert(sizeof(kRoutes) / sizeof(kRoutes[0]) + 1 <= WS_SERVER_MAX_URI_HANDLERS,
+                  "REST routes + /ws exceed ws_server's httpd URI-handler slots — "
+                  "raise WS_SERVER_MAX_URI_HANDLERS in ws_server.h");
 
     for (const auto& r : kRoutes) {
         httpd_uri_t h = {

@@ -208,7 +208,19 @@ void ws_server_init() {
     // from mobile browsers (up to 6) plus the persistent /ws connection
     // easily outruns a smaller pool.
     cfg.max_open_sockets    = 9;
-    cfg.max_uri_handlers    = 48;
+    // Every REST route in rest_ops.cpp's kRoutes[] is registered as its OWN
+    // httpd handler, plus /ws and the SPA static/catch-all handler on top —
+    // so this must stay >= kRoutes count + 2. It is NOT a soft limit:
+    // httpd_register_uri_handler() simply refuses once the slots run out, and
+    // because the SPA handler registers last, the visible symptom is the whole
+    // Web UI 404ing ("Nothing matches the given URI") while the REST/WS API
+    // keeps working — no build error, no crash, boot log shows only a single
+    // `httpd_uri: no slots left for registering handler` warning. That is
+    // exactly what happened when the RainMaker ops grew kRoutes 41 -> 48
+    // against a hardcoded 48. rest_ops.cpp carries a static_assert tying the
+    // route count to WS_SERVER_MAX_URI_HANDLERS so this fails at compile time
+    // from now on; raise both together if the table grows past the headroom.
+    cfg.max_uri_handlers    = WS_SERVER_MAX_URI_HANDLERS;
     cfg.uri_match_fn        = httpd_uri_match_wildcard;
     cfg.stack_size          = 12288; // 8 K was tight: api_rule_list -> hap_roundtrip ->
                                      // SPI exchange -> peer-dispatch BULK callback ->

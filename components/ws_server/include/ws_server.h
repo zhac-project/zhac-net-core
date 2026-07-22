@@ -8,6 +8,18 @@
 // the sending socket so the handler can issue a point-reply via
 // `ws_server_reply()`; broadcasts to every client use
 // `ws_server_broadcast()` instead.
+// httpd URI-handler slots. Every entry in rest_ops.cpp's kRoutes[] — which
+// includes the SPA static/catch-all "/*" as its LAST entry — is registered as
+// its own handler, and ws_server registers "/ws" on top. So this must stay
+// >= kRoutes count + 1; rest_ops.cpp static_asserts exactly that.
+//
+// Overflow is silent at build time and ugly at runtime: registration simply
+// fails for whatever no longer fits, and since the catch-all is registered
+// last, the Web UI 404s ("Nothing matches the given URI") while REST/WS keep
+// working, with only one `httpd_uri: no slots left` line in the boot log.
+// Headroom is deliberate so adding a route doesn't require touching this.
+static constexpr size_t WS_SERVER_MAX_URI_HANDLERS = 56;
+
 using WsRxCallback = void(*)(int fd, const char* data, size_t len);
 
 void             ws_server_init();
