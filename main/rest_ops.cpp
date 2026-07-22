@@ -885,6 +885,15 @@ void task_http(void*) {
     };
     static_assert(sizeof(kRoutes) / sizeof(kRoutes[0]) == 48,
                   "S-F4: REST route count drift — update api_routes.def too?");
+    // Each route below becomes its own httpd URI handler, and ws_server adds
+    // "/ws" on top. Overflowing the slot pool is silent at build time and
+    // drops whichever handler registers last — which is the SPA catch-all
+    // "/*", so the entire Web UI 404s while REST/WS still answer. Caught on
+    // hardware once (kRoutes 41 -> 48 against 48 slots); this assert makes the
+    // next occurrence a compile error instead.
+    static_assert(sizeof(kRoutes) / sizeof(kRoutes[0]) + 1 <= WS_SERVER_MAX_URI_HANDLERS,
+                  "REST routes + /ws exceed ws_server's httpd URI-handler slots — "
+                  "raise WS_SERVER_MAX_URI_HANDLERS in ws_server.h");
 
     for (const auto& r : kRoutes) {
         httpd_uri_t h = {
