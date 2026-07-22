@@ -597,6 +597,31 @@ extern "C" ApiStatus device_attr_set_core(uint64_t ieee, const char* key,
         }
     }
     *cmd_ok_out = cmd_ok;
+
+    // Optimistic RainMaker report for LOCALLY-commanded changes.
+    //
+    // Many devices — notably the whole no-report Tuya class — never emit an
+    // attribute report after obeying a command, so the P4 sends no
+    // BULK_STATE_UPDATE and the bridge's OUT hook in hap_bridge.cpp never
+    // fires. Before this, a socket toggled from the SPA (or by a rule) stayed
+    // stale in the RainMaker app until the device happened to report on its
+    // own — measured at Gate B: 4 commanded transitions produced 0 frames and
+    // 0 reports. The local SPA hides this by flipping its own control
+    // optimistically client-side (see AttrBoolRow's localV); the cloud has no
+    // such trick, so the firmware has to tell it.
+    //
+    // This is the same optimistic contract, applied once at the single point
+    // every local write already funnels through. VAL_INT is passed because
+    // rmk_bridge_on_attr_update uses val_type ONLY to reject VAL_STR/VAL_NONE
+    // — the real conversion is driven by the param's own plan (data_type +
+    // rmk_conv_t), and `val` here is already the raw shadow-convention value.
+    // Compiles to a no-op stub when the RainMaker flag is off.
+    //
+    // Cloud-initiated writes reach here too (write_cb -> this core), which
+    // would double-report; the bridge's skip-unchanged check collapses the
+    // second one, so the duplicate is harmless.
+    if (cmd_ok) rmk_bridge_on_attr_update(ieee, key, VAL_INT, val);
+
     return API_OK;
 }
 
