@@ -24,7 +24,18 @@ static void test_classifier() {
     { rmk_expose_t ex[] = {E("state",true)};
       assert(rmk_classify(ex,1) == RMK_DEV_SWITCH); }
     // writable state + other writable -> not plain switch -> OTHER
+    // A writable `state` wins even when other writable config knobs exist —
+    // real plugs (Tuya TS011F: state + child_lock + power_on_behavior +
+    // read-only metering) must not fall through to OTHER. Regression from
+    // Gate B, 2026-07-21.
     { rmk_expose_t ex[] = {E("state",true), E("mode",true)};
+      assert(rmk_classify(ex,2) == RMK_DEV_SWITCH); }
+    { rmk_expose_t ex[] = {E("state",true), E("child_lock",true),
+                           E("power_on_behavior",true), E("power",false),
+                           E("energy",false)};
+      assert(rmk_classify(ex,5) == RMK_DEV_SWITCH); }
+    // read-only `state` is NOT a switch (no way to command it)
+    { rmk_expose_t ex[] = {E("state",false), E("battery",false)};
       assert(rmk_classify(ex,2) == RMK_DEV_OTHER); }
     { rmk_expose_t ex[] = {E("temperature",false), E("humidity",false)};
       assert(rmk_classify(ex,2) == RMK_DEV_TEMP_SENSOR); }

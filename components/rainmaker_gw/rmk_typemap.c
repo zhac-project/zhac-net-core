@@ -16,13 +16,22 @@ rmk_devtype_t rmk_classify(const rmk_expose_t* ex, size_t n) {
     if (has(ex,n,"occupancy")) return RMK_DEV_MOTION_SENSOR;
     if (has(ex,n,"contact"))   return RMK_DEV_CONTACT_SENSOR;
     if (has(ex,n,"state")) {
-        // writable state and nothing ELSE controllable -> switch
-        size_t w = count_writable(ex, n);
-        bool state_writable = false;
+        // A writable `state` makes this a switch/plug, regardless of whatever
+        // ELSE the device exposes as writable.
+        //
+        // This deliberately does NOT require `state` to be the only writable
+        // expose. The original rule did, and it misfired on the first real
+        // device tested at Gate B: a Tuya TS011F smart plug exposes writable
+        // `state` PLUS writable config knobs (child_lock, power_on_behavior)
+        // and read-only metering, so it fell through to esp.device.other —
+        // even though plugs are explicitly inside v1 scope. Config knobs do
+        // not change what the device fundamentally IS; the extra exposes are
+        // simply not part of the RainMaker param plan (rmk_build_params only
+        // maps names it knows), so classifying as a switch loses nothing and
+        // gains correct rendering plus Alexa/Google category mapping.
         for (size_t i = 0; i < n; i++)
-            if (!strcmp(ex[i].name,"state") && ex[i].writable) state_writable = true;
-        if (state_writable && w == 1) return RMK_DEV_SWITCH;
-        return RMK_DEV_OTHER;
+            if (!strcmp(ex[i].name,"state") && ex[i].writable) return RMK_DEV_SWITCH;
+        return RMK_DEV_OTHER;   // read-only `state` (a contact-style sensor, etc.)
     }
     if (has(ex,n,"temperature") && count_writable(ex,n) == 0) return RMK_DEV_TEMP_SENSOR;
     return RMK_DEV_OTHER;
