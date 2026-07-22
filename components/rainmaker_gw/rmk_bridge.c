@@ -116,13 +116,17 @@
                                           // report off task_hap — see
                                           // rmk_bridge_on_attr_update's own
                                           // comment for why.
+#include "esp_rmaker_mqtt.h"             // esp_rmaker_mqtt_is_budget_available()
+                                          // — aggregate publish-rate guard in
+                                          // the OUT report path.
 #include "esp_timer.h"                    // esp_timer_get_time() — monotonic
                                           // µs clock for the OUT rate-limit.
 #include <new>                            // std::nothrow
 
-// Continuous-param report rate-limit (see rmk_bridge_on_attr_update). Fall
-// back to 30 s if the Kconfig symbol is absent (e.g. a flag-off build where
-// the option is hidden behind `depends on ZHAC_RAINMAKER_ENABLE`).
+// Continuous-param report rate-limit (see rmk_bridge_on_attr_update).
+// Defensive fallback only: whenever this file actually compiles (RainMaker
+// flag on), Kconfig's `default 30` already defines the symbol — this just
+// guards against config drift so the constant is never undefined.
 #ifndef CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S
 #define CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S 30
 #endif
@@ -342,8 +346,12 @@ static esp_err_t rmk_bridge_write_cb(const esp_rmaker_device_t* device,
         // own "reservation still ours" re-check).
         RmkBridgeParam* bp2 = plan_by_handle(d, param);
         if (bp2 && d->ieee == ieee) {
-            bp2->last_reported = zv;
-            bp2->has_last      = true;
+            bp2->last_reported  = zv;
+            bp2->has_last       = true;
+            bp2->last_report_us = esp_timer_get_time();  // anchor the OUT
+                                    // rate-limit window to this cloud write so
+                                    // an immediate device auto-report of the
+                                    // same param doesn't publish right after
         }
         reg_unlock();
         return ESP_OK;
@@ -748,6 +756,14 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
     // loop below; read before reg_lock (esp_timer_get_time is lock-free).
     const int64_t now_us = esp_timer_get_time();
 
+    // Aggregate publish-rate guard, evaluated BEFORE reg_lock: a forced
+    // command always passes; a non-forced (sensor) report passes only if the
+    // MQTT budget has a token. is_budget_available() takes the SDK's budget
+    // semaphore (briefly blockable), so it must NOT run under reg_lock — this
+    // file's discipline keeps the enqueue path lock-hold non-blocking (Task 21
+    // note below). The `force ||` short-circuit skips the call for commands.
+    const bool budget_ok = force || esp_rmaker_mqtt_is_budget_available();
+
     // Task 21 review fix (2nd round) — the registry scan, the conversion,
     // the work-queue enqueue, AND the throttle bookkeeping commit ALL run
     // inside this ONE critical section now (reg_lock held top to bottom).
@@ -858,7 +874,19 @@ void rmk_bridge_on_attr_update(uint64_t ieee, const char* key,
     // the same param can interleave either (task_hap only ever calls
     // this function from its own single-threaded frame dispatch, so it
     // cannot race a second call to itself).
-    if (target) {
+    // Aggregate publish-rate guard (budget_ok computed before reg_lock, see
+    // top of function). The per-param interval above bounds each param
+    // individually, but NOT the node's total publish rate: with enough
+    // continuous sensors the sum can still outrun RainMaker's MQTT budget
+    // (~1 token / 5 s). A non-forced (sensor) report only enqueues when the
+    // SDK's own budget accounting — the single source of truth — says a token
+    // is available, so the node can never over-publish no matter how many
+    // params report. A dropped sensor report just refreshes on the next one:
+    // last_reported / last_report_us are left untouched, so it retries the
+    // moment budget returns. A forced command NEVER drops here (budget_ok is
+    // unconditionally true when force) — it must re-assert, and commands are
+    // rare enough not to drain the budget the sensor gate keeps healthy.
+    if (target && budget_ok) {
         RmkReportWork* w = new (std::nothrow) RmkReportWork{target->handle, v};
         if (!w) {
             ESP_LOGW(TAG, "OOM deferring RainMaker report for key=%s — dropped", key);

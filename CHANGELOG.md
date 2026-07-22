@@ -26,9 +26,11 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   external entry only, killing the double-report) bypass both throttles and
   always re-assert; continuous (non-boolean) sensor params gain a per-param
   minimum report interval (`CONFIG_ZHAC_RMK_MIN_REPORT_INTERVAL_S`, default
-  30 s) so they can't exhaust the budget, while boolean events stay prompt.
-  Verified on hardware: idle sensor publishes 21→4 per 60 s, budget drops
-  6→0, cloud-UI toggles reflect in the RainMaker cloud within seconds.
+  30 s) and, as a hard aggregate cap, only publish when the SDK reports MQTT
+  budget available (`esp_rmaker_mqtt_is_budget_available()`) — so no number of
+  sensors can exhaust the budget, while boolean events and commands stay
+  prompt. Verified on hardware: idle sensor publishes 21→4 per 60 s, budget
+  drops 6→0, cloud-UI toggles reflect in the RainMaker cloud within seconds.
 
 - **Collections command buttons (On/Off/Toggle/Identify) all sent "Off".**
   `api_group_cmd` read only `{key, val}` and hardcoded cluster 0, dropping the

@@ -20,7 +20,7 @@
 idf_component_register(
     SRCS "rainmaker_gw.c" "rmk_typemap.c" "rmk_store.c" "rmk_bridge.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash zap_store esp_event
+    REQUIRES nvs_flash zap_store esp_event esp_timer
 )
 
 # esp_rainmaker (managed dep espressif/esp_rainmaker, registered under
