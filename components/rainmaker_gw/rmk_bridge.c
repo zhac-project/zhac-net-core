@@ -107,6 +107,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "esp_rmaker_core.h"
 #include "esp_rmaker_standard_params.h"  // ESP_RMAKER_DEF_NAME_PARAM,
@@ -169,6 +170,16 @@ static rmk_attr_write_fn s_attr_writer = nullptr;
 // "pre-init single-threaded use" reasoning as s_attr_writer above), then
 // only ever read from rmk_bridge_attach() — see rmk_bridge.h's own comment.
 static rmk_boot_restore_fn s_boot_restore = nullptr;
+
+// One-shot worker for the persisted-device restore. Runs OFF the SDK event
+// task (see the call site in rmk_bridge_attach for why) and deletes itself.
+static void rmk_boot_restore_task(void* arg) {
+    (void)arg;
+    if (s_boot_restore) s_boot_restore();
+    ESP_LOGI(TAG, "boot restore done (stack high-water %u bytes free)",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    vTaskDelete(NULL);
+}
 
 // Guards s_reg[] against a concurrent Task-18 caller (expose/unexpose,
 // presumably driven off DEVICE_JOIN/DEVICE_LEAVE, possibly on a different
@@ -855,7 +866,29 @@ void rmk_bridge_attach(void) {
     // sites (initial mapping-done vs. a later reconnect). NULL-checked so a
     // flag-on build that never wired the setter degrades to "no persisted
     // devices come back" (logged on the main/ side) instead of crashing.
-    if (s_boot_restore) s_boot_restore();
+    // ...but it MUST NOT run here. rmk_bridge_attach() is called from
+    // rmk_event_handler(), i.e. on the RainMaker SDK's event-loop task.
+    // rmk_boot_restore() does a HAP roundtrip (GET_DEVICE_BY_ID, up to 5 s)
+    // plus ArduinoJson encode/deserialize PER PERSISTED DEVICE. Running that
+    // inline overflowed the event task's stack the first time a node with a
+    // persisted device reached READY — Gate B panic, decoded backtrace:
+    //   rmk_event_handler -> rmk_bridge_attach -> rmk_boot_restore
+    //     -> rmk_expose_device_from_ieee -> hap_json_encode_get_device_req
+    //     -> snprintf  => Guru Meditation (unhandled debug exception)
+    // Blocking an SDK event callback for seconds would be wrong regardless
+    // of stack depth. So hand it to a one-shot task that deletes itself.
+    //
+    // 12 KB mirrors ws_server's httpd stack, sized for the SAME
+    // hap_roundtrip -> JSON chain, whose comment records that 8 KB was
+    // measurably tight on that path.
+    if (s_boot_restore) {
+        BaseType_t ok = xTaskCreate(rmk_boot_restore_task, "rmk_restore",
+                                    12288, NULL, 4, NULL);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "boot-restore task spawn failed — persisted devices "
+                          "stay unexposed until the next add/remove");
+        }
+    }
 #endif
 }
 
