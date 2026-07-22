@@ -111,7 +111,18 @@ static void rmk_event_handler(void* arg, esp_event_base_t base, int32_t id, void
     if (base == RMAKER_COMMON_EVENT) {
         switch (id) {
         case RMAKER_MQTT_EVENT_CONNECTED:
-            if (s_state == RMK_ST_CONNECTING || s_state == RMK_ST_BACKOFF) {
+            // RMK_ST_INIT_CLAIM must be accepted here too. A node whose
+            // certificate is already in the factory partition does NOT claim
+            // again, so RMAKER_EVENT_CLAIM_SUCCESSFUL never fires and the
+            // state never advances past INIT_CLAIM. Excluding it stranded
+            // every already-claimed node (i.e. every boot after the first)
+            // in INIT_CLAIM forever: rmk_bridge_attach() was never called,
+            // rmk_bridge_active() stayed false, and no shadow update ever
+            // reached the cloud — while status still reported a plausible
+            // "init_claim". Found on hardware at Gate B; Gate A missed it
+            // because that node had just been claimed in the same boot.
+            if (s_state == RMK_ST_INIT_CLAIM || s_state == RMK_ST_CONNECTING ||
+                s_state == RMK_ST_BACKOFF) {
                 // esp_rmaker_core.c's esp_rmaker_post_mqtt_connect_task()
                 // only posts RMAKER_EVENT_USER_NODE_MAPPING_DONE the FIRST
                 // time a mapping completes. On every later MQTT connect —
