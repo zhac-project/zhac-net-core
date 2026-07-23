@@ -162,7 +162,12 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
     // logged warning rather than emitting broken JSON.
     const bool is_logs = (strcmp(cmd, "logs.get") == 0);
     const bool is_devlist = (strcmp(cmd, "device.list") == 0);
-    const size_t kRspCap      = (is_logs || is_devlist) ? kDevListTransportCap : (8 * 1024);
+    // groups.all serializes the WHOLE membership mirror (64 devs × 16 gids =
+    // up to ~33 KB on a large fleet) — like device.list it blows past 8 KB, so
+    // give it the big bucket. Without this it fails closed to an empty/broken
+    // frame at exactly the fleet scale the global view exists to serve.
+    const bool is_groups_all = (strcmp(cmd, "groups.all") == 0);
+    const size_t kRspCap      = (is_logs || is_devlist || is_groups_all) ? kDevListTransportCap : (8 * 1024);
     const size_t kEnvelopeCap = kRspCap + 1024;
     char* rsp_buf = static_cast<char*>(heap_caps_malloc(kRspCap, MALLOC_CAP_SPIRAM));
     char* env_buf = static_cast<char*>(heap_caps_malloc(kEnvelopeCap, MALLOC_CAP_SPIRAM));

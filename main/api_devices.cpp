@@ -812,6 +812,10 @@ extern "C" ApiStatus api_groups_all(const char* body, size_t body_len,
                                     char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
     (void)body; (void)body_len;
     size_t n = dgm_all_json_live(rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;   // JsonWriter fails closed (n=0)
+                                             // only on buffer overflow — return
+                                             // an error, never a malformed
+                                             // {"ok":true,"data":} frame.
     if (rsp_len) *rsp_len = n;
     return API_OK;
 }
