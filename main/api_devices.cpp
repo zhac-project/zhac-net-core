@@ -9,6 +9,7 @@
 #include "log_ring.h"
 #include "groups_store.h"
 #include "json_buf.h"
+#include "dgm_store.h"
 #include "hap_json.h"
 #include "hap_protocol.h"
 #include "ws_server.h"
@@ -680,6 +681,128 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
     int n = snprintf(rsp_buf, rsp_cap, "%s",
                      "{\"ok\":false,\"err\":\"command failed\"}");
     if (rsp_len) *rsp_len = (size_t)n;
+    return API_OK;
+}
+
+// ── Native ZCL group membership (device.groups.*, increment 2) ───────────────
+// A dedicated API over the mirror (dgm_store) + the ZCL Groups send. The send
+// reuses the SET_ATTRIBUTE cluster-0x0004 path (HW-validated in increment 1);
+// on success the gateway-side membership mirror is updated so the UI can list
+// what a device is in without polling it.
+static size_t dgm_groups_json(uint64_t ieee, char* buf, size_t cap) {
+    uint16_t gids[DGM_MAX_GIDS];
+    uint8_t n = dgm_list(ieee, gids, DGM_MAX_GIDS);
+    JsonWriter w(buf, cap);
+    w.raw("{\"groups\":[");
+    for (uint8_t i = 0; i < n; i++) { if (i) w.ch(','); w.fmt("%u", gids[i]); }
+    w.raw("]}");
+    return w.finish();
+}
+
+// Send ZCL Add/Remove Group to the device via the SET_ATTRIBUTE roundtrip.
+// Returns true iff the P4 reported the command delivered (SET_ACK ok).
+static bool dgm_send_group(uint64_t ieee, uint8_t ep, uint16_t gid, bool remove) {
+    HapSetAttrReq attr{};
+    attr.ieee    = ieee;
+    attr.ep      = ep ? ep : 1;
+    attr.cluster = 0x0004;
+    attr.val     = gid;
+    strncpy(attr.key, remove ? "group_remove" : "group_add", sizeof(attr.key) - 1);
+    uint8_t hap_buf[160]; uint16_t hap_len = 0;
+    if (!hap_json_encode_set_attr(hap_buf, sizeof(hap_buf), &hap_len, attr)) return false;
+    char ack_buf[64]; size_t ack_len = 0;
+    if (!hap_roundtrip_v2(HapMsgType::SET_ATTRIBUTE, hap_buf, hap_len,
+                          ack_buf, sizeof(ack_buf), &ack_len, 3000)) return false;
+    if (ack_len == 0) return false;
+    JsonDocument d;
+    if (deserializeJson(d, ack_buf, ack_len) != DeserializationError::Ok) return false;
+    return d["ok"] | false;
+}
+
+// WS `device.groups.list` — args {ieee}. Returns the tracked membership.
+extern "C" ApiStatus api_device_groups_list(const char* body, size_t body_len,
+                                             char* rsp_buf, size_t rsp_cap,
+                                             size_t* rsp_len) {
+    JsonDocument doc; uint64_t ieee = 0;
+    ApiStatus st = parse_ieee_body(body, body_len, doc, ieee);
+    if (st != API_OK) return st;
+    size_t n = dgm_groups_json(ieee, rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;
+    if (rsp_len) *rsp_len = n;
+    return API_OK;
+}
+
+static ApiStatus dgm_add_remove(const char* body, size_t body_len,
+                                char* rsp_buf, size_t rsp_cap, size_t* rsp_len,
+                                bool remove) {
+    JsonDocument doc; uint64_t ieee = 0;
+    ApiStatus st = parse_ieee_body(body, body_len, doc, ieee);
+    if (st != API_OK) return st;
+    uint16_t gid = doc["gid"] | (uint16_t)0;
+    if (gid == 0) gid = doc["group"] | (uint16_t)0;
+    uint8_t ep = doc["ep"] | (uint8_t)1;
+    if (gid == 0) return API_BAD_REQUEST;
+    if (!dgm_send_group(ieee, ep, gid, remove)) {
+        int n = snprintf(rsp_buf, rsp_cap, "%s", "{\"ok\":false,\"err\":\"command failed\"}");
+        if (rsp_len) *rsp_len = (size_t)n;
+        return API_OK;
+    }
+    if (remove) dgm_remove(ieee, gid); else dgm_add(ieee, gid);
+    size_t n = dgm_groups_json(ieee, rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;
+    if (rsp_len) *rsp_len = n;
+    return API_OK;
+}
+
+// WS `device.groups.add` / `device.groups.remove` — args {ieee, ep?, gid}.
+extern "C" ApiStatus api_device_groups_add(const char* body, size_t body_len,
+                                            char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
+    return dgm_add_remove(body, body_len, rsp_buf, rsp_cap, rsp_len, /*remove=*/false);
+}
+extern "C" ApiStatus api_device_groups_remove(const char* body, size_t body_len,
+                                               char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
+    return dgm_add_remove(body, body_len, rsp_buf, rsp_cap, rsp_len, /*remove=*/true);
+}
+
+// WS `device.groups.refresh` — args {ieee, ep?}. Reads the device's ACTUAL ZCL
+// group table (Get Group Membership readback on the P4), reconciles the mirror
+// to it, and returns the authoritative list. (increment 2b)
+extern "C" ApiStatus api_device_groups_refresh(const char* body, size_t body_len,
+                                               char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
+    JsonDocument doc; uint64_t ieee = 0;
+    ApiStatus st = parse_ieee_body(body, body_len, doc, ieee);
+    if (st != API_OK) return st;
+    uint8_t ep = doc["ep"] | (uint8_t)1;
+
+    char q[80];
+    int qn = snprintf(q, sizeof(q), "{\"ieee\":\"0x%016llX\",\"ep\":%u}",
+                      (unsigned long long)ieee, ep ? ep : 1);
+    if (qn <= 0 || (size_t)qn >= sizeof(q)) return API_INTERNAL_ERROR;
+
+    char rsp[256]; size_t rn = 0;
+    if (!hap_roundtrip_v2(HapMsgType::GROUP_MEMBER_QUERY, (const uint8_t*)q, (uint16_t)qn,
+                          rsp, sizeof(rsp), &rn, 6000)) {
+        int n = snprintf(rsp_buf, rsp_cap, "%s", "{\"ok\":false,\"err\":\"no response\"}");
+        if (rsp_len) *rsp_len = (size_t)n;
+        return API_OK;
+    }
+    JsonDocument rd;
+    if (rn == 0 || deserializeJson(rd, rsp, rn) != DeserializationError::Ok ||
+        !(rd["ok"] | false)) {
+        int n = snprintf(rsp_buf, rsp_cap, "%s", "{\"ok\":false,\"err\":\"query failed\"}");
+        if (rsp_len) *rsp_len = (size_t)n;
+        return API_OK;
+    }
+    uint16_t gids[DGM_MAX_GIDS]; uint8_t count = 0;
+    for (JsonVariant v : rd["gids"].as<JsonArray>()) {
+        if (count >= DGM_MAX_GIDS) break;
+        gids[count++] = (uint16_t)(v.as<uint32_t>() & 0xFFFF);
+    }
+    dgm_set(ieee, gids, count);   // reconcile the mirror to the device's real table
+
+    size_t n = dgm_groups_json(ieee, rsp_buf, rsp_cap);
+    if (n == 0) return API_INTERNAL_ERROR;
+    if (rsp_len) *rsp_len = n;
     return API_OK;
 }
 
