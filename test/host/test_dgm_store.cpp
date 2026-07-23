@@ -72,13 +72,14 @@ int main() {
         dgm_tbl_add(t, 0xBB, 101);                              // BB in 101
         char buf[512];
         size_t n = dgm_all_json(t, buf, sizeof buf);
-        CHECK(n > 0 && buf[n] == '\0', "wrote NUL-terminated output");
+        buf[n] = '\0';   // JsonWriter is length-delimited (no guaranteed NUL); our
+                         // oversized test buffer has slack, so terminate it ourselves.
+        CHECK(n > 0, "wrote output");
         CHECK(strstr(buf, "\"gid\":101") != nullptr, "has gid 101");
         CHECK(strstr(buf, "\"gid\":108") != nullptr, "has gid 108");
         CHECK(strstr(buf, "\"gid\":101") < strstr(buf, "\"gid\":108"), "gids ascending");
         CHECK(strstr(buf, "0x00000000000000aa") != nullptr, "member AA present");
         CHECK(strstr(buf, "0x00000000000000bb") != nullptr, "member BB present");
-        // gid 101 lists two members, gid 108 exactly one
         CHECK(strstr(buf, "{\"gid\":108,\"members\":[{\"ieee\":\"0x00000000000000aa\"}]}") != nullptr,
               "gid 108 has exactly member AA");
     }
@@ -86,8 +87,24 @@ int main() {
         DgmTable t = {};
         char buf[64];
         size_t n = dgm_all_json(t, buf, sizeof buf);
+        buf[n] = '\0';
         CHECK(strcmp(buf, "{\"groups\":[]}") == 0, "empty table -> {\"groups\":[]}");
-        (void)n;
+    }
+
+    { printf("\nG dgm_all_json distinct-gid cap\n");
+        DgmTable t = {};
+        // Fill with far more distinct gids than DGM_MAX_GROUPS (64 devs x 16 gids
+        // = 1024 distinct), then expect the output capped to exactly DGM_MAX_GROUPS.
+        uint16_t g = 1;
+        for (uint8_t d = 0; d < DGM_MAX_DEVS; d++)
+            for (uint8_t k = 0; k < DGM_MAX_GIDS; k++)
+                dgm_tbl_add(t, (uint64_t)(0x1000 + d), g++);
+        char buf[8192];
+        size_t n = dgm_all_json(t, buf, sizeof buf);
+        buf[n] = '\0';
+        CHECK(n > 0, "cap: wrote output (fit in buffer)");
+        int cnt = 0; for (const char* p = buf; (p = strstr(p, "\"gid\":")) != nullptr; p++) cnt++;
+        CHECK(cnt == DGM_MAX_GROUPS, "capped at DGM_MAX_GROUPS distinct groups");
     }
 
     printf("\n%s - %d failure(s)\n", s_fail ? "FAILED" : "PASSED", s_fail);
