@@ -4,7 +4,9 @@
 // ops). NVS load/save is a thin wrapper over these (the host NVS stub is a
 // no-op, so persistence itself is not unit-tested here).
 #include "dgm_store.h"
+#include "json_buf.h"
 #include <cstdio>
+#include <cstring>
 
 static int s_fail = 0;
 #define CHECK(c, m) do { if (!(c)) { s_fail++; printf("  FAIL: %s\n", m); } else printf("  ok:   %s\n", m); } while (0)
@@ -62,6 +64,30 @@ int main() {
         CHECK(dgm_tbl_forget(t, 0xAA), "forget present -> true");
         CHECK(!dgm_tbl_forget(t, 0xAA), "forget absent -> false");
         CHECK(t.n == 1 && dgm_tbl_list(t, 0xBB, out, 16) == 1, "other device intact");
+    }
+
+    { printf("\nE dgm_all_json inversion (by gid, ascending, multi-member)\n");
+        DgmTable t = {};
+        dgm_tbl_add(t, 0xAA, 108); dgm_tbl_add(t, 0xAA, 101);   // AA in 101 + 108
+        dgm_tbl_add(t, 0xBB, 101);                              // BB in 101
+        char buf[512];
+        size_t n = dgm_all_json(t, buf, sizeof buf);
+        CHECK(n > 0 && buf[n] == '\0', "wrote NUL-terminated output");
+        CHECK(strstr(buf, "\"gid\":101") != nullptr, "has gid 101");
+        CHECK(strstr(buf, "\"gid\":108") != nullptr, "has gid 108");
+        CHECK(strstr(buf, "\"gid\":101") < strstr(buf, "\"gid\":108"), "gids ascending");
+        CHECK(strstr(buf, "0x00000000000000aa") != nullptr, "member AA present");
+        CHECK(strstr(buf, "0x00000000000000bb") != nullptr, "member BB present");
+        // gid 101 lists two members, gid 108 exactly one
+        CHECK(strstr(buf, "{\"gid\":108,\"members\":[{\"ieee\":\"0x00000000000000aa\"}]}") != nullptr,
+              "gid 108 has exactly member AA");
+    }
+    { printf("\nF dgm_all_json empty table\n");
+        DgmTable t = {};
+        char buf[64];
+        size_t n = dgm_all_json(t, buf, sizeof buf);
+        CHECK(strcmp(buf, "{\"groups\":[]}") == 0, "empty table -> {\"groups\":[]}");
+        (void)n;
     }
 
     printf("\n%s - %d failure(s)\n", s_fail ? "FAILED" : "PASSED", s_fail);

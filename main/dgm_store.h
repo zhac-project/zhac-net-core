@@ -40,3 +40,13 @@ bool    dgm_remove(uint64_t ieee, uint16_t gid);
 uint8_t dgm_list(uint64_t ieee, uint16_t* out, uint8_t max);
 bool    dgm_set(uint64_t ieee, const uint16_t* gids, uint8_t count);
 bool    dgm_forget(uint64_t ieee);
+
+// ── Global by-gid view (increment 3: the SPA "Groups" tab) ───────────────────
+// Max distinct group ids the global view enumerates in one response.
+static constexpr uint16_t DGM_MAX_GROUPS = 128;
+// Serialize the whole table inverted by gid (ascending), members ieee-only:
+//   {"groups":[{"gid":101,"members":[{"ieee":"0x..."},...]},...]}
+// Pure (no NVS) so it is host-tested against a hand-built DgmTable.
+size_t dgm_all_json(const DgmTable& t, char* buf, size_t cap);
+// Load the mirror from NVS, then dgm_all_json. Runtime path for groups.all.
+size_t dgm_all_json_live(char* buf, size_t cap);

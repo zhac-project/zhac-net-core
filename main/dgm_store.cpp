@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <cstring>
+#include "json_buf.h"
 
 // ── Pure table operations ────────────────────────────────────────────────────
 static DgmEntry* dgm_find(DgmTable& t, uint64_t ieee) {
@@ -124,4 +125,47 @@ bool dgm_forget(uint64_t ieee) {
 }
 uint8_t dgm_list(uint64_t ieee, uint16_t* out, uint8_t max) {
     Guard g; DgmTable t; dgm_load(t); return dgm_tbl_list(t, ieee, out, max);
+}
+
+size_t dgm_all_json(const DgmTable& t, char* buf, size_t cap) {
+    // 1. Collect distinct gids, insertion-sorted ascending, deduped, capped.
+    uint16_t gids[DGM_MAX_GROUPS];
+    uint16_t ng = 0;
+    for (uint8_t d = 0; d < t.n; d++) {
+        const DgmEntry& e = t.devs[d];
+        for (uint8_t k = 0; k < e.count; k++) {
+            uint16_t g = e.gids[k];
+            uint16_t pos = 0;
+            while (pos < ng && gids[pos] < g) pos++;
+            if (pos < ng && gids[pos] == g) continue;          // dedup
+            if (ng >= DGM_MAX_GROUPS) continue;                // cap (drop overflow)
+            for (uint16_t m = ng; m > pos; m--) gids[m] = gids[m - 1];
+            gids[pos] = g; ng++;
+        }
+    }
+    // 2. Serialize by gid; for each, scan the table for member devices.
+    JsonWriter w(buf, cap);
+    w.raw("{\"groups\":[");
+    for (uint16_t i = 0; i < ng; i++) {
+        if (i) w.ch(',');
+        w.fmt("{\"gid\":%u,\"members\":[", (unsigned)gids[i]);
+        bool first = true;
+        for (uint8_t d = 0; d < t.n; d++) {
+            const DgmEntry& e = t.devs[d];
+            bool has = false;
+            for (uint8_t k = 0; k < e.count; k++) if (e.gids[k] == gids[i]) { has = true; break; }
+            if (!has) continue;
+            if (!first) w.ch(',');
+            w.fmt("{\"ieee\":\"0x%016llx\"}", (unsigned long long)e.ieee);
+            first = false;
+        }
+        w.raw("]}");
+    }
+    w.raw("]}");
+    return w.finish();
+}
+
+size_t dgm_all_json_live(char* buf, size_t cap) {
+    Guard g; DgmTable t; dgm_load(t);
+    return dgm_all_json(t, buf, cap);
 }
