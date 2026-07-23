@@ -67,6 +67,7 @@ ZHAC_API_ROUTE("device.groups.list",         api_device_groups_list,          PO
 ZHAC_API_ROUTE("device.groups.add",          api_device_groups_add,           POST, "/api/device/groups/add")
 ZHAC_API_ROUTE("device.groups.remove",       api_device_groups_remove,        POST, "/api/device/groups/remove")
 ZHAC_API_ROUTE("device.groups.refresh",      api_device_groups_refresh,       POST, "/api/device/groups/refresh")
+ZHAC_API_ROUTE("groups.all",                 api_groups_all,                  POST, "/api/groups/all")
 
 // ── Rules ───────────────────────────────────────────────────────────
 ZHAC_API_ROUTE("rule.list",                  api_rule_list,                   GET,  "/api/rule/list")

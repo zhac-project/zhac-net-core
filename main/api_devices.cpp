@@ -806,6 +806,16 @@ extern "C" ApiStatus api_device_groups_refresh(const char* body, size_t body_len
     return API_OK;
 }
 
+// WS `groups.all` / POST /api/groups/all — no args. Whole membership mirror,
+// inverted by gid. See dgm_all_json. Read-only; no P4 roundtrip.
+extern "C" ApiStatus api_groups_all(const char* body, size_t body_len,
+                                    char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
+    (void)body; (void)body_len;
+    size_t n = dgm_all_json_live(rsp_buf, rsp_cap);
+    if (rsp_len) *rsp_len = n;
+    return API_OK;
+}
+
 // WS `device.options.set` — args {ieee, occupancy_timeout?, debounce_ms?,
 // flood_protection?, throttle_ms?}. Stores the body to NVS verbatim; P4 is notified
 // via DEVICE_OPTIONS_SET only when one of the forwarded fields is set.
