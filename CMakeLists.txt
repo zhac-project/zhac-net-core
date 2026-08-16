@@ -17,6 +17,25 @@ else()
     message(FATAL_ERROR "shared components dir not found — set IDF_COMPONENT_OVERRIDE_PATH or clone zhac-components as a sibling")
 endif()
 
+# embedded-zhc is the host-testable C++20 device library. zhc_adapter resolves
+# it from $EMBEDDED_ZHC_PATH and otherwise falls back to
+# <zhac-components>/../../embedded/zhc — the PRE-SPLIT monorepo layout, which no
+# longer exists. So without this, a plain `idf.py build` from a fresh checkout
+# dies deep inside a shared component:
+#
+#   CMake Error at component.cmake:321 (message):
+#     Include directory '.../zhac-components/embedded/zhc/include' is not a
+#     directory.
+#   Call Stack: .../zhac_components/components/zhc_adapter/CMakeLists.txt:99
+#
+# It built for anyone who had exported EMBEDDED_ZHC_PATH (the platform justfile
+# and the manual recipe in CLAUDE.md both do), which is exactly why the gap
+# survived: the environment that hid it was the only one anybody built in.
+# Default to the sibling repo, mirroring zhac-wired-core.
+if(NOT DEFINED ENV{EMBEDDED_ZHC_PATH})
+    set(ENV{EMBEDDED_ZHC_PATH} "${CMAKE_CURRENT_LIST_DIR}/../embedded-zhc")
+endif()
+
 # Firmware version baked into esp_app_desc.version (shown in the web UI Info
 # block). Derived from git: the release tag on a clean checkout (e.g.
 # v2026061501), tag-commits-ghash when ahead, or the bare hash if untagged.
