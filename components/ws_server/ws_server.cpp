@@ -54,6 +54,21 @@ static bool add_fd(int fd, bool authed) {
     return added;
 }
 
+// Add the fd ONLY if absent, leaving an existing entry's auth flag alone.
+//
+// add_fd() overwrites s_fd_authed on a repeat call, which is right at handshake
+// (freshly detected auth) and wrong everywhere else — calling it per received
+// frame would deauthenticate a client on its very next message. Hence the split.
+static void ensure_fd(int fd, bool authed_if_new) {
+    bool present = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_fd_count; i++) {
+        if (s_fds[i] == fd) { present = true; break; }
+    }
+    xSemaphoreGive(s_mutex);
+    if (!present) add_fd(fd, authed_if_new);
+}
+
 static void remove_fd(int fd) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
@@ -93,50 +108,91 @@ void ws_server_fd_deauth_all() {
     xSemaphoreGive(s_mutex);
 }
 
+// F18 (FINDINGS.md): the socket may OPEN unauthenticated; auth is enforced
+// per-message in the dispatch layer. If the client presents a valid token at
+// handshake (X-Api-Key header, or the legacy ?token= query) we mark it authed
+// now — back-compat for non-browser clients, which set headers without any URL
+// leak. Browsers connect WITHOUT a URL token and authenticate via a first
+// {"cmd":"auth"} message, keeping the long-lived token out of proxy/access logs.
+static bool detect_handshake_auth(httpd_req_t* req) {
+    if (s_api_token[0] == '\0') return true;   // no token configured → auth off
+
+    char key[64] = {};
+    bool got_key = false;
+    if (httpd_req_get_hdr_value_str(req, "X-Api-Key", key, sizeof(key)) == ESP_OK) {
+        got_key = true;
+    } else {
+        size_t qlen = httpd_req_get_url_query_len(req);
+        if (qlen > 0 && qlen < 256) {
+            char qbuf[256];
+            if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK &&
+                httpd_query_key_value(qbuf, "token", key, sizeof(key)) == ESP_OK) {
+                got_key = true;
+            }
+        }
+    }
+    if (got_key && strlen(key) == 32) {
+        // Constant-time compare: XOR-accumulate all 32 bytes.
+        uint8_t diff = 0;
+        for (int i = 0; i < 32; i++)
+            diff |= (uint8_t)key[i] ^ (uint8_t)s_api_token[i];
+        return diff == 0;
+    }
+    return false;
+}
+
+// Register a freshly handshaken socket. Closing on a full table is deliberate:
+// a slot-less socket would stay open, accept commands, yet never receive a
+// single broadcast.
+static void register_client(httpd_req_t* req, int fd) {
+    if (!add_fd(fd, detect_handshake_auth(req))) {
+        ESP_LOGW(TAG, "WS client limit (%d) reached, closing fd=%d",
+                 MAX_WS_CLIENTS, fd);
+        httpd_sess_trigger_close(s_server, fd);
+    }
+}
+
+#ifdef CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+// ESP-IDF v6.1 STOPPED invoking the URI handler for the WebSocket handshake:
+//
+//   /* If the request is websocket handshake, then do not call the uri->handler */
+//   return ESP_OK;                       -- components/esp_http_server/src/httpd_uri.c
+//
+// v6.0 fell through to "Invoke handler", which is how the HTTP_GET branch below
+// ever ran. On v6.1 it never runs, so no client was registered, client_count()
+// stayed 0 and ws_server_broadcast() iterated an empty list: every push event
+// silently vanished while request/reply kept working — the failure looks like a
+// connected, healthy socket that just never receives anything.
+//
+// v6.1 added this callback for exactly this purpose. It still gets the original
+// httpd_req_t, so handshake-time token auth keeps working unchanged.
+static esp_err_t ws_post_handshake(httpd_req_t* req) {
+    register_client(req, httpd_req_to_sockfd(req));
+    return ESP_OK;
+}
+#endif
+
 static esp_err_t ws_handler(httpd_req_t* req) {
     int fd = httpd_req_to_sockfd(req);
     if (req->method == HTTP_GET) {
-        // F18 (FINDINGS.md): the socket may OPEN unauthenticated; auth is
-        // enforced per-message in the dispatch layer. If the client presents a
-        // valid token at handshake (X-Api-Key header, or the legacy ?token=
-        // query) we mark it authed now — back-compat for non-browser clients,
-        // which set headers without any URL leak. Browsers connect WITHOUT a
-        // URL token and authenticate via a first {"cmd":"auth"} message,
-        // keeping the long-lived token out of proxy/access logs.
-        bool authed = (s_api_token[0] == '\0');   // no token configured → auth off
-        if (!authed) {
-            char key[64] = {};
-            bool got_key = false;
-            if (httpd_req_get_hdr_value_str(req, "X-Api-Key", key,
-                                             sizeof(key)) == ESP_OK) {
-                got_key = true;
-            } else {
-                size_t qlen = httpd_req_get_url_query_len(req);
-                if (qlen > 0 && qlen < 256) {
-                    char qbuf[256];
-                    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK &&
-                        httpd_query_key_value(qbuf, "token", key, sizeof(key)) == ESP_OK) {
-                        got_key = true;
-                    }
-                }
-            }
-            if (got_key && strlen(key) == 32) {
-                // Constant-time compare: XOR-accumulate all 32 bytes.
-                uint8_t diff = 0;
-                for (int i = 0; i < 32; i++)
-                    diff |= (uint8_t)key[i] ^ (uint8_t)s_api_token[i];
-                authed = (diff == 0);
-            }
-        }
-        if (!add_fd(fd, authed)) {
-            // Table full: close the socket instead of leaving it half-alive
-            // (it could send commands but would never see a broadcast).
-            ESP_LOGW(TAG, "WS client limit (%d) reached, closing fd=%d",
-                     MAX_WS_CLIENTS, fd);
-            httpd_sess_trigger_close(s_server, fd);
-        }
+        // IDF <= 6.0 path. On 6.1+ this is unreachable (see ws_post_handshake).
+        register_client(req, fd);
         return ESP_OK;
     }
+
+    // Safety net, and the ONLY registration that works on IDF 6.1 when
+    // CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT is off: adopt any socket that
+    // reaches us with a data frame but was never registered. ensure_fd (not
+    // add_fd) so a client that authenticated earlier is not knocked back to
+    // unauthenticated by its next message.
+    //
+    // A socket adopted here has no handshake headers to inspect, so it starts
+    // unauthenticated whenever a token is configured — it receives no
+    // broadcasts until its {"cmd":"auth"} message calls
+    // ws_server_fd_set_authed(). That is the safe direction to be wrong in, and
+    // it also repairs auth itself: previously that setter silently did nothing
+    // because the fd was not in the table to begin with.
+    ensure_fd(fd, s_api_token[0] == '\0');
     // DS10 (DS_FINDINGS): the old fixed 256-byte stack buffer truncated/rejected
     // any WS frame larger than 255 bytes (rule DSL, script.check Lua source) and
     // a 2 KB+ stack buffer would risk the httpd task's canary on its deep call
@@ -181,6 +237,12 @@ static const httpd_uri_t s_ws_uri = {
     // Session teardown after CLOSE runs through close_fn below.
     .handle_ws_control_frames = false,
     .supported_subprotocol    = nullptr,
+#ifdef CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+    // Field exists only on IDF >= 6.1 and only when the option is enabled;
+    // both the struct member and the callback are compiled out otherwise, so
+    // this stays source-compatible with v6.0.
+    .ws_post_handshake_cb     = ws_post_handshake,
+#endif
 };
 
 // Registered as httpd_config_t::close_fn — fires on EVERY terminated session
@@ -311,15 +373,38 @@ void ws_server_broadcast(const char* json, size_t len) {
     // (device states, alerts, log lines). The auth handshake reply itself is a
     // targeted ws_server_reply(), never a broadcast, so gating here cannot
     // break the {"cmd":"auth"} exchange.
-    int  fds[MAX_WS_CLIENTS];
-    int  count = 0;
+    int  snap_fd[MAX_WS_CLIENTS];
+    bool snap_authed[MAX_WS_CLIENTS];
+    int  snap_n = 0;
     const bool auth_on = (s_api_token[0] != '\0');
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
-        if (auth_on && !s_fd_authed[i]) continue;
-        fds[count++] = s_fds[i];
+        snap_authed[snap_n] = s_fd_authed[i];
+        snap_fd[snap_n++]   = s_fds[i];
     }
     xSemaphoreGive(s_mutex);
+
+    // Drop entries httpd no longer considers live WebSocket sessions.
+    //
+    // The failure-driven cleanup further down only fires when a send actually
+    // errors, and a half-open TCP socket keeps ACCEPTING writes long after the
+    // peer is gone — so an abruptly-killed client could hold a slot
+    // indefinitely. With MAX_WS_CLIENTS at 3 that is two dead browsers away
+    // from refusing every new connection. httpd_ws_get_fd_info() is the
+    // authoritative answer and costs a table lookup.
+    //
+    // Deliberately outside the mutex: this file's rule is never to call httpd
+    // while holding it, and remove_fd() takes it itself.
+    int  fds[MAX_WS_CLIENTS];
+    int  count = 0;
+    for (int i = 0; i < snap_n; i++) {
+        if (httpd_ws_get_fd_info(s_server, snap_fd[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
+            remove_fd(snap_fd[i]);
+            continue;
+        }
+        if (auth_on && !snap_authed[i]) continue;
+        fds[count++] = snap_fd[i];
+    }
 
     httpd_ws_frame_t pkt{};
     pkt.type    = HTTPD_WS_TYPE_TEXT;
