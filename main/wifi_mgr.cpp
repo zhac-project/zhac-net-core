@@ -20,12 +20,18 @@
 #include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include "esp_sntp.h"
+#include "ntp_cfg.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
+#include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 
 #include "s3_internal.h"
+#include "improv_proto.h"
+#include "task_stacks.h"
 
 static const char* TAG = "wifi_mgr";
 
@@ -195,14 +201,12 @@ static void wifi_event_handler(void*, esp_event_base_t base,
             arm_ap_grace_timer();
         }
 
-        // Start SNTP once
+        // Start SNTP once. ntp_cfg owns the server: the public default, or a
+        // local one from Settings for a network without internet access.
         static bool s_sntp_started = false;
         if (!s_sntp_started) {
-            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-            esp_sntp_setservername(0, "pool.ntp.org");
-            esp_sntp_init();
             s_sntp_started = true;
-            ESP_LOGI(TAG, "SNTP started");
+            ntp_cfg_start();
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
         auto* ev = static_cast<wifi_event_ap_staconnected_t*>(event_data);
@@ -368,6 +372,7 @@ static void start_ap_mode(void) {
     // otherwise it fails ESP_ERR_WIFI_MODE (0x3005). APSTA so scan works.
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     configure_ap();
+    ntp_cfg_init();   // before the first DHCP lease: may ask the router for a time server
     ESP_ERROR_CHECK(esp_wifi_start());
 
     snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
@@ -390,6 +395,7 @@ static void start_sta_mode(const char* ssid, const char* pass) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     configure_ap();
     configure_sta(ssid, pass);
+    ntp_cfg_init();   // before the first DHCP lease: may ask the router for a time server
     ESP_ERROR_CHECK(esp_wifi_start());
 
     snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
@@ -536,6 +542,160 @@ static void task_gpio_reset(void*) {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
+// ── Improv Wi-Fi over the console UART ───────────────────────────────────
+// The browser flasher (ESP Web Tools) asks for Wi-Fi right after flashing and
+// can later offer "Change Wi-Fi" and "Visit device", all over the USB cable,
+// with no provisioning-AP detour. Protocol: https://www.improv-wifi.com/serial/.
+// Framing is in improv_proto.h (host-tested); this is the UART and Wi-Fi side.
+#if CONFIG_ESP_CONSOLE_UART
+static constexpr uart_port_t kImprovUart      = static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM);
+static constexpr int64_t     kImprovTimeoutUs = 30LL * 1000 * 1000;
+// Must equal "name" in the flasher manifest (zhac-docs/flash/build-site.sh):
+// ESP Web Tools compares the two to recognise an installed ZHAC.
+static constexpr const char* kImprovFirmware  = "ZHAC dual-chip S3";
+
+static void improv_send(uint8_t type, const uint8_t* data, uint8_t len) {
+    uint8_t wire[255 + 12];
+    const size_t n = improv::frame(type, data, len, wire);
+    // One driver write: its TX lock keeps the packet whole while other tasks log.
+    uart_write_bytes(kImprovUart, wire, n);
+}
+
+static void improv_send_byte(uint8_t type, uint8_t v) { improv_send(type, &v, 1); }
+
+static void improv_send_strings(uint8_t cmd, const char* const* strs, size_t count) {
+    uint8_t body[255];
+    const size_t n = improv::result(cmd, strs, count, body);
+    if (n) improv_send(improv::TYPE_RESULT, body, static_cast<uint8_t>(n));
+}
+
+static void improv_send_url(uint8_t cmd) {
+    char url[32];
+    snprintf(url, sizeof(url), "http://%s/", s_ip_str);
+    const char* strs[] = {url};
+    improv_send_strings(cmd, strs, 1);
+}
+
+// Saves the credentials and moves the station over without the reboot that
+// /api/wifi uses, because Improv reports the outcome on this same serial
+// session. Wrong credentials then behave as they do there: retries, and after
+// MAX_STA_RETRIES the stored ones are cleared.
+static void improv_apply_sta(const char* ssid, const char* pass) {
+    nvs_handle_t h;
+    if (nvs_open("wifi_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "ssid", ssid);
+        nvs_set_str(h, "pass", pass);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    s_wifi_connected.store(false, std::memory_order_release);  // the old link is not the answer
+    s_retry_count.store(0, std::memory_order_release);
+    if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer); // may hold a 60 s backoff
+    esp_wifi_disconnect();
+    configure_sta(ssid, pass);
+    esp_wifi_connect();
+}
+
+static void improv_send_scan(void) {
+    wifi_mgr_scan();
+    auto* aps = static_cast<wifi_ap_record_t*>(
+        heap_caps_malloc(WIFI_MGR_MAX_SCAN * sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM));
+    const uint16_t n = aps ? wifi_mgr_get_scan_results(aps, WIFI_MGR_MAX_SCAN) : 0;
+    for (uint16_t i = 0; i < n; i++) {
+        const char* ssid = reinterpret_cast<const char*>(aps[i].ssid);
+        bool skip = ssid[0] == '\0';                              // hidden network
+        for (uint16_t j = 0; j < i && !skip; j++)                 // mesh: one row per name
+            skip = std::strcmp(ssid, reinterpret_cast<const char*>(aps[j].ssid)) == 0;
+        if (skip) continue;
+        char rssi[8];
+        snprintf(rssi, sizeof(rssi), "%d", aps[i].rssi);
+        const char* strs[] = {ssid, rssi, aps[i].authmode == WIFI_AUTH_OPEN ? "NO" : "YES"};
+        improv_send_strings(improv::CMD_SCAN, strs, 3);
+    }
+    heap_caps_free(aps);
+    improv_send_strings(improv::CMD_SCAN, nullptr, 0);          // end of list
+}
+
+static void improv_handle(const improv::Parser& p, int64_t* deadline) {
+    uint8_t cmd = 0, alen = 0;
+    const uint8_t* arg = p.type() == improv::TYPE_RPC
+                       ? improv::rpc_arg(p.data(), p.data_len(), &cmd, &alen) : nullptr;
+    if (!arg) { improv_send_byte(improv::TYPE_ERROR, improv::ERR_INVALID_RPC); return; }
+    switch (cmd) {
+    case improv::CMD_WIFI_SETTINGS: {
+        char ssid[33], pass[65];
+        if (!improv::parse_wifi_settings(arg, alen, ssid, pass)) {
+            improv_send_byte(improv::TYPE_ERROR, improv::ERR_INVALID_RPC);
+            return;
+        }
+        ESP_LOGI(TAG, "Improv: connecting to \"%s\"", ssid);
+        improv_send_byte(improv::TYPE_ERROR, improv::ERR_NONE);
+        improv_apply_sta(ssid, pass);
+        improv_send_byte(improv::TYPE_STATE, improv::STATE_PROVISIONING);
+        *deadline = esp_timer_get_time() + kImprovTimeoutUs;
+        return;
+    }
+    case improv::CMD_GET_STATE: {
+        const bool up = !*deadline && s_wifi_connected.load(std::memory_order_acquire);
+        improv_send_byte(improv::TYPE_STATE, *deadline ? improv::STATE_PROVISIONING
+                                             : up ? improv::STATE_PROVISIONED
+                                                  : improv::STATE_READY);
+        if (up) improv_send_url(improv::CMD_GET_STATE);
+        return;
+    }
+    case improv::CMD_GET_INFO: {
+        const char* strs[] = {kImprovFirmware, esp_app_get_description()->version,
+                              "ESP32-S3", s_ap_ssid};
+        improv_send_strings(improv::CMD_GET_INFO, strs, 4);
+        return;
+    }
+    case improv::CMD_SCAN:
+        improv_send_scan();
+        return;
+    default:
+        improv_send_byte(improv::TYPE_ERROR, improv::ERR_UNKNOWN_RPC);
+    }
+}
+
+static void task_improv(void*) {
+    improv::Parser p;
+    int64_t deadline = 0;   // non-zero while a connection attempt is pending
+    uint8_t chunk[64];
+    for (;;) {
+        const int r = uart_read_bytes(kImprovUart, chunk, sizeof(chunk), pdMS_TO_TICKS(200));
+        for (int i = 0; i < r; i++) {
+            if (p.feed(chunk[i]))    improv_handle(p, &deadline);
+            else if (p.bad_checksum) improv_send_byte(improv::TYPE_ERROR, improv::ERR_INVALID_RPC);
+        }
+        if (!deadline) continue;
+        if (s_wifi_connected.load(std::memory_order_acquire)) {
+            deadline = 0;
+            improv_send_byte(improv::TYPE_STATE, improv::STATE_PROVISIONED);
+            improv_send_url(improv::CMD_WIFI_SETTINGS);
+        } else if (esp_timer_get_time() > deadline) {
+            deadline = 0;
+            improv_send_byte(improv::TYPE_ERROR, improv::ERR_UNABLE_TO_CONNECT);
+            improv_send_byte(improv::TYPE_STATE, improv::STATE_READY);
+        }
+    }
+}
+
+static void improv_start(void) {
+    // 256 B RX ring (it must exceed the 128 B FIFO); no TX ring, writes block.
+    if (uart_driver_install(kImprovUart, 256, 0, 0, nullptr, 0) != ESP_OK) {
+        ESP_LOGW(TAG, "Improv: console UART driver unavailable, serial Wi-Fi setup off");
+        return;
+    }
+    // Console output now goes through the same driver, so a log line and an
+    // Improv packet share one TX lock instead of interleaving bytes.
+    uart_vfs_dev_use_driver(kImprovUart);
+    // Internal-RAM stack: this task writes NVS, which a PSRAM stack cannot do.
+    xTaskCreate(task_improv, "TaskImprov", zhac::stack::kImprov, nullptr, 2, nullptr);
+}
+#else
+static void improv_start(void) {}   // the console is not a UART: nothing to listen on
+#endif
+
 void wifi_mgr_init(void) {
     ESP_LOGI(TAG, "Initialising WiFi manager");
 
@@ -591,6 +751,8 @@ void wifi_mgr_init(void) {
 
     // GPIO reset button task
     xTaskCreate(task_gpio_reset, "TaskGPIORst", 2048, nullptr, 2, nullptr);
+
+    improv_start();
 }
 
 bool wifi_mgr_is_ap_mode(void) {

@@ -9,6 +9,59 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Added
 
+- **Time from the router.** When no time server is named, the hub asks the router for one
+  (DHCP option 42) and uses it before `pool.ntp.org`; status reports it as `ntp_dhcp_server`
+  and the Settings Time card says so. A hub on a network without internet access then keeps
+  its clock across power cuts with no configuration.
+
+- **The first claim of a hub is bounded.** `POST /api/auth/setup` answers only in the first
+  ten minutes after power-on (`403 {"error":"setup_closed"}` after); status reports the
+  seconds left as `auth_setup_secs_left`. An unclaimed or reset hub can no longer be taken by
+  whoever finds it on the network later, only by someone who can power-cycle it. Boot log
+  says so while no password exists.
+
+- **A time server you can choose** (Settings, Time; `settings.set {"ntp_server"}`). A hub
+  without internet access can use one on its own network, so its clock returns after a power
+  cut without anyone opening the web UI. Empty means the public default, and status reports
+  the server as `ntp_server`.
+- **`time.set {epoch}` for a hub without internet access.** No board has a battery-backed
+  clock, so an offline hub had no time and its schedules never ran. The web UI now hands over
+  the browser's clock when status says `clock_set: false`. The hub takes it only while its own
+  clock is unset, so a browser never moves a clock that SNTP has set. WebSocket only: every web-server URI slot is taken, so there is no REST twin. The P4 gets
+  the time from the S3 within a second.
+- **Home Assistant discovery** (zhac-components `ha_bridge`): a toggle and a discovery prefix
+  in Settings → MQTT. Devices, their state and their controls appear in Home Assistant's MQTT
+  integration; commands come back on `<root>/devices/<IEEE>/<key>/set`. Device data is
+  fetched from the P4 through the same handlers the web UI uses.
+- **Wi-Fi setup from the browser flasher (Improv Wi-Fi serial).** After flashing the S3 over
+  its UART port, the installer asks for the Wi-Fi name and password, picks from a scan, and
+  links to the hub once it is online; later visits offer "Change Wi-Fi". The hub switches
+  networks without rebooting and saves the credentials exactly as `/api/wifi` does. Console
+  output now goes through the UART driver so log lines cannot split a packet. Costs one 4 KB
+  internal-RAM task. The framing is host-tested (`test/host/test_improv_proto.cpp`).
+
+### Fixed
+
+- **Decimal writes.** `device.attr.set` / `PUT /api/devices/:ieee/attrs` with `21.5` no longer
+  truncates to 21: the value travels to the P4 as `fval` and the device's converter scales it.
+
+- **Saving settings no longer strips the MQTT password.** Status shows the broker URL without
+  its `user:pass@` part, the Settings form sent that form back, and the hub stored it, so
+  every save disconnected the hub from a password-protected broker. A submitted URL equal to
+  the credential-free form of the stored one now leaves the stored one untouched. The log line
+  for a changed broker is credential-free too.
+
+- **A restarted P4 had no time for up to an hour**, so its schedules waited (and, before the
+  matching `simple_rules` fix, fired at the wrong time). The S3 only sent TIME_SYNC hourly;
+  every (re)SYNC with the P4 now sends it at once. `/api/status` and `status.get` report
+  `clock_set`, which the web UI shows on the Rules page.
+- **Every enum write from the web UI sent the first option.** A string value such as
+  `"restore"` went through `atoi()` and became 0. Numeric strings still become numbers;
+  anything else now travels to the P4 as text (`sval`), where the device's converter looks it
+  up. Needs a main-core with the matching change; an older P4 ignores the new field.
+
+### Added
+
 - **device.groups.* — native ZCL group membership API + mirror (increment 2).**
   New `device.groups.list` / `.add` / `.remove` (WS + generic REST, remote-allow-
   listed). add/remove send the ZCL Groups command to the device (reusing the

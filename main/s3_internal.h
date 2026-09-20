@@ -7,6 +7,7 @@
 #include <cstdio>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "nvs.h"
 #include "hap_session.h"
 #include "hap_json.h"
@@ -82,6 +83,9 @@ extern bool s_auth_enabled;
 // ── OTA signalling ────────────────────────────────────────────────────────
 extern char              s_ota_url[256];
 extern SemaphoreHandle_t s_ota_sem;
+
+// TaskTimeSync, so hap_bridge can wake it on every (re)SYNC with the P4.
+extern std::atomic<TaskHandle_t> s_time_sync_task;
 
 // ── P4 state cache ────────────────────────────────────────────────────────
 extern std::atomic<uint16_t> s_p4_device_count;

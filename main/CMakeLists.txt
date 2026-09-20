@@ -14,6 +14,7 @@ set(srcs
     "rest_rules.cpp"
     "rest_ops.cpp"
     "ws_bridge.cpp"
+    "ha_glue.cpp"
     "wifi_mgr.cpp"
     "metrics_mqtt.cpp"
 )
@@ -33,6 +34,8 @@ idf_component_register(
         hap_json
         ws_server
         mqtt_gw
+        ntp_cfg
+        ha_bridge
         tg_gw
         metrics
         mbedtls
@@ -48,6 +51,7 @@ idf_component_register(
         freertos
         spiffs
         driver
+        esp_driver_uart   # improv serial on the console UART (wifi_mgr.cpp)
         remote_client
         rainmaker_gw
 )

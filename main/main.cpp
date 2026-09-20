@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include "ha_glue.h"
+#include "zap_setup_window.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -362,6 +364,9 @@ void auth_init() {
                s_api_token);
         fflush(stdout);
         ESP_LOGI(TAG, "API auth enabled (token len=%u)", (unsigned)strlen(s_api_token));
+        if (!s_pw_set)
+            ESP_LOGW(TAG, "no admin password: the web UI can set one for %u min after power-on, "
+                     "then a power cycle reopens that", (unsigned)(kZapSetupWindowS / 60));
     } else {
         ws_server_set_api_token(nullptr);
         ESP_LOGI(TAG, "API auth disabled");
@@ -486,6 +491,7 @@ nvs_handle_t s_nvs_zhac_opt = 0;
 // ── S3 HAP + WiFi state ───────────────────────────────────────────────────
 std::atomic<bool> s_synced{false};
 std::atomic<bool> s_wifi_connected{false};
+std::atomic<TaskHandle_t> s_time_sync_task{nullptr};
 bool              s_metrics_enabled = false;
 bool              s_ap_disabled     = false;
 
@@ -511,7 +517,10 @@ static void task_time_sync(void*) {
             ESP_LOGI(TAG, "TIME_SYNC sent ts=%lld", (long long)now);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(3600 * 1000));
+        // Hourly, or at once when hap_bridge wakes us after a (re)SYNC: a P4
+        // that restarted has lost the time and runs no schedules until it
+        // gets it again.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(3600 * 1000));
     }
 }
 
@@ -1160,13 +1169,18 @@ extern "C" void app_main() {
         // happens on STA_GOT_IP; mqtt_gw_subscribe stores the filter
         // and applies it on the next CONNECTED event.
         mqtt_gw_set_rx_callback(on_mqtt_rx);
+        ha_glue_start();   // Home Assistant discovery (off until enabled in Settings)
         // Subscribe under the configured root so two controllers on
         // one broker don't receive each other's device commands.
         char sub[40];
         snprintf(sub, sizeof(sub), "%s/#", mqtt_gw_get_root_topic());
         mqtt_gw_subscribe(sub, 0);
     }
-    xTaskCreate(             task_time_sync, "TaskTimeSync", zhac::stack::kTimeSync, nullptr, 2, nullptr);
+    {
+        TaskHandle_t ts = nullptr;
+        xTaskCreate(         task_time_sync, "TaskTimeSync", zhac::stack::kTimeSync, nullptr, 2, &ts);
+        s_time_sync_task.store(ts, std::memory_order_release);
+    }
     xTaskCreate(             task_ota,    "TaskOTA",   zhac::stack::kOta, nullptr, 2, nullptr);
     xTaskCreate(             task_p4_ota, "TaskP4OTA", zhac::stack::kP4Ota, nullptr, 2, nullptr);
     xTaskCreate(             task_stack_mon,"TaskStackMon", zhac::stack::kStackMonS3, nullptr, 1, nullptr);

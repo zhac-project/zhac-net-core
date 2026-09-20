@@ -110,7 +110,14 @@ always overrides the build default across reboots and updates.
 
 ### Onboarding a fresh unit
 
-Because provisioning is auth-gated, you need the token before WiFi setup:
+The easiest path skips the token: flash the S3 from the browser flasher over its
+UART port, and the installer asks for the Wi-Fi name and password and sends them
+over the cable (Improv Wi-Fi serial, `wifi_mgr.cpp`). The serial port is already
+the trusted channel the token is printed on, so this needs no token. Reopening the
+flasher later offers "Change Wi-Fi" and a link to the hub.
+
+Provisioning over the network (`/api/wifi/*`) is auth-gated, so there you need the
+token first:
 
 - **Community / single unit** — read the random token from the serial console on
   first boot, then use it to provision.

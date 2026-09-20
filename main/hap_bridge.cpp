@@ -28,6 +28,8 @@
 #include "api_handlers.h"
 #include "metrics/metrics_macros.h"
 #include "task_stacks.h"
+#include "ha_bridge.h"
+#include "ha_glue.h"
 #include "rmk_bridge.h"   // Task 16 fix: BULK_STATE_UPDATE is the real S3
                           // fan-out for device state (device_shadow/
                           // event_bus are never fed on this target — see
@@ -700,6 +702,10 @@ void task_hap(void*) {
                                                          f.payload_len, 0, false);
                                     }
                                 }
+                                // Home Assistant: one retained topic per
+                                // attribute (no-op while discovery is off).
+                                ha_glue_publish_attrs(parse_ieee(ieee_str),
+                                                      doc["attrs"].as<JsonObjectConst>());
                             }
 
                             // Task 16 fix: RainMaker bridge OUT direction.
@@ -809,6 +815,7 @@ void task_hap(void*) {
                     uint64_t ieee = 0;
                     hap_json_decode_device_join(f.payload, f.payload_len, &ieee);
                     ESP_LOGI(TAG, "DEVICE_JOIN ieee=0x%016llX", (unsigned long long)ieee);
+                    ha_bridge_device_changed(ieee);
                     ws_event_broadcast("device.added",
                                         reinterpret_cast<const char*>(f.payload),
                                         f.payload_len);
@@ -825,6 +832,7 @@ void task_hap(void*) {
                     uint64_t ieee = 0;
                     hap_json_decode_device_join(f.payload, f.payload_len, &ieee);
                     ESP_LOGI(TAG, "DEVICE_LEAVE ieee=0x%016llX", (unsigned long long)ieee);
+                    ha_bridge_device_removed(ieee);
                     // Task 16 fix: pulls the RainMaker unpair cleanup
                     // forward from Task 18's own registry-reconciliation
                     // pass. Cheap no-op (flag-off stub, or ieee simply
@@ -964,6 +972,12 @@ void task_hap(void*) {
             if (!hap_json_decode_sync(f.payload, f.payload_len, info)) return;
             if (!info.is_ack) return;
             s_synced.store(true, std::memory_order_release);
+            // The P4 has no clock of its own and its schedules wait until it
+            // has the time. After a P4 restart this re-SYNC is the first
+            // chance to resend it, instead of the next hourly TIME_SYNC.
+            if (TaskHandle_t t = s_time_sync_task.load(std::memory_order_acquire)) {
+                xTaskNotifyGive(t);
+            }
 #if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
             // F-08: SYNC_ACK is proof the new firmware can talk to P4
             // over SPI — the strongest health signal we have. Cancel

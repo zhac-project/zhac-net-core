@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "zap_setup_window.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -602,6 +603,13 @@ static esp_err_t handle_post_auth_setup(httpd_req_t* req) {
     if (auth_password_is_set()) {
         httpd_resp_set_status(req, "403 Forbidden");
         httpd_resp_sendstr(req, "{\"error\":\"already_set\"}");
+        return ESP_OK;
+    }
+    // Bounded first claim (zap_setup_window.h): only in the first ten minutes
+    // after power-on. Whoever can power-cycle the hub can reopen it.
+    if (zap_setup_secs_left() == 0) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_sendstr(req, "{\"error\":\"setup_closed\"}");
         return ESP_OK;
     }
     char body[192] = {};

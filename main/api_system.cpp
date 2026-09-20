@@ -14,7 +14,11 @@
 //   - handle_post_scripts_bulk   (body up to HAP_MAX_PAYLOAD; shared-handler
 //                                  buffers would pin too much stack)
 
+#include "ha_bridge.h"
+#include "zap_setup_window.h"
 #include "api_handlers.h"
+#include "zap_clock.h"
+#include "ntp_cfg.h"
 #include "s3_internal.h"
 #include "nvs_helpers.h"
 #include "log_ring.h"
@@ -33,6 +37,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <sys/time.h>
 #include <memory>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -78,10 +83,34 @@ static bool url_has_control_chars(const char* url) {
 #include "sys_metrics.h"
 
 // ── Status / system ──────────────────────────────────────────────────────
+// time.set {epoch}: the browser's clock for a hub that has none -- no RTC, and
+// SNTP needs the internet. It fills an unset clock only (zap_clock.h); the P4
+// then gets the time from task_time_sync within a second, and its schedules
+// start. Reply {"set":false} means the clock was already set and untouched.
+extern "C" ApiStatus api_time_set(const char* body, size_t body_len,
+                                  char* rsp_buf, size_t rsp_cap, size_t* rsp_len) {
+    JsonDocument doc;
+    if (body_len == 0 || deserializeJson(doc, body, body_len)) return API_BAD_REQUEST;
+    const int64_t epoch = doc["epoch"] | static_cast<int64_t>(0);
+    if (!zap_clock_epoch_ok(epoch)) return API_BAD_REQUEST;
+    bool set = false;
+    if (!zap_clock_is_set(time(nullptr))) {
+        const timeval tv{static_cast<time_t>(epoch), 0};
+        set = settimeofday(&tv, nullptr) == 0;
+        if (set) ESP_LOGI(TAG_API, "clock set from the web UI");
+    }
+    const int n = snprintf(rsp_buf, rsp_cap, "{\"set\":%s}", set ? "true" : "false");
+    if (n < 0 || static_cast<size_t>(n) >= rsp_cap) return API_INTERNAL_ERROR;
+    *rsp_len = static_cast<size_t>(n);
+    return API_OK;
+}
+
 extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
                                      char* rsp_buf, size_t rsp_cap,
                                      size_t* rsp_len) {
     char ip_str[16]  = "0.0.0.0";
+    char ntp_dhcp[48] = "";
+    ntp_cfg_dhcp_server(ntp_dhcp, sizeof(ntp_dhcp));   // empty when the router offers none
     char mac_str[18] = "00:00:00:00:00:00";
 
     uint8_t mqtt_en_u8        = 0;
@@ -188,8 +217,14 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"metrics_enabled\":%s"
          ",\"auth_enabled\":%s"
          ",\"auth_setup_required\":%s"
+         ",\"auth_setup_secs_left\":%u"
+         ",\"clock_set\":%s"
+         ",\"ntp_server\":\"%s\""
+         ",\"ntp_dhcp_server\":\"%s\""
          ",\"fw_version\":\"%s\""
          ",\"p4_unresponsive\":%s"
+         ",\"ha_discovery\":%s"
+         ",\"ha_prefix\":\"%s\""
          ",\"p4\":{"
            "\"devices\":%" PRIu16
            ",\"uptime\":%" PRIu32
@@ -246,6 +281,14 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         // that no password exists yet — the same fact the open setup endpoint
         // makes true; both close the moment the password is set.
         (s_auth_enabled && !auth_password_is_set())      ? "true" : "false",
+        // Seconds the first-claim window has left (zap_setup_window.h); 0 once
+        // it closed -- a power cycle reopens it. Always 0 with a password set.
+        (unsigned)((s_auth_enabled && !auth_password_is_set()) ? zap_setup_secs_left() : 0),
+        // Schedules (cron rules, Lua on_cron) wait until the clock is set;
+        // the SPA's Rules page says so. The P4 takes its time from this one.
+        time(nullptr) >= 1577836800                      ? "true" : "false",
+        ntp_cfg_server(),   // zap_ntp_host_ok() keeps quotes/backslashes out
+        ntp_dhcp,           // the router's offer in use, or empty
         s3_fw_ver,
         // F-01 fix: api_token field removed — /api/status is
         // unauthenticated, so echoing the bootstrap token here let any
@@ -253,6 +296,8 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         // on first boot (see auth_init in main.cpp) or via the
         // authenticated /api/system/token (api_token_rotate).
         hap_bridge_is_p4_unresponsive()                  ? "true" : "false",
+        ha_bridge_enabled()                              ? "true" : "false",
+        ha_bridge_prefix(),   // [A-Za-z0-9_-] only (ha_bridge_configure)
         s_p4_device_count.load(std::memory_order_relaxed),
         s_p4_uptime_s.load(std::memory_order_relaxed),
         p4_fw_ver,
@@ -605,11 +650,27 @@ extern "C" ApiStatus api_settings_set(const char* body, size_t body_len,
         if (nvs_open("mqtt_cfg", NVS_READWRITE, &h) != ESP_OK) {
             return API_INTERNAL_ERROR;
         }
-        nvs_set_str(h, "broker_url", url);
-        nvs_commit(h);
-        nvs_close(h);
-        mqtt_gw_set_broker_url(url);
-        ESP_LOGI(TAG_API, "MQTT broker updated: %s", url);
+        // Status shows the broker WITHOUT its user:pass@ (sanitize_broker_url),
+        // and the web UI's Settings form sends back what it showed. A client
+        // that echoes that credential-free form has not changed the broker:
+        // keep the stored URL, or every "Save settings" would silently strip
+        // the MQTT password.
+        char stored[128] = {}, stored_safe[128] = {};
+        size_t stored_len = sizeof(stored);
+        const bool have_stored = nvs_get_str(h, "broker_url", stored, &stored_len) == ESP_OK && stored[0];
+        if (have_stored) sanitize_broker_url(stored, stored_safe, sizeof(stored_safe));
+        if (have_stored && strcmp(url, stored_safe) == 0 && strcmp(url, stored) != 0) {
+            nvs_close(h);
+            ESP_LOGI(TAG_API, "MQTT broker unchanged (credential-free form echoed back)");
+        } else {
+            nvs_set_str(h, "broker_url", url);
+            nvs_commit(h);
+            nvs_close(h);
+            mqtt_gw_set_broker_url(url);
+            char safe[128];
+            sanitize_broker_url(url, safe, sizeof(safe));
+            ESP_LOGI(TAG_API, "MQTT broker updated: %s", safe);
+        }
     }
 
     // P4-T29 (FINDINGS §6, :544): `sys_cfg` was opened+committed+closed THREE
@@ -624,6 +685,11 @@ extern "C" ApiStatus api_settings_set(const char* body, size_t body_len,
     bool        set_tz        = false;  char tz_keep[64] = {};
     bool        set_metrics   = false;  uint8_t metrics_val = 0;
     bool        set_apdis     = false;  uint8_t apdis_val   = 0;
+
+    // Time server: ntp_cfg persists it in sys_cfg and restarts SNTP itself, so
+    // it stays out of the staged block below.
+    const char* ntp_str = doc["ntp_server"] | (const char*)nullptr;
+    if (ntp_str && !ntp_cfg_set_server(ntp_str)) return API_BAD_REQUEST;
 
     const char* tz_str = doc["timezone"] | (const char*)nullptr;
     if (tz_str && tz_str[0] != '\0') {
@@ -679,6 +745,11 @@ extern "C" ApiStatus api_settings_set(const char* body, size_t body_len,
             mqtt_gw_stop();
             ESP_LOGI(TAG_API, "MQTT: disabled (applied)");
         }
+    }
+
+    if (doc["ha_discovery"].is<bool>() || doc["ha_prefix"].is<const char*>()) {
+        const bool en = doc["ha_discovery"] | ha_bridge_enabled();
+        ha_bridge_configure(en, doc["ha_prefix"] | ha_bridge_prefix());
     }
 
     if (doc["auth_enabled"].is<bool>()) {

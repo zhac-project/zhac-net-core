@@ -31,6 +31,9 @@
 
 // ── Status / system ─────────────────────────────────────────────────
 ZHAC_API_ROUTE("status.get",                 api_status_get,                  GET,  "/api/status")
+// WS only, no REST twin: every httpd URI slot is taken (see the count assert in
+// rest_ops.cpp), and one more would silently drop the SPA catch-all.
+ZHAC_API_ROUTE("time.set",                   api_time_set,                    POST, "/api/time")
 ZHAC_API_ROUTE("alerts.get",                 api_alerts_get,                  GET,  "/api/alerts")
 ZHAC_API_ROUTE("logs.get",                   api_logs_get,                    GET,  "/api/logs")
 ZHAC_API_ROUTE("diagnostics.unhandled.get",  api_diagnostics_unhandled_get,   GET,  "/api/diagnostics/unhandled")

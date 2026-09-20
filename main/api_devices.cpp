@@ -4,6 +4,7 @@
 // Handlers here are PURE business logic. Auth, rate-limiting, URI parsing,
 // and transport framing live in rest_*.cpp (HTTP) and ws_bridge.cpp (WS).
 
+#include "ha_bridge.h"
 #include "api_handlers.h"
 #include "s3_internal.h"
 #include "log_ring.h"
@@ -18,6 +19,7 @@
 #include "rmk_bridge.h"   // rmk_bridge_on_device_renamed (Task 18)
 #include "ArduinoJson.h"
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -535,6 +537,7 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
     // (Task 16) and NOT duplicated here. `name` is already UTF-8-sanitized
     // above (utf8_safe_copy).
     rmk_bridge_on_device_renamed(ieee, name);
+    ha_bridge_device_changed(ieee);   // Home Assistant shows the new name
 
     size_t n = (got >= rsp_cap) ? rsp_cap - 1 : got;
     memcpy(rsp_buf, rsp.get(), n);
@@ -569,7 +572,8 @@ extern "C" ApiStatus api_device_rename(const char* body, size_t body_len,
 extern "C" ApiStatus device_attr_set_core(uint64_t ieee, const char* key,
                                            int32_t val, uint8_t ep,
                                            uint16_t cluster, uint16_t attr,
-                                           bool* cmd_ok_out) {
+                                           bool* cmd_ok_out, const char* sval,
+                                           const float* fval) {
     HapSetAttrReq req{};
     req.ieee    = ieee;
     req.ep      = ep;
@@ -577,6 +581,8 @@ extern "C" ApiStatus device_attr_set_core(uint64_t ieee, const char* key,
     req.attr    = attr;
     req.val     = val;
     strncpy(req.key, key, sizeof(req.key) - 1);
+    if (sval) strncpy(req.sval, sval, sizeof(req.sval) - 1);
+    if (fval) { req.fval = *fval; req.has_fval = true; }
 
     uint8_t hap_buf[160];
     uint16_t hap_len = 0;
@@ -642,8 +648,28 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
     if (vv.isNull()) vv = doc["val"];
     if (vv.is<bool>())              attr.val = vv.as<bool>() ? 1 : 0;
     else if (vv.is<int>())          attr.val = vv.as<int32_t>();
-    else if (vv.is<float>())        attr.val = (int32_t)vv.as<float>();
-    else if (vv.is<const char*>())  attr.val = atoi(vv.as<const char*>());
+    else if (vv.is<float>()) {
+        // A decimal (21.5): travels as `fval` for the converter to scale;
+        // `val` keeps the rounded integer for a P4 without fval support.
+        attr.fval     = vv.as<float>();
+        attr.has_fval = true;
+        attr.val      = (int32_t)lroundf(attr.fval);
+    }
+    else if (vv.is<const char*>()) {
+        // "12" is a number sent as text; anything else ("restore", "heat") is
+        // an enum option. That used to become atoi() == 0 -- every enum write
+        // from the web UI sent the first option's raw value. The option now
+        // travels as text (sval) to the P4's converter, which owns its lookup.
+        const char* s = vv.as<const char*>();
+        char* end = nullptr;
+        const long n = strtol(s, &end, 10);
+        if (end && end != s && *end == '\0') {
+            attr.val = (int32_t)n;
+        } else {
+            if (strlen(s) >= sizeof(attr.sval)) return API_BAD_REQUEST;
+            strncpy(attr.sval, s, sizeof(attr.sval) - 1);
+        }
+    }
     else                            attr.val = 0;
 
     attr.ep      = doc["ep"]      | (uint8_t)0;
@@ -653,7 +679,9 @@ extern "C" ApiStatus api_device_attr_set(const char* body, size_t body_len,
     bool cmd_ok = false;
     ApiStatus core_st = device_attr_set_core(attr.ieee, attr.key, attr.val,
                                               attr.ep, attr.cluster, attr.attr,
-                                              &cmd_ok);
+                                              &cmd_ok,
+                                              attr.sval[0] ? attr.sval : nullptr,
+                                              attr.has_fval ? &attr.fval : nullptr);
     if (core_st != API_OK) return core_st;
 
     // Optimistic RainMaker report for an externally-commanded change (this

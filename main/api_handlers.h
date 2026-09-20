@@ -47,6 +47,11 @@ typedef ApiStatus (*ApiHandlerFn)(const char*, size_t, char*, size_t, size_t*);
 ApiStatus api_status_get(const char* body, size_t body_len,
                           char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
 
+// time.set {epoch} — WS only. Sets an UNSET clock from the browser's; replies
+// {"set":bool}, false when the clock was already set (left untouched).
+ApiStatus api_time_set(const char* body, size_t body_len,
+                        char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
+
 // GET /api/alerts — args-less. Reply buffer >= 1024 bytes.
 ApiStatus api_alerts_get(const char* body, size_t body_len,
                           char* rsp_buf, size_t rsp_cap, size_t* rsp_len);
@@ -164,9 +169,14 @@ ApiStatus api_device_attr_set(const char* body, size_t body_len,
 //
 // `key` must already be validated to fit HapSetAttrReq::key (<=23 chars,
 // NUL-terminated) — this function does not re-check.
+// `sval`: an enum option or other string value, sent to the P4 as text
+// (HapSetAttrReq::sval); null for numeric writes.
+// `fval`: a decimal value (21.5); `val` then carries its rounded integer for
+// a P4 that predates decimal writes. Null for integer writes.
 ApiStatus device_attr_set_core(uint64_t ieee, const char* key, int32_t val,
                                 uint8_t ep, uint16_t cluster, uint16_t attr,
-                                bool* cmd_ok_out);
+                                bool* cmd_ok_out, const char* sval = nullptr,
+                                const float* fval = nullptr);
 
 // device.groups.list/add/remove — native ZCL group membership (increment 2).
 // args {ieee} (list) or {ieee, ep?, gid} (add/remove). Returns {"groups":[...]}.

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include "ha_bridge.h"
 #include "s3_internal.h"
 #include <cinttypes>
 #include <cstring>
@@ -439,6 +440,9 @@ void on_ws_rx(int fd, const char* data, size_t len) {
 // Called from the esp-mqtt event task — keep it fast, no blocking.
 void on_mqtt_rx(const char* topic, int topic_len,
                 const char* data,  int data_len) {
+    // Home Assistant commands (<root>/devices/<IEEE>/<key>/set) are queued to
+    // ha_bridge's task, never handled here on the esp-mqtt task.
+    if (ha_bridge_on_mqtt_rx(topic, topic_len, data, data_len)) return;
     // Check for interview trigger: <root>/devices/0x.../interview
     {
         char prefix[48];
