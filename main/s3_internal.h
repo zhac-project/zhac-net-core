@@ -204,6 +204,8 @@ bool     auth_check_token(const char* token);   // F18: WS first-message auth
 void     auth_init();
 // Admin password (human credential — login exchanges it for the API token).
 bool     auth_password_is_set();
+bool     auth_storage_error();   // zhac_auth could not be opened: sign-in forced on, RAM token, no set-up
+bool     sys_storage_error();    // NVS could not be initialised at boot: locked, empty, nothing erased
 bool     auth_password_store(const char* pw);               // 8..63 chars; persists salted hash
 bool     auth_password_check(httpd_req_t* req, const char* pw);  // shares the auth lockout
 

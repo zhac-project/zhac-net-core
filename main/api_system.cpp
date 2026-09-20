@@ -218,6 +218,8 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
          ",\"auth_enabled\":%s"
          ",\"auth_setup_required\":%s"
          ",\"auth_setup_secs_left\":%u"
+         ",\"auth_storage_error\":%s"
+         ",\"storage_error\":%s"
          ",\"clock_set\":%s"
          ",\"ntp_server\":\"%s\""
          ",\"ntp_dhcp_server\":\"%s\""
@@ -284,6 +286,8 @@ extern "C" ApiStatus api_status_get(const char* /*body*/, size_t /*body_len*/,
         // Seconds the first-claim window has left (zap_setup_window.h); 0 once
         // it closed -- a power cycle reopens it. Always 0 with a password set.
         (unsigned)((s_auth_enabled && !auth_password_is_set()) ? zap_setup_secs_left() : 0),
+        auth_storage_error() ? "true" : "false",   // sign-in forced on, serial token only
+        sys_storage_error()  ? "true" : "false",   // NVS unusable at boot; nothing erased
         // Schedules (cron rules, Lua on_cron) wait until the clock is set;
         // the SPA's Rules page says so. The P4 takes its time from this one.
         time(nullptr) >= 1577836800                      ? "true" : "false",

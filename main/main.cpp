@@ -66,6 +66,10 @@ uint64_t parse_ieee(const char* s) {
 
 char s_api_token[33] = {};
 bool s_auth_enabled = false;
+bool g_storage_error = false;            // NVS could not be initialised at boot
+static bool s_auth_storage_error = false;  // zhac_auth namespace could not be opened
+bool sys_storage_error()  { return g_storage_error; }
+bool auth_storage_error() { return s_auth_storage_error; }
 
 // Auth-failure rate limit (CC-F8). Sliding 60-second window of failed attempts;
 // once a peer crosses AUTH_FAIL_LIMIT in the window its check_auth returns false
@@ -252,7 +256,23 @@ void auth_init() {
     nvs_handle_t h;
     esp_err_t oe = nvs_open("zhac_auth", NVS_READWRITE, &h);
     if (oe != ESP_OK) {
-        ESP_LOGE(TAG, "auth_init: nvs_open failed: %s", esp_err_to_name(oe));
+        // Storage fault. Fail CLOSED: sign-in stays on with a token that lives
+        // only in RAM and is printed on the serial console -- the one recovery
+        // path -- and no password can be set until storage works again. The
+        // old behaviour (auth off) turned a broken flash into an open hub.
+        s_auth_storage_error = true;
+        s_auth_enabled = true;
+        s_pw_set = false;
+        uint8_t rnd[16];
+        esp_fill_random(rnd, sizeof(rnd));
+        for (int i = 0; i < 16; i++) snprintf(s_api_token + i * 2, 3, "%02x", rnd[i]);
+        ws_server_set_api_token(s_api_token);
+        ESP_LOGE(TAG, "auth_init: nvs_open failed: %s -- STORAGE ERROR: sign-in forced on, "
+                      "password set-up refused until storage is reset", esp_err_to_name(oe));
+        printf("\n*** ZHAC auth storage unreadable -- serial-only token for this boot: %s ***\n"
+               "    Sign in with it (Login -> \"Use API token\"), then reset storage from Settings.\n\n",
+               s_api_token);
+        fflush(stdout);
         return;
     }
 
@@ -996,8 +1016,14 @@ extern "C" void app_main() {
     // TODO: Enable NVS encryption (nvs_flash_secure_init) — see docs/TODO.md
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
+        // Never erase the owner's storage on our own initiative. Boot locked
+        // and empty: sign-in falls closed (auth_init), status says
+        // storage_error, Wi-Fi comes up without NVS (AP mode, no creds), and
+        // the WS command system.storage_reset erases only when asked.
+        g_storage_error = true;
+        ESP_LOGE(TAG, "NVS partition unusable (%s) -- STORAGE ERROR: booting without it. "
+                      "Sign in with the serial token, then reset storage from Settings.",
+                 esp_err_to_name(nvs_ret));
     } else {
         ESP_ERROR_CHECK(nvs_ret);
     }

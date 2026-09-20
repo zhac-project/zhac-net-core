@@ -600,6 +600,11 @@ static esp_err_t handle_post_auth_login(httpd_req_t* req) {
 static esp_err_t handle_post_auth_setup(httpd_req_t* req) {
     SET_CORS_HEADERS(req);
     httpd_resp_set_type(req, "application/json");
+    if (auth_storage_error()) {   // nowhere to keep a password: serial token only
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "{\"error\":\"storage_error\"}");
+        return ESP_OK;
+    }
     if (auth_password_is_set()) {
         httpd_resp_set_status(req, "403 Forbidden");
         httpd_resp_sendstr(req, "{\"error\":\"already_set\"}");

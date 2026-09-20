@@ -708,6 +708,10 @@ void wifi_mgr_init(void) {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    // Storage error boot: the Wi-Fi driver must not touch NVS or init fails
+    // and the hub could never show its recovery page. Credentials are
+    // unreadable too, so it falls to AP mode by itself.
+    if (sys_storage_error()) init_cfg.nvs_enable = 0;
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
 
     ESP_ERROR_CHECK(esp_event_handler_register(

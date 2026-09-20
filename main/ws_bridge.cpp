@@ -11,6 +11,8 @@
 #include "freertos/task.h"
 #include <atomic>
 #include "esp_log.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
 #include "hap_json.h"
@@ -127,6 +129,19 @@ static void dispatch_envelope(int fd, JsonDocument& doc) {
         }
         send_envelope_error(fd, id_var, "auth required");
         return;
+    }
+    // WS only (every REST URI slot is taken): erase the hub's storage on the
+    // owner's explicit request -- the boot path never does it by itself.
+    if (strcmp(cmd, "system.storage_reset") == 0) {
+        ESP_LOGW("ws_bridge", "storage reset requested -- erasing NVS and restarting");
+        const esp_err_t e = nvs_flash_erase();
+        if (e != ESP_OK) { send_envelope_error(fd, id_var, esp_err_to_name(e)); return; }
+        char ok[96];
+        int n = id_var.is<int>() ? snprintf(ok, sizeof(ok), "{\"id\":%d,\"ok\":true}", id_var.as<int>())
+                                 : snprintf(ok, sizeof(ok), "{\"id\":null,\"ok\":true}");
+        if (n > 0 && (size_t)n < sizeof(ok)) ws_server_reply(fd, ok, (size_t)n);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
     }
     const WsCmd* entry = ws_lookup(cmd);
     if (!entry) {
