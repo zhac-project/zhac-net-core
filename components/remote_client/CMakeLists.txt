@@ -36,6 +36,7 @@ idf_component_register(
     # resolving via REQUIRES from another component is rejected here,
     # the dependency must be private.
     PRIV_REQUIRES esp_websocket_client
+                  esp_app_format   # esp_app_get_description: fw_version in the auth frame
                   mbedtls esp-tls
                   nvs_flash
                   ws_server

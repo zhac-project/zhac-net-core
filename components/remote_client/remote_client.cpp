@@ -28,6 +28,7 @@
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
 #include "esp_log.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_event.h"
@@ -250,11 +251,20 @@ static void send_auth_frame() {
     // reply to *this* request and reject stale / replayed / unsolicited frames.
     s_auth_id = esp_random() & 0x7FFFFFFFu;   // positive JSON int range
     if (s_auth_id == 0) s_auth_id = 1;
-    char buf[256];
+    // The cloud reconciles by these: a boot_epoch it has not seen means the
+    // hub restarted and its cache must be reloaded cold; the version lets it
+    // pick the right protocol expectations. "vDEV" and no boot_epoch made
+    // every reconnect look like a warm one.
+    static uint32_t s_boot_epoch = 0;
+    if (s_boot_epoch == 0) s_boot_epoch = (esp_random() & 0x7FFFFFFFu) | 1u;
+    const esp_app_desc_t* app = esp_app_get_description();
+    char buf[320];
     int n = snprintf(buf, sizeof(buf),
         "{\"id\":%u,\"cmd\":\"remote.auth\","
-        "\"args\":{\"token\":\"%s\",\"device_id\":\"%s\",\"fw_version\":\"%s\"}}",
-        (unsigned)s_auth_id, s_cfg.token, s_cfg.devid, "vDEV");
+        "\"args\":{\"token\":\"%s\",\"device_id\":\"%s\",\"fw_version\":\"%s\","
+        "\"boot_epoch\":%u}}",
+        (unsigned)s_auth_id, s_cfg.token, s_cfg.devid, app ? app->version : "unknown",
+        (unsigned)s_boot_epoch);
     if (n > 0 && (size_t)n < sizeof(buf) && s_ws) {
         esp_websocket_client_send_text(s_ws, buf, n, pdMS_TO_TICKS(2000));
     }

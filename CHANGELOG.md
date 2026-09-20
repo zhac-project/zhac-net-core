@@ -42,6 +42,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **Cloud auth frame carries the real firmware version and a per-boot identifier**
+  (`boot_epoch`) instead of the literal `vDEV`, so the cloud can tell a reboot from a
+  reconnect and reload its cache cold when it must (architecture review A4, hub side).
+
 - **Decimal writes.** `device.attr.set` / `PUT /api/devices/:ieee/attrs` with `21.5` no longer
   truncates to 21: the value travels to the P4 as `fval` and the device's converter scales it.
 
