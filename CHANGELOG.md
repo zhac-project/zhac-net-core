@@ -9,6 +9,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Changed
 
+- **Home Assistant: thermostats, covers, locks, fans and buttons become their own entity
+  types**, and battery devices turn unavailable after a day of silence (zhac-components
+  `ha_bridge`). Battery detection needs a P4 whose `device.get` reports the power source.
+
 - **Storage faults no longer erase the owner's data.** When the NVS partition cannot be
   initialised at boot (no free pages, format version change) the hub used to erase it
   silently: devices, rules, names, passwords gone. It now boots locked and empty instead:

@@ -39,7 +39,7 @@ bool with_device(uint64_t ieee, HaDeviceCb cb, void* ctx) {
             if (d["attrs"].isNull() || serializeJson(d["attrs"], attrs, kJsonCap) >= kJsonCap)
                 snprintf(attrs, kJsonCap, "{}");
             const HaDeviceSnapshot snap{ieee, d["name"] | "", d["vendor"] | "", d["model"] | "",
-                                        exposes, attrs};
+                                        exposes, attrs, ha_battery_powered((uint8_t)(d["ps"] | 0))};
             cb(snap, ctx);
             ok = true;
         }
