@@ -9,6 +9,7 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Changed
 
+- `ws_server`: on builds that execute from PSRAM (`CONFIG_SPIRAM_XIP_FROM_PSRAM`, the S31 wired core) the 12 K httpd task stack is allocated from PSRAM via `httpd_config_t.task_caps`; S3 builds unchanged.
 - **Status JSON could carry a stray control byte** from a stale MQTT client id in NVS; the
   settings loader now drops any non-printable broker URL, root topic or client id.
 

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "ws_server.h"
+#include "sdkconfig.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -292,6 +293,12 @@ void ws_server_init() {
                                      // path (httpd thread tracing through master_send
                                      // and back into ws send) plus headroom for
                                      // future handler additions.
+#if defined(CONFIG_SPIRAM_XIP_FROM_PSRAM) && defined(CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM)
+    // Firmware runs from PSRAM (S31 wired build): the 12 K httpd stack lives
+    // there too and stays off the tight internal DRAM. Other builds keep the
+    // httpd default (internal).
+    cfg.task_caps           = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#endif
     // Mobile browsers (Safari/Chrome on iOS/Android) open up to 6 parallel
     // TCP connections to the same host for speculative fetches + asset
     // prefetch. LRU eviction re-purposes the oldest idle connection for
