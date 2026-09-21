@@ -9,6 +9,9 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Changed
 
+- **Status JSON could carry a stray control byte** from a stale MQTT client id in NVS; the
+  settings loader now drops any non-printable broker URL, root topic or client id.
+
 - **Home Assistant: thermostats, covers, locks, fans and buttons become their own entity
   types**, and battery devices turn unavailable after a day of silence (zhac-components
   `ha_bridge`). Battery detection needs a P4 whose `device.get` reports the power source.
