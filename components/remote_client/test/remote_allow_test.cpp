@@ -10,7 +10,9 @@ int main() {
     assert(remote_cmd_allowed("device.list"));
     assert(remote_cmd_allowed("device.attr.set"));
     assert(remote_cmd_allowed("rule.create"));
-    assert(remote_cmd_allowed("script.run"));
+    // script.run is privileged (F9: arbitrary Lua = RCE); denied unless the
+    // build sets CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED, which this test does not.
+    assert(!remote_cmd_allowed("script.run"));
     assert(remote_cmd_allowed("group.cmd"));
     assert(remote_cmd_allowed("alerts.get"));
 
@@ -39,6 +41,17 @@ int main() {
     assert(remote_event_allowed("rule.fired"));
     assert(remote_event_allowed("group.changed"));
     assert(remote_event_allowed("alert"));
+
+    // Names the single-chip builds (wired S31/P4, mono) push: per-attribute
+    // attr.changed {ieee,key,value,ts} and the rule/group edit events. The
+    // cloud's LiveEventAdapter consumes all of them; filtered here, a hub on
+    // those builds never updated the cloud shadow after the first sync.
+    assert(remote_event_allowed("attr.changed"));
+    assert(remote_event_allowed("attr.bulk"));
+    assert(remote_event_allowed("rule.updated"));
+    assert(remote_event_allowed("rule.deleted"));
+    assert(remote_event_allowed("group.updated"));
+    assert(remote_event_allowed("group.deleted"));
 
     // log / wifi / mqtt / bulk events stay LAN-only.
     assert(!remote_event_allowed("log.line"));

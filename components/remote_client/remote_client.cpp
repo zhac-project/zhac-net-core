@@ -379,15 +379,24 @@ static void drain_tx_queue() {
     }
 }
 
-// True when the STA interface currently holds a non-zero IPv4 lease. Used to self-heal a missed
-// EVB_WIFI_UP edge (see the IDLE_NO_WIFI case): app_main posts EVB_WIFI_UP on IP_EVENT_STA_GOT_IP,
-// but if got-IP fired before this task processed EVB_ENABLE the one-shot bit is lost and we would
-// otherwise sit in IDLE_NO_WIFI forever despite a live STA.
-static bool sta_has_ip() {
-    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta == nullptr) return false;
-    esp_netif_ip_info_t ip{};
-    return esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0;
+// True when an uplink -- the Wi-Fi STA or the Ethernet port -- is up and holds a non-zero IPv4
+// lease. Used to self-heal a missed EVB_WIFI_UP edge (see the IDLE_NO_WIFI case): app_main posts
+// EVB_WIFI_UP on got-IP, but if got-IP fired before this task processed EVB_ENABLE the one-shot bit
+// is lost and we would otherwise sit in IDLE_NO_WIFI forever despite a live link. On the Ethernet
+// builds that is the normal case, not a race: the lease is taken once at boot, long before anyone
+// pastes cloud credentials, so no got-IP edge ever follows an enable. Checking only the STA left
+// those hubs in IDLE_NO_WIFI for good.
+static bool uplink_has_ip() {
+    static const char* const kUplinks[] = {"WIFI_STA_DEF", "ETH_DEF"};
+    for (const char* key : kUplinks) {
+        esp_netif_t* nif = esp_netif_get_handle_from_ifkey(key);
+        esp_netif_ip_info_t ip{};
+        if (nif && esp_netif_is_netif_up(nif) &&
+            esp_netif_get_ip_info(nif, &ip) == ESP_OK && ip.ip.addr != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void task_remote_body(void*) {
@@ -467,7 +476,7 @@ static void task_remote_body(void*) {
                 // before we processed EVB_ENABLE, so the one-shot bit was lost), promote to
                 // CONNECTING. This case re-runs every ~1 s on the wait-bits timeout, so recovery
                 // is bounded to ~1 s without relying on a fresh wifi event.
-                if (sta_has_ip()) step(REMOTE_EV_WIFI_UP);
+                if (uplink_has_ip()) step(REMOTE_EV_WIFI_UP);
                 break;
 
             case REMOTE_STATE_CONNECTING:
@@ -606,10 +615,24 @@ static void remote_objects_init_once(void) {
 // Spawn task_remote if it is not already alive. Respawnable: the DISABLED
 // state deletes the task and clears s_task, and re-enable calls this to bring
 // it back. Does NOT recreate kernel objects (see remote_objects_init_once).
+// Cloud commands run on this task: handle_rx_frame -> dispatch_envelope_for_remote -> the same
+// handlers the local WebSocket runs on the 12 KB httpd worker. On the dual-chip S3 those handlers
+// are short HAP round trips and 6 KB is plenty; on the single-chip builds (wired, mono) they call
+// the Zigbee, rules and Lua code directly -- wired's device.get alone keeps a 2 KB exposes buffer
+// and a 32-entry attribute snapshot on the stack -- so those builds size it like the httpd worker
+// through CONFIG_ZHAC_REMOTE_TASK_STACK_KB.
+#ifndef CONFIG_ZHAC_REMOTE_TASK_STACK_KB
+#define CONFIG_ZHAC_REMOTE_TASK_STACK_KB 6
+#endif
+
 static void remote_task_spawn(void) {
     if (s_task) return;
-    xTaskCreatePinnedToCore(task_remote_body, "task_remote",
-        6 * 1024, nullptr, tskIDLE_PRIORITY + 3, &s_task, 0);
+    if (xTaskCreatePinnedToCore(task_remote_body, "task_remote",
+            CONFIG_ZHAC_REMOTE_TASK_STACK_KB * 1024, nullptr, tskIDLE_PRIORITY + 3, &s_task, 0) != pdPASS) {
+        s_task = nullptr;
+        ESP_LOGE(TAG, "task_remote create failed (%d KB stack) -- remote stays down",
+                 CONFIG_ZHAC_REMOTE_TASK_STACK_KB);
+    }
 }
 
 extern "C" void remote_client_init(void) {

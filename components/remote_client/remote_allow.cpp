@@ -72,11 +72,17 @@ constexpr const char* kRemoteAllowedEvents[] = {
     // on/off / sensor changes and can only refresh on reconnect. "device.attribute_change" below
     // is not currently emitted (kept for forward-compat).
     "attr.bulk",
+    // The single-chip builds (wired S31/P4, mono) have no coalescer: they push one
+    // attr.changed {ieee,key,value,ts} per attribute, and name rule/group edits
+    // *.updated / *.deleted. The cloud's LiveEventAdapter takes all of these.
+    "attr.changed",
     "device.added", "device.removed", "device.attribute_change",
     "device.online", "device.offline", "device.renamed",
     "device.configure_progress", "device.bound", "device.unbound",
     "rule.added", "rule.removed", "rule.fired", "rule.error",
+    "rule.updated", "rule.deleted",
     "group.added", "group.removed", "group.changed",
+    "group.updated", "group.deleted",
     "alert",
 };
 
