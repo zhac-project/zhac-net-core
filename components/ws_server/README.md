@@ -92,8 +92,10 @@ token drop back to the auth-only command set.
   **never logs** (log-pipeline-safe; queue-full/OOM drops are counted in
   `ws_bridge_tx_drops()` and surfaced in `status.get`). See the contract
   block in `main/s3_internal.h`.
-- A `configASSERT` before the guard store fires if a second task enters the
-  send loop concurrently.
+- The wired and single-chip builds call it from several tasks (event bus,
+  status tick, log sink), so the send loop runs under `s_tx_mutex`: a second
+  task waits its turn (it used to trip a `configASSERT` and reboot the hub).
+  A call from inside the loop on the same task returns at once.
 - Inside the send loop: no `ESP_LOG*` and no early returns between the
   `s_broadcast_task` guard stores — with the WS log sink enabled a log line
   re-enters the WS TX path, and a stuck guard would permanently mute the

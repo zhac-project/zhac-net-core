@@ -21,6 +21,7 @@
 static const char*       TAG      = "ws_server";
 static httpd_handle_t    s_server = nullptr;
 static SemaphoreHandle_t s_mutex  = nullptr;
+static SemaphoreHandle_t s_tx_mutex = nullptr;  // one broadcast send loop at a time
 static WsRxCallback      s_rx_cb  = nullptr;
 static char              s_api_token[33] = {};
 
@@ -262,6 +263,8 @@ static void ws_httpd_close_fn(httpd_handle_t hd, int sockfd) {
 void ws_server_init() {
     s_mutex = xSemaphoreCreateMutex();
     configASSERT(s_mutex);
+    s_tx_mutex = xSemaphoreCreateMutex();
+    configASSERT(s_tx_mutex);
 
     httpd_config_t cfg      = HTTPD_DEFAULT_CONFIG();
     cfg.server_port         = 80;
@@ -359,8 +362,10 @@ int ws_server_client_count() {
 // The log pipeline checks this (ws_server_in_broadcast) and drops its WS-sink
 // fan-out for lines logged from within the broadcast path — defence-in-depth
 // against TX-path re-entry (e.g. esp_http_server's own ESP_LOG* inside
-// httpd_ws_send_frame_async). Single writer: only the ws_bridge TX worker
-// calls ws_server_broadcast.
+// httpd_ws_send_frame_async). Written under s_tx_mutex: net-core broadcasts
+// from one TX worker, but the wired and single-chip builds broadcast from
+// several tasks (event bus, status tick, log sink), so the send loop is
+// serialized rather than asserted single-writer.
 static std::atomic<TaskHandle_t> s_broadcast_task{nullptr};
 
 bool ws_server_in_broadcast() {
@@ -369,7 +374,11 @@ bool ws_server_in_broadcast() {
 }
 
 void ws_server_broadcast(const char* json, size_t len) {
-    if (!s_server || !s_mutex) return;
+    if (!s_server || !s_mutex || !s_tx_mutex) return;
+    // A line logged from inside our own send loop would come back here on the
+    // same task; the log sink drops it already, and taking s_tx_mutex again
+    // would deadlock.
+    if (ws_server_in_broadcast()) return;
 
     // Snapshot fd list outside the send loop so we don't hold the mutex
     // while calling potentially blocking httpd API.
@@ -426,7 +435,9 @@ void ws_server_broadcast(const char* json, size_t len) {
     esp_err_t failed_err[MAX_WS_CLIENTS];
     int       n_failed = 0;
 
-    configASSERT(s_broadcast_task.load(std::memory_order_acquire) == nullptr); // single-broadcaster invariant (TX worker only)
+    // Two tasks broadcasting at once tripped the old single-writer assert and
+    // rebooted the wired hub (main's status tick vs the event bus). Take turns.
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
     s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
     // NOTE: no early returns between the guard stores — in_broadcast must clear.
     for (int i = 0; i < count; i++) {
@@ -438,6 +449,7 @@ void ws_server_broadcast(const char* json, size_t len) {
         }
     }
     s_broadcast_task.store(nullptr, std::memory_order_release);
+    xSemaphoreGive(s_tx_mutex);
 
     for (int i = 0; i < n_failed; i++) {
         remove_fd(failed_fd[i]);   // cleanup first…

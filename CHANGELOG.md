@@ -9,6 +9,7 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- `ws_server_broadcast` serializes its send loop with a mutex instead of asserting a single broadcaster. The wired and single-chip builds broadcast from several tasks (event bus, status tick, log sink); two at once tripped the assert and rebooted the S31 hub after a few hours (crash dump: `main` sending `status.tick` while `TaskEventBus` sent `attr.changed`). A call from inside the loop on the same task returns at once, as before.
 - `remote_client` on Ethernet builds (the wired S31/P4 core pulls this component): the client waited in `IDLE_NO_WIFI` for a got-IP edge, and its self-heal looked only at the Wi-Fi STA. An Ethernet hub takes its lease at boot, before anyone saves cloud credentials, so no edge ever followed and the link never started. The self-heal now accepts an up Ethernet (`ETH_DEF`) or STA interface with an address. The remote task stack comes from `CONFIG_ZHAC_REMOTE_TASK_STACK_KB` (default 6 KB here; the wired root sets 12 KB because its cloud commands run the Zigbee/rules/Lua handlers directly). The event allow-list gains the names the single-chip builds push (`attr.changed`, `rule.updated|deleted`, `group.updated|deleted`); the cloud already consumes them. The host test expected `script.run` to be cloud-allowed, which F9 made privileged; it now asserts the denial.
 
 ### Changed
