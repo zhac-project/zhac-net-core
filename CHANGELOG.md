@@ -33,6 +33,14 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Added
 
+- **Cloud automations can read rule status and run a rule now.** The remote (cloud) channel
+  allow-list gains `rules.status` (per-rule run counters, a read) and `rule.run` ("Run now": one
+  stored rule's own actions, which `rule.create` already lets the cloud schedule). ZHAC Cloud now
+  puts automations on the hub through the `rule.*` commands, and shows "last ran" and a real Test
+  with these two. The wired builds (S31, P4) answer both; the dual-chip S3 has no HAP opcode for
+  them yet and replies with an error. Destructive commands (`ota.*`, `zigbee.reset`,
+  `script.run`/`script.write`, `device.delete`, `settings.set`, …) stay privileged.
+
 - **Time from the router.** When no time server is named, the hub asks the router for one
   (DHCP option 42) and uses it before `pool.ntp.org`; status reports it as `ntp_dhcp_server`
   and the Settings Time card says so. A hub on a network without internet access then keeps

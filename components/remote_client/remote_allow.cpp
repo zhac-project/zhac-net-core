@@ -34,6 +34,11 @@ constexpr const char* kRemoteAllowedCmds[] = {
     "device.groups.refresh",
     // Rules
     "rule.list", "rule.create", "rule.delete", "rule.enable", "rule.update",
+    // Cloud automations: per-rule run counters (a read) and "Run now", which
+    // runs one stored rule's own actions. That grants nothing rule.create does
+    // not already: a rule's actions run whenever its trigger fires anyway, and
+    // script.run / script.write stay privileged below.
+    "rules.status", "rule.run",
     // Scripts — list/read/delete/check; run + write are privileged (RCE)
     "script.list", "script.read", "script.delete", "script.check",
     // Groups

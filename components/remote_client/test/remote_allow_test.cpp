@@ -3,6 +3,7 @@
 #include "remote_allow.h"
 #include <cassert>
 #include <cstdio>
+#include <initializer_list>
 
 int main() {
     // Spot-check a representative cmd from each family is allowed.
@@ -15,6 +16,18 @@ int main() {
     assert(!remote_cmd_allowed("script.run"));
     assert(remote_cmd_allowed("group.cmd"));
     assert(remote_cmd_allowed("alerts.get"));
+
+    // Cloud automations: every rule command, run counters and Run now.
+    for (const char* c : {"rule.list", "rule.create", "rule.update", "rule.enable",
+                          "rule.delete", "rules.status", "rule.run"}) {
+        assert(remote_cmd_allowed(c));
+    }
+    // The destructive / RCE set stays privileged (denied without the Kconfig).
+    for (const char* c : {"ota.s3", "ota.p4", "zigbee.reset", "script.write",
+                          "device.delete", "settings.set", "system.token.rotate",
+                          "uplink.set", "deploy.apply", "deploy.etag"}) {
+        assert(!remote_cmd_allowed(c));
+    }
 
     // The wifi RO subset is allowed.
     assert(remote_cmd_allowed("wifi.status"));
