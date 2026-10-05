@@ -9,20 +9,22 @@
 # fails with "X.h: No such file" (the include dirs of PRIV_REQUIRES are
 # never wired up).
 #
-# So: switch the SRCS list, not the call itself. When Kconfig is off
-# the SRCS list is empty — IDF still creates a (header-only) component
-# library, but with zero .o files. The public header in include/ uses
-# inline no-op stubs when the Kconfig is off, so callers compile clean.
+# So: switch the SRCS list, not the call itself. When Kconfig is off the
+# SRCS list holds only the two pure files named below (remote_allow.cpp,
+# remote_xfer.cpp); the client, state machine, backoff and NVS layer are
+# left out. The public header in include/ uses inline no-op stubs when the
+# Kconfig is off, so callers compile clean.
 
+# remote_allow.cpp and remote_xfer.cpp are pure and the wired dispatcher (zhac-wired-core ws_bridge.cpp)
+# calls them too -- the script-name check, the staging slot, the page cutter -- so they build in both
+# Kconfig states.
+set(remote_srcs "remote_allow.cpp" "remote_xfer.cpp")
 if(CONFIG_ZHAC_REMOTE_CLIENT_ENABLE)
-    set(remote_srcs
+    list(APPEND remote_srcs
         "remote_client.cpp"
         "remote_state.cpp"
-        "remote_allow.cpp"
         "remote_backoff.cpp"
         "remote_nvs.cpp")
-else()
-    set(remote_srcs "")
 endif()
 
 idf_component_register(
