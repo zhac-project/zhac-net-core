@@ -130,9 +130,19 @@ config ZHAC_REMOTE_ALLOW_PRIVILEGED
     help
         FINDINGS.md F9. When OFF (default) the remote/cloud channel cannot
         invoke firmware flash (ota.s3/ota.p4), network reset (zigbee.reset),
-        arbitrary Lua (script.run/script.write), device deletion, settings
-        changes, or token rotation — a compromised or spoofed cloud peer is
-        limited to reads + recoverable device/rule/group operations. Enable
-        ONLY if you fully trust the cloud endpoint and transport.
+        device deletion (device.delete), settings changes (settings.set),
+        token rotation (system.token.rotate) or the uplink mode switch
+        (uplink.set) — a compromised or spoofed cloud peer is limited to
+        reads + recoverable device/rule/group operations. Turning it ON
+        exposes exactly the privileged list in
+        components/remote_client/remote_allow.cpp (kRemotePrivilegedCmds).
+        Enable ONLY if you fully trust the cloud endpoint and transport.
+
+        Lua is not part of this option. script.write, script.reload,
+        system.restart and a direct script.run are gated by the hub's own
+        "Allow script changes from the cloud" switch, which is always off on
+        this firmware (it defines no switch hook). A rule's script.run
+        action is not gated by that switch; the cloud limits such rules to
+        owners and admins.
 
 endmenu

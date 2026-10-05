@@ -10,8 +10,10 @@ extern "C" {
 // The relay's answer to one cloud command: nullptr = pass it to the dispatcher, else the error code:
 //   "local_only"      settings.set carrying the key only the hub's own page may change
 //                     (remote_scripts), whatever the build trusts the cloud with;
-//   "scripts_off"     a switch-gated op (script.write / run / reload, system.restart) while the hub's
-//                     "Allow script changes from the cloud" switch is off;
+//   "scripts_off"     a switch-gated op while the hub's "Allow script changes from the cloud" switch is
+//                     off. The switch gates changing Lua and engine control (script.write, script.reload,
+//                     system.restart) and a direct script.run. It does not gate a rule's script.run
+//                     action: the cloud, not the hub, limits such rules to owners and admins;
 //   "cmd_not_allowed" anything else the relay does not pass.
 // `local_only_key`: the args carry `remote_scripts`. `scripts_on`: the switch.
 // LINEAR SCANS over static arrays (~70 entries), once per cloud frame.

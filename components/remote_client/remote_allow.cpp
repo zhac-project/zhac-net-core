@@ -41,14 +41,16 @@ constexpr const char* kRemoteAllowedCmds[] = {
     // Rules
     "rule.list", "rule.create", "rule.delete", "rule.enable", "rule.update",
     // Cloud automations: per-rule run counters (a read) and "Run now", which
-    // runs one stored rule's own actions. That grants nothing rule.create does
-    // not already: a rule's actions run whenever its trigger fires anyway.
+    // runs one stored rule's own actions. A rule's `script.run` action runs a
+    // stored script, and the hub switch below does NOT gate it: cloud
+    // automations rely on it. The cloud, not the hub, limits rules with that
+    // action to owners and admins.
     "rules.status", "rule.run",
     // Remote editing (spec 2026-10-05 §3.1): a parse check stores nothing, and a
     // staged part reaches flash only through script.write, which the switch gates.
     "rule.check", "script.part",
-    // Scripts — reading, deleting (runs no code) and checking; writing and running
-    // are switch-gated below
+    // Scripts — reading, deleting (runs no code) and checking; changing them and a
+    // direct run are switch-gated below
     "script.list", "script.read", "script.delete", "script.check",
     // Groups
     "group.list", "group.create", "group.get", "group.update",
@@ -66,10 +68,13 @@ constexpr const char* kRemoteAllowedCmds[] = {
     "device.rainmaker.list", "device.rainmaker.add", "device.rainmaker.remove",
 };
 
-// Switch-gated (spec 2026-10-05 §3.1): Lua code, and the restart that recovers a
-// wedged Lua task. Pass only while the hub's own page has "Allow script changes
-// from the cloud" on (remote_scripts_allowed()); refused scripts_off otherwise, so
-// the cloud can say "turn it on" rather than "not supported".
+// Switch-gated (spec 2026-10-05 §3.1): changing Lua and controlling the engine from
+// the cloud (script.write, script.reload, system.restart), and a direct script.run.
+// They pass only while the hub's own page has "Allow script changes from the cloud"
+// on (remote_scripts_allowed()); otherwise they are refused scripts_off, so the
+// cloud can say "turn it on" rather than "not supported". The switch does not stop
+// a stored rule's script.run action from running a script (see "Cloud automations"
+// above).
 constexpr const char* kRemoteScriptCmds[] = {
     "script.write", "script.run", "script.reload", "system.restart",
 };
