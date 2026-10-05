@@ -13,12 +13,15 @@ add_compile_options(-Wall -Wextra -g -O1
 add_link_options(-fsanitize=address,undefined)
 
 set(MAIN ${CMAKE_CURRENT_SOURCE_DIR}/../../main)
+# main/json_buf.h includes utf8_seq.h (the shared UTF-8 validator), which lives in remote_client's include dir.
+set(REMOTE_CLIENT_INC ${CMAKE_CURRENT_SOURCE_DIR}/../../components/remote_client/include)
 
 add_executable(json_safety_host
     test_json_safety.cpp
     ${MAIN}/groups_store.cpp)
 target_include_directories(json_safety_host PRIVATE
     ${MAIN}
+    ${REMOTE_CLIENT_INC}
     ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
 
 set(RAINMAKER_GW ${CMAKE_CURRENT_SOURCE_DIR}/../../components/rainmaker_gw)
@@ -49,6 +52,7 @@ add_executable(dgm_store_host
     ${MAIN}/dgm_store.cpp)
 target_include_directories(dgm_store_host PRIVATE
     ${MAIN}
+    ${REMOTE_CLIENT_INC}
     ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
 
 add_executable(improv_proto_host test_improv_proto.cpp)

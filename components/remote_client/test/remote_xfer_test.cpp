@@ -50,6 +50,7 @@ static void staging() {
     assert(is(remote_xfer_part("12345678901234567", 0, 2, "x", 1, 0, &got), "bad_part"));   // 17 chars
     assert(remote_xfer_part("1234567890123456", 0, 2, "x", 1, 0, &got) == nullptr);         // 16 chars
     assert(is(remote_xfer_part("ab-1", 0, 2, "x", 1, 0, &got), "bad_part"));
+    assert(is(remote_xfer_part("1234567890123456", 1, 2, "y", 1, 0, &got), "bad_part"));   // the bad frame dropped the open transfer
     assert(is(remote_xfer_part("ok", 0, 1, "x", 1, 0, &got), "bad_part"));
     assert(is(remote_xfer_part("ok", 0, 17, "x", 1, 0, &got), "bad_part"));
     assert(remote_xfer_part("ok", 0, 16, "x", 1, 0, &got) == nullptr);
@@ -60,6 +61,7 @@ static void staging() {
     assert(remote_xfer_part("big", 0, 3, half.data(), half.size(), 0, &got) == nullptr);
     assert(remote_xfer_part("big", 1, 3, half.data(), half.size(), 1, &got) == nullptr && got == 16384);
     assert(is(remote_xfer_part("big", 2, 3, "x", 1, 2, &got), "too_large"));
+    assert(is(remote_xfer_part("big", 2, 3, "x", 1, 3, &got), "bad_part"));       // too_large dropped it: the same part finds no slot
     assert(!remote_xfer_use("big", 3, false, keep, &s));
     assert(remote_xfer_part("fit", 0, 2, half.data(), half.size(), 0, &got) == nullptr);
     assert(remote_xfer_part("fit", 1, 2, half.data(), half.size(), 0, &got) == nullptr);

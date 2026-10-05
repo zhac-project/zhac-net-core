@@ -4,6 +4,7 @@
 // Staging slot and page cutter for remote script editing (spec 2026-10-05 §3.4). See remote_xfer.h.
 
 #include "remote_xfer.h"
+#include "utf8_seq.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -56,30 +57,6 @@ bool xfer_ok(const char* x) {
         if (!alnum || n >= 16) return false;
     }
     return n > 0;
-}
-
-// Byte length of the strict RFC 3629 UTF-8 sequence at s (at most `avail` bytes), 0 when invalid or
-// cut: the strictness WebSocket validators (Chrome, Tomcat) apply, as json_buf.h's utf8_seq_len has it.
-size_t utf8_len(const unsigned char* s, size_t avail) {
-    const unsigned char c = s[0];
-    if (c < 0x80) return 1;
-    size_t need;
-    unsigned char lo = 0x80, hi = 0xBF;
-    if      (c >= 0xC2 && c <= 0xDF) { need = 1; }
-    else if (c == 0xE0)              { need = 2; lo = 0xA0; }
-    else if (c >= 0xE1 && c <= 0xEC) { need = 2; }
-    else if (c == 0xED)              { need = 2; hi = 0x9F; }
-    else if (c == 0xEE || c == 0xEF) { need = 2; }
-    else if (c == 0xF0)              { need = 3; lo = 0x90; }
-    else if (c >= 0xF1 && c <= 0xF3) { need = 3; }
-    else if (c == 0xF4)              { need = 3; hi = 0x8F; }
-    else return 0;
-    if (avail < need + 1) return 0;
-    for (size_t k = 1; k <= need; k++) {
-        const unsigned char cc = s[k];
-        if (cc < (k == 1 ? lo : 0x80) || cc > (k == 1 ? hi : 0xBF)) return 0;
-    }
-    return need + 1;
 }
 
 }  // namespace
@@ -152,7 +129,7 @@ size_t remote_xfer_page(const char* text, size_t len, size_t offset, size_t budg
                 } else if (c < 0x80) {
                     esc[0] = static_cast<char>(c);
                     pn = 1;
-                } else if ((adv = utf8_len(reinterpret_cast<const unsigned char*>(text) + i, len - i)) != 0) {
+                } else if ((adv = utf8_seq_len(reinterpret_cast<const unsigned char*>(text) + i, len - i)) != 0) {
                     piece = text + i;          // a whole character, as is
                     pn = adv;
                 } else {
