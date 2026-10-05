@@ -120,6 +120,11 @@ void remote_client_send_reply(const char* json, size_t len);
 
 void remote_client_get_status(RemoteStatusSnap* out);
 
+// remote.auth's extra fields as `,"key":value…` (no braces), at most cap-1 bytes; returns the length,
+// 0 for none. Weak default: none. zhac-wired-core reports its caps and the script switch (spec
+// 2026-10-05 §3.6); hubs that send neither stay read-only in the cloud.
+size_t remote_hello_extra(char* out, size_t cap);
+
 #else  // CONFIG_ZHAC_REMOTE_CLIENT_ENABLE not set
 
 // Inline no-op stubs. The compiler eliminates these at -O2; no

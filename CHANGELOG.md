@@ -7,8 +7,13 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added
+
+- **Remote rules and scripts editing on the cloud relay** (`remote_client`, spec 2026-10-05 §3.1/§3.6/§3.7). The relay passes `rule.check` and `script.part`; `script.write`, `script.run`, `script.reload` and `system.restart` pass only while the hub's own page has "Allow script changes from the cloud" on (`remote_scripts_allowed()`, weak, false on this firmware) and are otherwise answered `scripts_off`; `settings.set` carrying `remote_scripts` is answered `local_only` whatever the build. `script.run`/`script.write` leave the privileged list. The events `script.added`, `script.updated`, `script.deleted`, `script.error` and `hub.caps` reach the cloud. Every relayed change is logged with the tag `cloud` and the person's account id (`script.write by <id> name=heating`). `remote.auth` carries what a weak `remote_hello_extra()` adds (nothing here; the wired firmware adds its caps and the switch), in a 512-byte buffer (was 320).
+
 ### Fixed
 
+- `remote_allow.cpp` now includes `sdkconfig.h`: `CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED` never took effect before (privileged commands were always refused).
 - `ws_server_broadcast` serializes its send loop with a mutex instead of asserting a single broadcaster. The wired and single-chip builds broadcast from several tasks (event bus, status tick, log sink); two at once tripped the assert and rebooted the S31 hub after a few hours (crash dump: `main` sending `status.tick` while `TaskEventBus` sent `attr.changed`). A call from inside the loop on the same task returns at once, as before.
 - `remote_client` on Ethernet builds (the wired S31/P4 core pulls this component): the client waited in `IDLE_NO_WIFI` for a got-IP edge, and its self-heal looked only at the Wi-Fi STA. An Ethernet hub takes its lease at boot, before anyone saves cloud credentials, so no edge ever followed and the link never started. The self-heal now accepts an up Ethernet (`ETH_DEF`) or STA interface with an address. The remote task stack comes from `CONFIG_ZHAC_REMOTE_TASK_STACK_KB` (default 6 KB here; the wired root sets 12 KB because its cloud commands run the Zigbee/rules/Lua handlers directly). The event allow-list gains the names the single-chip builds push (`attr.changed`, `rule.updated|deleted`, `group.updated|deleted`); the cloud already consumes them. The host test expected `script.run` to be cloud-allowed, which F9 made privileged; it now asserts the denial.
 

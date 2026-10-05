@@ -15,7 +15,13 @@
 //     on LAN. Re-exposing them via remote = self foot-gun.
 
 #include "remote_allow.h"
+#include <cstdio>
 #include <cstring>
+// CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED. Nothing included sdkconfig.h here before, so the option never
+// took effect (fail-closed). Absent in the host tests.
+#if __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
 
 namespace {
 
@@ -36,10 +42,13 @@ constexpr const char* kRemoteAllowedCmds[] = {
     "rule.list", "rule.create", "rule.delete", "rule.enable", "rule.update",
     // Cloud automations: per-rule run counters (a read) and "Run now", which
     // runs one stored rule's own actions. That grants nothing rule.create does
-    // not already: a rule's actions run whenever its trigger fires anyway, and
-    // script.run / script.write stay privileged below.
+    // not already: a rule's actions run whenever its trigger fires anyway.
     "rules.status", "rule.run",
-    // Scripts — list/read/delete/check; run + write are privileged (RCE)
+    // Remote editing (spec 2026-10-05 §3.1): a parse check stores nothing, and a
+    // staged part reaches flash only through script.write, which the switch gates.
+    "rule.check", "script.part",
+    // Scripts — reading, deleting (runs no code) and checking; writing and running
+    // are switch-gated below
     "script.list", "script.read", "script.delete", "script.check",
     // Groups
     "group.list", "group.create", "group.get", "group.update",
@@ -57,16 +66,22 @@ constexpr const char* kRemoteAllowedCmds[] = {
     "device.rainmaker.list", "device.rainmaker.add", "device.rainmaker.remove",
 };
 
+// Switch-gated (spec 2026-10-05 §3.1): Lua code, and the restart that recovers a
+// wedged Lua task. Pass only while the hub's own page has "Allow script changes
+// from the cloud" on (remote_scripts_allowed()); refused scripts_off otherwise, so
+// the cloud can say "turn it on" rather than "not supported".
+constexpr const char* kRemoteScriptCmds[] = {
+    "script.write", "script.run", "script.reload", "system.restart",
+};
+
 // F9 (FINDINGS.md): privileged ops the cloud channel must NOT reach by
-// default — firmware flash (ota.*), network wipe (zigbee.reset), arbitrary
-// Lua execution (script.run/write), device removal, and auth/config changes.
-// A compromised or spoofed cloud peer (or anyone holding the bearer token)
-// would otherwise gain RCE-equivalent control. Exposed only when
-// CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED is set, for operators who explicitly
-// trust the cloud endpoint.
+// default — firmware flash (ota.*), network wipe (zigbee.reset), device
+// removal, and auth/config changes. A compromised or spoofed cloud peer (or
+// anyone holding the bearer token) would otherwise gain destructive control.
+// Exposed only when CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED is set, for operators
+// who explicitly trust the cloud endpoint. (Lua moved to the switch above.)
 constexpr const char* kRemotePrivilegedCmds[] = {
     "ota.s3", "ota.p4", "zigbee.reset",
-    "script.run", "script.write",
     "device.delete", "settings.set", "system.token.rotate",
     "uplink.set",
 };
@@ -89,34 +104,79 @@ constexpr const char* kRemoteAllowedEvents[] = {
     "group.added", "group.removed", "group.changed",
     "group.updated", "group.deleted",
     "alert",
+    // Remote editing (spec 2026-10-05 §3.6): the cloud's script mirror and the switch.
+    "script.added", "script.updated", "script.deleted", "script.error", "hub.caps",
 };
 
-constexpr size_t kCmdCount   = sizeof(kRemoteAllowedCmds)   / sizeof(kRemoteAllowedCmds[0]);
-constexpr size_t kPrivCount  = sizeof(kRemotePrivilegedCmds)/ sizeof(kRemotePrivilegedCmds[0]);
-constexpr size_t kEventCount = sizeof(kRemoteAllowedEvents) / sizeof(kRemoteAllowedEvents[0]);
+// Changes the hub logs with the `cloud` tag (spec 2026-10-05 §3.7).
+constexpr const char* kLoggedCmds[] = {
+    "rule.create", "rule.update", "rule.enable", "rule.delete", "rule.run",
+    "script.write", "script.delete", "script.run", "script.reload", "system.restart",
+};
 
-} // namespace
-
-extern "C" bool remote_cmd_allowed(const char* cmd) {
-    if (!cmd || !*cmd) return false;
-    for (size_t i = 0; i < kCmdCount; i++) {
-        if (std::strcmp(cmd, kRemoteAllowedCmds[i]) == 0) return true;
+template <size_t N>
+bool listed(const char* const (&list)[N], const char* s) {
+    for (const char* x : list) {
+        if (std::strcmp(x, s) == 0) return true;
     }
-#ifdef CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED
-    // F9: only reachable when the operator explicitly trusts the cloud peer.
-    for (size_t i = 0; i < kPrivCount; i++) {
-        if (std::strcmp(cmd, kRemotePrivilegedCmds[i]) == 0) return true;
-    }
-#else
-    (void)kPrivCount;
-#endif
     return false;
 }
 
-extern "C" bool remote_event_allowed(const char* name) {
-    if (!name || !*name) return false;
-    for (size_t i = 0; i < kEventCount; i++) {
-        if (std::strcmp(name, kRemoteAllowedEvents[i]) == 0) return true;
+// An account id as the cloud sends it (a UUID): 1-40 of [0-9a-f-].
+bool account_id_ok(const char* by) {
+    size_t n = 0;
+    for (; by && by[n]; n++) {
+        const char c = by[n];
+        if (n >= 40 || !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == '-')) return false;
     }
-    return false;
+    return n > 0;
+}
+
+} // namespace
+
+extern "C" __attribute__((weak)) bool remote_scripts_allowed(void) { return false; }
+
+extern "C" const char* remote_cmd_refusal(const char* cmd, bool local_only_key, bool scripts_on) {
+    if (!cmd || !*cmd) return "cmd_not_allowed";
+    // Only the hub's own page turns the script switch on, whatever the build trusts the cloud with.
+    if (local_only_key && std::strcmp(cmd, "settings.set") == 0) return "local_only";
+    if (listed(kRemoteAllowedCmds, cmd)) return nullptr;
+    if (listed(kRemoteScriptCmds, cmd)) return scripts_on ? nullptr : "scripts_off";
+#ifdef CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED
+    // F9: only reachable when the operator explicitly trusts the cloud peer.
+    if (listed(kRemotePrivilegedCmds, cmd)) return nullptr;
+#else
+    (void)kRemotePrivilegedCmds;
+#endif
+    return "cmd_not_allowed";
+}
+
+extern "C" bool remote_cmd_allowed(const char* cmd) {
+    return remote_cmd_refusal(cmd, false, remote_scripts_allowed()) == nullptr;
+}
+
+extern "C" bool remote_event_allowed(const char* name) {
+    return name && *name && listed(kRemoteAllowedEvents, name);
+}
+
+extern "C" bool remote_script_name_ok(const char* name) {
+    size_t n = 0;
+    for (; name && name[n]; n++) {
+        const char c = name[n];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                        c == '_' || c == '-';
+        if (!ok || n >= 24) return false;
+    }
+    return n > 0;
+}
+
+extern "C" bool remote_change_log_line(const char* cmd, const char* by, long id, const char* name,
+                                       char* out, size_t cap) {
+    if (!cmd || !out || cap == 0 || !listed(kLoggedCmds, cmd)) return false;
+    int n = std::snprintf(out, cap, "%s by %s", cmd, account_id_ok(by) ? by : "-");
+    if (n > 0 && (size_t)n < cap && id >= 0) n += std::snprintf(out + n, cap - n, " id=%ld", id);
+    if (n > 0 && (size_t)n < cap && remote_script_name_ok(name)) {
+        n += std::snprintf(out + n, cap - n, " name=%s", name);
+    }
+    return n > 0;
 }
