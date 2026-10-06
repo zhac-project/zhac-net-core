@@ -358,9 +358,10 @@ int ws_server_client_count() {
     return n;
 }
 
-// Task currently inside ws_server_broadcast()'s send loop, nullptr when none.
+// Task currently inside send_locked()'s send loop (a broadcast fan-out or a
+// point reply), nullptr when none.
 // The log pipeline checks this (ws_server_in_broadcast) and drops its WS-sink
-// fan-out for lines logged from within the broadcast path — defence-in-depth
+// fan-out for lines logged from within the send path — defence-in-depth
 // against TX-path re-entry (e.g. esp_http_server's own ESP_LOG* inside
 // httpd_ws_send_frame_async). Written under s_tx_mutex: net-core broadcasts
 // from one TX worker, but the wired and single-chip builds broadcast from
@@ -371,6 +372,28 @@ static std::atomic<TaskHandle_t> s_broadcast_task{nullptr};
 bool ws_server_in_broadcast() {
     return s_broadcast_task.load(std::memory_order_acquire) ==
            xTaskGetCurrentTaskHandle();
+}
+
+// The ONLY place that writes frames to client sockets. httpd_ws_send_frame_async
+// sends a frame as TWO send()s (header, then payload) with no lock of its own,
+// so two tasks writing one socket interleave them: one frame's header lands
+// inside the other's payload and the browser fails the connection (close 1006).
+// Every writer — broadcast fan-out and point replies alike — therefore takes
+// turns on s_tx_mutex and sets the s_broadcast_task marker, so a log line
+// emitted from inside the send is dropped by the log sink instead of
+// re-entering ws_server_broadcast on this task and deadlocking on the mutex.
+// Sends `pkt` to fds[0..n); res[i] = that send's result. Returns false, having
+// sent nothing, when the lock was not taken (callers drop the frame; the fd is
+// healthy, so it must NOT be evicted). Never logs: a failure log here would
+// recurse through the log sink.
+static bool send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, esp_err_t* res) {
+    if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) return false;
+    s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+    // NOTE: no early returns between the guard stores — in_broadcast must clear.
+    for (int i = 0; i < n; i++) res[i] = httpd_ws_send_frame_async(s_server, fds[i], pkt);
+    s_broadcast_task.store(nullptr, std::memory_order_release);
+    xSemaphoreGive(s_tx_mutex);
+    return true;
 }
 
 void ws_server_broadcast(const char* json, size_t len) {
@@ -411,7 +434,7 @@ void ws_server_broadcast(const char* json, size_t len) {
     //
     // Deliberately outside the mutex: this file's rule is never to call httpd
     // while holding it, and remove_fd() takes it itself.
-    int  fds[MAX_WS_CLIENTS];
+    int  fds[MAX_WS_CLIENTS] = {};   // zero-init: send_locked() takes it as const int*
     int  count = 0;
     for (int i = 0; i < snap_n; i++) {
         if (httpd_ws_get_fd_info(s_server, snap_fd[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
@@ -431,30 +454,17 @@ void ws_server_broadcast(const char* json, size_t len) {
     // line re-enters the WS TX path, and logging a failure against a dead fd
     // used to recurse (log → sink → broadcast → fail → log → …) until stack
     // overflow. Collect failures, remove the dead fds FIRST, then log.
-    int       failed_fd[MAX_WS_CLIENTS];
-    esp_err_t failed_err[MAX_WS_CLIENTS];
-    int       n_failed = 0;
-
+    //
     // Two tasks broadcasting at once tripped the old single-writer assert and
     // rebooted the wired hub (main's status tick vs the event bus). Take turns.
-    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
-    s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
-    // NOTE: no early returns between the guard stores — in_broadcast must clear.
-    for (int i = 0; i < count; i++) {
-        esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &pkt);
-        if (ret != ESP_OK) {
-            failed_fd[n_failed]  = fds[i];
-            failed_err[n_failed] = ret;
-            n_failed++;
-        }
-    }
-    s_broadcast_task.store(nullptr, std::memory_order_release);
-    xSemaphoreGive(s_tx_mutex);
+    esp_err_t res[MAX_WS_CLIENTS];
+    if (!send_locked(fds, count, &pkt, res)) return;
 
-    for (int i = 0; i < n_failed; i++) {
-        remove_fd(failed_fd[i]);   // cleanup first…
+    for (int i = 0; i < count; i++) {
+        if (res[i] == ESP_OK) continue;
+        remove_fd(fds[i]);   // cleanup first…
         ESP_LOGW(TAG, "ws_broadcast: send failed fd=%d err=%d (removed)",
-                 failed_fd[i], failed_err[i]);   // …log after — bounded: the
+                 fds[i], res[i]);   // …log after — bounded: the
         // fd is already gone, so a re-broadcast of this line can't re-fail.
     }
 }
@@ -472,7 +482,10 @@ void ws_server_reply(int fd, const char* json, size_t len) {
     pkt.type    = HTTPD_WS_TYPE_TEXT;
     pkt.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(json));
     pkt.len     = len;
-    esp_err_t ret = httpd_ws_send_frame_async(s_server, fd, &pkt);
+    // Same turn-taking as the broadcast loop (see send_locked): a reply runs on
+    // the httpd task while another task may be broadcasting to this socket.
+    esp_err_t ret = ESP_OK;
+    if (!send_locked(&fd, 1, &pkt, &ret)) return;
     if (ret != ESP_OK) {
         // Same ordering rule as the broadcast loop: drop the fd before
         // touching the log pipeline.

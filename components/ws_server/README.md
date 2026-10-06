@@ -44,7 +44,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 |--------|----------|
 | `ws_server_init()` | Creates the fd-table mutex, starts httpd on :80, registers `/ws`, installs `close_fn`. Call exactly once. On `httpd_start` failure logs and returns; all other calls are then no-ops (`s_server == nullptr`). |
 | `ws_server_broadcast(json, len)` | Fan-out of one TEXT frame to every **authed** fd. **Single-broadcaster contract: only the ws_bridge TX worker may call this** (enforced by a `configASSERT` on the `s_broadcast_task` guard). Producers must use `ws_bridge_broadcast_enqueue()` / `ws_event_broadcast()` (`main/s3_internal.h`) instead. Snapshots the fd list under `s_mutex`, releases it, then loops `httpd_ws_send_frame_async`. **Never logs inside the send loop** — failures are collected, dead fds removed first, logged after (log-sink recursion guard). |
-| `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted** (`remove_fd` before logging — same ordering rule as broadcast). |
+| `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted** (`remove_fd` before logging — same ordering rule as broadcast). The send takes `s_tx_mutex` and sets the `s_broadcast_task` marker like the broadcast loop (both go through `send_locked()`), so a reply never interleaves with a broadcast on the socket; if the lock cannot be taken the reply is dropped and the fd is kept. |
 | `ws_server_get_handle()` | Underlying daemon handle for registering additional URIs. `nullptr` before init. |
 | `ws_server_set_rx_callback(cb)` | Installs the inbound text-frame callback (single slot, latest wins, `nullptr` detaches). |
 | `ws_server_set_api_token(token)` | Sets the 32-char token (`char[33]`, truncated). `nullptr`/`""` disables auth entirely (token set ⇔ auth on). |
@@ -131,9 +131,12 @@ Lua uploads) is gone.
 
 - `s_mutex` protects only the fd table (`s_fds`, `s_fd_authed`,
   `s_fd_count`); never held across an httpd send.
-- `httpd_ws_send_frame_async` enqueues on the httpd control socket; the
-  single-broadcaster rule means fan-out ordering is decided in the TX
-  worker's queue, not by racing producers.
+- `httpd_ws_send_frame_async` writes from the CALLING task, as two `send()`s
+  (header, then payload) with no lock of its own. `send_locked()` is its only
+  caller and holds `s_tx_mutex` for every frame, broadcast fan-out and
+  `ws_server_reply` alike, so two tasks can never interleave on a socket (an
+  unlocked reply once did: the browser failed the connection, close 1006).
+  Fan-out ordering is decided in the TX worker's queue, not by racing producers.
 - Callers must not hold their own mutexes across `ws_server_broadcast` /
   `ws_server_reply` (WEB-F2): format under a local lock, snapshot, release,
   then send.
