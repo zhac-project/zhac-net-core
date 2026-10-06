@@ -59,6 +59,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 | Symbol | Value | Why |
 |--------|-------|-----|
 | `MAX_WS_CLIENTS` | 3 | Hard cap on concurrent WS sockets. **Table full → `httpd_sess_trigger_close(fd)`** — a slot-less socket would be a half-functional zombie (accepts commands, never sees a broadcast). |
+| `WS_SEND_TIMEOUT_S` | 3 s | `SO_SNDTIMEO` set on every WS socket when it is registered (handshake, or first data frame). httpd's own `send_wait_timeout` (10 s) stays for the plain HTTP part. A WS frame is two `send()`s, so a dead peer stalls a sender for this long while it holds `s_tx_mutex`; a LAN client drains the send buffer in milliseconds. |
 | `WS_RX_MAX` | 8 KB | DS10: cap on an inbound text frame (covers rule DSL + `script.check` Lua source). Larger frames are logged and dropped — no huge forced allocation. |
 | Token length | exactly 32 chars | Constant-time XOR-accumulate compare, no short-circuit. |
 
@@ -155,7 +156,7 @@ Lua uploads) is gone.
 
 | Condition | Behaviour |
 |-----------|-----------|
-| fd table full | `WS client limit (3) reached, closing fd=%d` + `httpd_sess_trigger_close`. |
+| fd table full | `WS client limit (3) reached, closing fd=%d` + `httpd_sess_trigger_close` — for a fresh handshake and for a socket first seen on a data frame (`ensure_fd`; it used to be left open as a zombie). |
 | Send failure (broadcast) | fd removed first, its session closed (`httpd_sess_trigger_close`, outside `s_tx_mutex`), then `ws_broadcast: send failed fd=%d err=%d (removed)`. The close is requested only by the call that actually removed the fd: a second failure for an fd that is already gone (a sender with an older fd snapshot) closes nothing, because httpd queues closes by session pointer. |
 | Send failure (reply) | fd removed first, its session closed (same rule: only if this call removed it), then `ws_reply: send failed fd=%d err=%d (removed)`. Without the close the socket stayed open and the browser's next frame re-adopted it unauthenticated (`ensure_fd`): every command answered `auth required` until reload. Now the page reconnects and signs in again. |
 | Send lock not taken | The frame is dropped; the fd is healthy, so it is neither evicted nor closed. |

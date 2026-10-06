@@ -11,6 +11,8 @@
 #include <atomic>
 #include <cstring>
 #include <cstdlib>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 // DS10 (DS_FINDINGS): cap on an inbound WS text frame. Covers rule DSL +
@@ -63,6 +65,30 @@ static bool add_fd(int fd, bool authed) {
     return added;
 }
 
+// httpd gives every accepted socket SO_SNDTIMEO = send_wait_timeout (10 s, see
+// ws_server_init), per send() call, and a WS frame is two of them. A dead peer
+// (no FIN, no RST) therefore stalls a send for that long WHILE it holds
+// s_tx_mutex, and every other sender waits with it — the single httpd task too,
+// whenever a reply is queued behind it. A LAN client drains the 11.5 KB send
+// buffer in milliseconds, so WS sockets get a much shorter cap (the plain HTTP
+// part of a connection keeps the 10 s).
+static constexpr time_t WS_SEND_TIMEOUT_S = 3;
+
+// Make a socket a broadcast client: cap its send stall, then add it. Closing on a
+// full table is deliberate — a slot-less socket would stay open, accept commands,
+// yet never receive a single broadcast (a half-functional zombie). Used for a
+// fresh handshake (register_client) and for a socket first seen on a data frame
+// (ensure_fd).
+static void adopt_client(int fd, bool authed) {
+    const timeval tv = {WS_SEND_TIMEOUT_S, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    if (!add_fd(fd, authed)) {
+        ESP_LOGW(TAG, "WS client limit (%d) reached, closing fd=%d",
+                 MAX_WS_CLIENTS, fd);
+        httpd_sess_trigger_close(s_server, fd);
+    }
+}
+
 // Add the fd ONLY if absent, leaving an existing entry's auth flag alone.
 //
 // add_fd() overwrites s_fd_authed on a repeat call, which is right at handshake
@@ -75,7 +101,7 @@ static void ensure_fd(int fd, bool authed_if_new) {
         if (s_fds[i] == fd) { present = true; break; }
     }
     xSemaphoreGive(s_mutex);
-    if (!present) add_fd(fd, authed_if_new);
+    if (!present) adopt_client(fd, authed_if_new);
 }
 
 // True if the fd was in the table and this call removed it. Logs after
@@ -157,15 +183,9 @@ static bool detect_handshake_auth(httpd_req_t* req) {
     return false;
 }
 
-// Register a freshly handshaken socket. Closing on a full table is deliberate:
-// a slot-less socket would stay open, accept commands, yet never receive a
-// single broadcast.
+// Register a freshly handshaken socket (see adopt_client).
 static void register_client(httpd_req_t* req, int fd) {
-    if (!add_fd(fd, detect_handshake_auth(req))) {
-        ESP_LOGW(TAG, "WS client limit (%d) reached, closing fd=%d",
-                 MAX_WS_CLIENTS, fd);
-        httpd_sess_trigger_close(s_server, fd);
-    }
+    adopt_client(fd, detect_handshake_auth(req));
 }
 
 #ifdef CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT

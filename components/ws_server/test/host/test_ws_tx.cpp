@@ -30,6 +30,7 @@
 #include "freertos/semphr.h"   // g_take_fails, g_self_deadlocks hooks
 
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -108,6 +109,18 @@ static void do_broadcast(int)     { ws_server_broadcast(kEvent.data(), kEvent.si
 static void add_client(int fd) {            // the handshake: registers fd as a client
     httpd_req_t req{HTTP_GET, reinterpret_cast<void*>(static_cast<intptr_t>(fd))};
     g_ws_uri->handler(&req);
+}
+
+static void data_frame(int fd) {            // a frame from a socket httpd knows: the handler runs with method 0
+    httpd_req_t req{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(fd))};
+    g_ws_uri->handler(&req);
+}
+
+static long sndtimeo_s(int fd) {            // the socket's SO_SNDTIMEO, whole seconds
+    timeval tv{};
+    socklen_t l = sizeof tv;
+    getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, &l);
+    return long(tv.tv_sec);
 }
 
 // Drain the peer and split it into frames; false unless it is a clean run of `81 len {...}` frames.
@@ -190,6 +203,7 @@ int main() {
     socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
     add_client(sv[0]);
     CHECK(ws_server_client_count() == 1, "client registered");
+    CHECK(sndtimeo_s(sv[0]) == 3, "register_client caps the WS send timeout at 3 s");
 
     scenario("reply parked mid-frame, broadcast arrives: frames intact", do_reply, do_broadcast, sv[0], sv[1]);
     scenario("broadcast parked mid-frame, reply arrives: frames intact", do_broadcast, do_reply, sv[0], sv[1]);
@@ -286,6 +300,26 @@ int main() {
     const bool got = read_frames(sv[1], f);
     for (const auto& m : f) { logs += m == kLog; events += m == kEvent; }
     CHECK(got && logs >= 4 && events == 1, "the sink hook ran: log frames and the event reached the healthy client");
+
+    // A socket httpd knows but the table does not (evicted, or never registered) sends a data frame. ensure_fd adopts
+    // it with the same capped send timeout as the handshake; when the table is full it closes the socket, as the
+    // handshake does, instead of leaving a zombie that answers commands but never receives a broadcast.
+    int y[2], x1[2], x2[2], z[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, y);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, x1);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, x2);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, z);
+    g_closes.clear();
+    data_frame(y[0]);
+    CHECK(sndtimeo_s(y[0]) == 3 && g_closes.empty(), "ensure_fd adopts a socket with the capped send timeout, and closes nothing");
+    add_client(x1[0]);
+    add_client(x2[0]);
+    CHECK(ws_server_client_count() == 3, "table full");
+    data_frame(z[0]);
+    CHECK(g_closes.size() == 1 && g_closes[0].fd == z[0], "ensure_fd closes a socket it cannot adopt (table full)");
+    g_close_fn(nullptr, x1[0]);
+    g_close_fn(nullptr, x2[0]);
+    g_closes.clear();
 
     // Sign-in on. sv[0] registered while it was off, so it stays signed in; everything new starts signed out.
     ws_server_set_api_token("0123456789abcdef0123456789abcdef");
