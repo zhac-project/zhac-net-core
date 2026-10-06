@@ -17,8 +17,15 @@
 // Second part: a failed send must CLOSE the session (httpd_sess_trigger_close), not only drop
 // the fd from the broadcast table. Otherwise the socket stays open, the browser's next frame
 // re-adopts it with authed=0 and every command answers "auth required" until the page reloads.
+// A second failed send for an fd that is already gone closes nothing: IDF queues a close by session
+// pointer, so a duplicate could land on a slot a new connection has since taken.
+//
+// Third part: no log call while s_mutex (the fd table lock) is held. The wired WS log sink calls
+// ws_server_broadcast from inside the log call (zhac-wired-core main/log_ring.cpp, dispatch_to_sinks),
+// and broadcast takes s_mutex: a log line emitted under s_mutex would take it twice. The shim mutex is
+// error-checking, so that is counted (g_self_deadlocks) instead of hanging the test.
 #include "ws_server.h"
-#include "freertos/semphr.h"   // g_take_fails hook
+#include "freertos/semphr.h"   // g_take_fails, g_self_deadlocks hooks
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -27,6 +34,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,13 +71,23 @@ esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* f)
 // Session closes requested by ws_server, with what was true at the moment of the call.
 struct Close { int fd; int clients; bool warned; bool locked; };
 static std::vector<Close> g_closes;
-static bool g_warned = false;               // the "send failed" warning has been logged
+static std::mutex g_closes_mu;
+static std::atomic<bool> g_warned{false};   // the "send failed" warning has been logged
+static std::atomic<bool> g_sink_on{false};  // host_log() behaves like the wired WS log sink
 
-void host_log(const char*, const char* fmt, ...) { if (strstr(fmt, "send failed")) g_warned = true; }
+static const std::string kLog = R"({"type":"log","level":"I","entry":"x"})";
+
+void host_log(const char*, const char* fmt, ...) {
+    if (strstr(fmt, "send failed")) g_warned = true;
+    // The wired sink (log_ring.cpp dispatch_to_sinks) broadcasts every log line from inside the log call.
+    if (g_sink_on) ws_server_broadcast(kLog.data(), kLog.size());
+}
 
 esp_err_t httpd_sess_trigger_close(httpd_handle_t, int fd) {
     // `locked` = still inside the TX lock (the marker is set exactly while it is held).
-    g_closes.push_back({fd, ws_server_client_count(), g_warned, ws_server_in_broadcast()});
+    const Close c{fd, ws_server_client_count(), g_warned, ws_server_in_broadcast()};
+    std::lock_guard<std::mutex> l(g_closes_mu);
+    g_closes.push_back(c);
     return ESP_OK;
 }
 
@@ -166,6 +184,49 @@ int main() {
     CHECK(g_closes.size() == 1 && g_closes[0].fd == c3[0], "reply failure: that fd's session is closed");
     CHECK(g_closes.size() == 1 && g_closes[0].clients == 1 && !g_closes[0].warned && !g_closes[0].locked && g_warned,
           "reply failure: fd removed first, closed outside the TX lock, then logged");
+
+    // The same fd failing twice closes its session once: only the call that actually removed the fd closes.
+    int c4[2], c5[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, c4);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, c5);
+    add_client(c4[0]);
+    g_closes.clear();
+    g_fail_fd = c4[0];
+    do_broadcast(0);                        // evicts and closes
+    do_reply(c4[0]);                        // back to back: the fd is already out of the table
+    g_fail_fd = -1;
+    CHECK(g_closes.size() == 1 && g_closes[0].fd == c4[0], "same fd failing twice (broadcast, then reply): closed once");
+
+    // The same through two broadcasts: B2 took its fd snapshot while B1 was still sending, so it fails on the
+    // evicted fd as well once it gets the TX lock.
+    add_client(c5[0]);
+    g_closes.clear();
+    g_entered = 0;
+    g_parked  = false;
+    g_fail_fd = c5[0];
+    std::thread b1(do_broadcast, 0);
+    for (int i = 0; i < 1000 && !g_parked; i++) nap();     // B1 sits mid-frame on sv[0], holding the TX lock
+    std::thread b2(do_broadcast, 0);                        // snapshots both fds, then waits for the lock
+    b1.join();
+    b2.join();
+    g_fail_fd = -1;
+    CHECK(g_closes.size() == 1 && g_closes[0].fd == c5[0], "stale fd snapshot (two broadcasts): closed once");
+
+    // The wired WS log sink broadcasts from inside the log call. A log line emitted while s_mutex is held would
+    // take it a second time (the shim counts that instead of hanging): add_fd and remove_fd log after unlocking.
+    int c6[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, c6);
+    read_frames(sv[1], f);                  // forget what the scenarios above sent
+    g_sink_on = true;
+    add_client(c6[0]);                      // add_fd logs "WS client added"
+    CHECK(g_self_deadlocks.exchange(0) == 0, "add_fd logs outside s_mutex (log sink on)");
+    g_fail_fd = c6[0];
+    do_broadcast(0);                        // evicts c6: remove_fd logs "WS client removed", then the warning
+    g_fail_fd = -1;
+    CHECK(g_self_deadlocks.exchange(0) == 0, "remove_fd logs outside s_mutex (log sink on)");
+    g_sink_on = false;
+    CHECK(read_frames(sv[1], f) && f.size() == 4 && f[0] == kLog && f[1] == kEvent && f[2] == kLog && f[3] == kLog,
+          "the sink hook ran: three log frames and the event reached the healthy client");
 
     return g_failures ? 1 : 0;
 }

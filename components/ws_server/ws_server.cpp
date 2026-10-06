@@ -39,8 +39,14 @@ static WsReplyHook  s_hook_func = nullptr;
 // Returns false when the client table is full (caller closes the socket —
 // a slot-less socket would stay open, accept commands, yet never receive a
 // single broadcast: a half-functional zombie).
+//
+// No ESP_LOG* while s_mutex is held — here, in remove_fd, or anywhere else in
+// this file. The wired and single-chip WS log sinks call ws_server_broadcast
+// from inside the log call, and that takes s_mutex again: a self-deadlock on
+// this non-recursive mutex. Collect what to log, unlock, then log.
 static bool add_fd(int fd, bool authed) {
     bool added = false;
+    int  total = 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
         if (s_fds[i] == fd) { s_fd_authed[i] = authed; xSemaphoreGive(s_mutex); return true; }
@@ -50,9 +56,10 @@ static bool add_fd(int fd, bool authed) {
         s_fd_authed[s_fd_count] = authed;
         s_fd_count++;
         added = true;
-        ESP_LOGI(TAG, "WS client added fd=%d authed=%d total=%d", fd, authed, s_fd_count);
+        total = s_fd_count;
     }
     xSemaphoreGive(s_mutex);
+    if (added) ESP_LOGI(TAG, "WS client added fd=%d authed=%d total=%d", fd, authed, total);
     return added;
 }
 
@@ -71,18 +78,25 @@ static void ensure_fd(int fd, bool authed_if_new) {
     if (!present) add_fd(fd, authed_if_new);
 }
 
-static void remove_fd(int fd) {
+// True if the fd was in the table and this call removed it. Logs after
+// unlocking, like add_fd.
+static bool remove_fd(int fd) {
+    bool removed = false;
+    int  total   = 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
         if (s_fds[i] == fd) {
             --s_fd_count;
             s_fds[i]       = s_fds[s_fd_count];
             s_fd_authed[i] = s_fd_authed[s_fd_count];   // F18: keep auth state aligned
-            ESP_LOGI(TAG, "WS client removed fd=%d total=%d", fd, s_fd_count);
+            removed = true;
+            total   = s_fd_count;
             break;
         }
     }
     xSemaphoreGive(s_mutex);
+    if (removed) ESP_LOGI(TAG, "WS client removed fd=%d total=%d", fd, total);
+    return removed;
 }
 
 // F18: per-fd auth state for first-message WS authentication.
@@ -407,9 +421,12 @@ static bool send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, esp_err_t*
 // itself included; call it outside s_tx_mutex. Best effort, like register_client:
 // the result is ignored (a full httpd control queue leaves the old behaviour for
 // this fd). Not for a lock that was never taken: that fd is healthy.
+// Only the call that actually removed the fd closes it. httpd queues a close by
+// session POINTER, so a second one (another sender with a stale fd snapshot
+// failing on the same fd, a reply after a broadcast) could close whatever new
+// connection has since taken that slot.
 static void drop_failed_fd(int fd) {
-    remove_fd(fd);
-    httpd_sess_trigger_close(s_server, fd);
+    if (remove_fd(fd)) httpd_sess_trigger_close(s_server, fd);
 }
 
 void ws_server_broadcast(const char* json, size_t len) {

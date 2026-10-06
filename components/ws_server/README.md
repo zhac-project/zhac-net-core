@@ -44,7 +44,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 |--------|----------|
 | `ws_server_init()` | Creates the fd-table mutex, starts httpd on :80, registers `/ws`, installs `close_fn`. Call exactly once. On `httpd_start` failure logs and returns; all other calls are then no-ops (`s_server == nullptr`). |
 | `ws_server_broadcast(json, len)` | Fan-out of one TEXT frame to every **authed** fd. **Single-broadcaster contract: only the ws_bridge TX worker may call this** (enforced by a `configASSERT` on the `s_broadcast_task` guard). Producers must use `ws_bridge_broadcast_enqueue()` / `ws_event_broadcast()` (`main/s3_internal.h`) instead. Snapshots the fd list under `s_mutex`, releases it, then loops `httpd_ws_send_frame_async`. **Never logs inside the send loop** — failures are collected, dead fds removed first, logged after (log-sink recursion guard). |
-| `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted and its session closed** (`remove_fd`, then `httpd_sess_trigger_close`, before logging — same ordering rule as broadcast). The send takes `s_tx_mutex` and sets the `s_broadcast_task` marker like the broadcast loop (both go through `send_locked()`), so a reply never interleaves with a broadcast on the socket; if the lock cannot be taken the reply is dropped and the fd is kept. |
+| `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted and its session closed** (`remove_fd`, then `httpd_sess_trigger_close` if that call removed it, before logging — same ordering rule as broadcast). The send takes `s_tx_mutex` and sets the `s_broadcast_task` marker like the broadcast loop (both go through `send_locked()`), so a reply never interleaves with a broadcast on the socket; if the lock cannot be taken the reply is dropped and the fd is kept. |
 | `ws_server_get_handle()` | Underlying daemon handle for registering additional URIs. `nullptr` before init. |
 | `ws_server_set_rx_callback(cb)` | Installs the inbound text-frame callback (single slot, latest wins, `nullptr` detaches). |
 | `ws_server_set_api_token(token)` | Sets the 32-char token (`char[33]`, truncated). `nullptr`/`""` disables auth entirely (token set ⇔ auth on). |
@@ -130,7 +130,10 @@ Lua uploads) is gone.
 ## Threading
 
 - `s_mutex` protects only the fd table (`s_fds`, `s_fd_authed`,
-  `s_fd_count`); never held across an httpd send.
+  `s_fd_count`); never held across an httpd send, and never across an
+  `ESP_LOG*`: the wired and single-chip WS log sinks call `ws_server_broadcast`
+  from inside the log call, which takes `s_mutex` again (a self-deadlock on this
+  non-recursive mutex). `add_fd` / `remove_fd` collect what to log, unlock, then log.
 - `httpd_ws_send_frame_async` writes from the CALLING task, as two `send()`s
   (header, then payload) with no lock of its own. `send_locked()` is its only
   caller and holds `s_tx_mutex` for every frame, broadcast fan-out and
@@ -146,8 +149,8 @@ Lua uploads) is gone.
 | Condition | Behaviour |
 |-----------|-----------|
 | fd table full | `WS client limit (3) reached, closing fd=%d` + `httpd_sess_trigger_close`. |
-| Send failure (broadcast) | fd removed first, its session closed (`httpd_sess_trigger_close`, outside `s_tx_mutex`), then `ws_broadcast: send failed fd=%d err=%d (removed)`. |
-| Send failure (reply) | fd removed first, its session closed, then `ws_reply: send failed fd=%d err=%d (removed)`. Without the close the socket stayed open and the browser's next frame re-adopted it unauthenticated (`ensure_fd`): every command answered `auth required` until reload. Now the page reconnects and signs in again. |
+| Send failure (broadcast) | fd removed first, its session closed (`httpd_sess_trigger_close`, outside `s_tx_mutex`), then `ws_broadcast: send failed fd=%d err=%d (removed)`. The close is requested only by the call that actually removed the fd: a second failure for an fd that is already gone (a sender with an older fd snapshot) closes nothing, because httpd queues closes by session pointer. |
+| Send failure (reply) | fd removed first, its session closed (same rule: only if this call removed it), then `ws_reply: send failed fd=%d err=%d (removed)`. Without the close the socket stayed open and the browser's next frame re-adopted it unauthenticated (`ensure_fd`): every command answered `auth required` until reload. Now the page reconnects and signs in again. |
 | Send lock not taken | The frame is dropped; the fd is healthy, so it is neither evicted nor closed. |
 | Inbound frame > 8 KB | `ws frame %u B exceeds cap %u — dropped`; connection stays up. |
 | Frame buffer OOM | `ESP_ERR_NO_MEM` returned to httpd. |

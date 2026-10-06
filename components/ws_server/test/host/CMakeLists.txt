@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Host regression test for ws_server's TX serialisation and close-on-failed-send: builds the real ws_server.cpp
-# against the esp_http_server / FreeRTOS shims in stubs/ (real pthread mutexes, so two
-# threads can genuinely race). Separate from any IDF unity app; build with plain cmake:
+# Host regression test for ws_server: TX serialisation, close-on-failed-send and logging outside
+# the fd-table lock. Builds the real ws_server.cpp against the esp_http_server / FreeRTOS shims
+# in stubs/ (real pthread mutexes, so two threads can genuinely race). Separate from any IDF
+# unity app; build with plain cmake:
 #   cmake -B build -S . && cmake --build build && ctest --test-dir build
 cmake_minimum_required(VERSION 3.16)
 project(ws_server_host_tests CXX)
