@@ -43,13 +43,13 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 | Symbol | Contract |
 |--------|----------|
 | `ws_server_init()` | Creates the fd-table mutex, starts httpd on :80, registers `/ws`, installs `close_fn`. Call exactly once. On `httpd_start` failure logs and returns; all other calls are then no-ops (`s_server == nullptr`). |
-| `ws_server_broadcast(json, len)` | Fan-out of one TEXT frame to every **authed** fd. **Single-broadcaster contract: only the ws_bridge TX worker may call this** (enforced by a `configASSERT` on the `s_broadcast_task` guard). Producers must use `ws_bridge_broadcast_enqueue()` / `ws_event_broadcast()` (`main/s3_internal.h`) instead. Snapshots the fd list under `s_mutex`, releases it, then loops `httpd_ws_send_frame_async`. **Never logs inside the send loop** — failures are collected, dead fds removed first, logged after (log-sink recursion guard). |
-| `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted** (`remove_fd` before logging — same ordering rule as broadcast). |
+| `ws_server_broadcast(json, len)` | Fan-out of one TEXT frame to every **authed** fd. Callable from any task: the send runs under `s_tx_mutex`, so concurrent callers take turns. On the dual-chip net-core the ws_bridge TX worker is the only caller (producers enqueue through `ws_bridge_broadcast_enqueue()` / `ws_event_broadcast()`, `main/s3_internal.h`); the wired and single-chip builds call it directly from the event bus, the status tick and the log sink. Snapshots the fd list under `s_mutex` and releases it; then, holding `s_tx_mutex`, re-checks each fd and sends with `httpd_ws_send_frame_async`. Returns before the lock when there is no recipient. **Never logs under either lock.** A failed fd is evicted quietly while `s_tx_mutex` is still held; its session close and the log lines follow the release (log-sink recursion guard). |
+| `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted and its session closed** (evicted under the TX lock, `httpd_sess_trigger_close` after the release if that call removed it, then logged — same rule as broadcast). The send takes `s_tx_mutex` and sets the `s_broadcast_task` marker like the broadcast loop (both go through `send_locked()`), so a reply never interleaves with a broadcast on the socket; if the lock cannot be taken the reply is dropped and the fd is kept. |
 | `ws_server_get_handle()` | Underlying daemon handle for registering additional URIs. `nullptr` before init. |
 | `ws_server_set_rx_callback(cb)` | Installs the inbound text-frame callback (single slot, latest wins, `nullptr` detaches). |
 | `ws_server_set_api_token(token)` | Sets the 32-char token (`char[33]`, truncated). `nullptr`/`""` disables auth entirely (token set ⇔ auth on). |
 | `ws_server_client_count()` | Live fd count under `s_mutex`. |
-| `ws_server_in_broadcast()` | True when the *calling* task is inside the broadcast send loop. Used by the log pipeline to drop WS fan-out of lines logged from within the TX path. |
+| `ws_server_in_broadcast()` | True when the *calling* task is inside a send to a WS client: the broadcast fan-out or `ws_server_reply` (`send_locked` holds the TX lock and sets the marker). Used by the log pipeline to drop WS fan-out of lines logged from within the TX path; `ws_server_broadcast` returns at once for such a call and `ws_server_reply` asserts (not on the sentinel-hook route, which takes no lock). |
 | `ws_server_fd_is_authed(fd)` / `ws_server_fd_set_authed(fd)` | F18 per-fd auth state; the dispatch layer permits only `auth` until set. |
 | `ws_server_fd_deauth_all()` | Q48: clears every authed flag on token rotation — stale-token sockets must re-auth. |
 | `ws_server_register_reply_hook(sentinel_fd, hook)` | Routes `ws_server_reply` for one reserved sentinel fd (outside legal httpd range) to a hook (e.g. remote_client). Single slot; register before traffic; `nullptr` unregisters. |
@@ -59,6 +59,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 | Symbol | Value | Why |
 |--------|-------|-----|
 | `MAX_WS_CLIENTS` | 3 | Hard cap on concurrent WS sockets. **Table full → `httpd_sess_trigger_close(fd)`** — a slot-less socket would be a half-functional zombie (accepts commands, never sees a broadcast). |
+| `WS_SEND_TIMEOUT_S` | 3 s | `SO_SNDTIMEO` set on every WS socket when it is registered (handshake, or first data frame). httpd's own `send_wait_timeout` (10 s) stays for the plain HTTP part. A WS frame is two `send()`s, so a dead peer stalls a sender for this long while it holds `s_tx_mutex`; a LAN client drains the send buffer in milliseconds. |
 | `WS_RX_MAX` | 8 KB | DS10: cap on an inbound text frame (covers rule DSL + `script.check` Lua source). Larger frames are logged and dropped — no huge forced allocation. |
 | Token length | exactly 32 chars | Constant-time XOR-accumulate compare, no short-circuit. |
 
@@ -82,20 +83,21 @@ no 401 at the upgrade. Per-fd state drives two gates:
 Token rotation calls `ws_server_fd_deauth_all()` so live sessions on the old
 token drop back to the auth-only command set.
 
-## Broadcast TX contract (single broadcaster)
+## Broadcast TX contract
 
-`ws_server_broadcast` is **not** a general-purpose producer API:
+`ws_server_broadcast` is serialised by `s_tx_mutex`, so any task may call it; the
+builds differ in who does:
 
-- The ONLY sanctioned caller is the ws_bridge TX worker
-  (`ws_bridge_tx_init`). Arbitrary tasks enqueue via
+- **Dual-chip net-core:** the ONLY caller is the ws_bridge TX worker
+  (`ws_bridge_tx_init`). Producers enqueue via
   `ws_bridge_broadcast_enqueue(json, len)` — copies the frame, never blocks,
   **never logs** (log-pipeline-safe; queue-full/OOM drops are counted in
   `ws_bridge_tx_drops()` and surfaced in `status.get`). See the contract
   block in `main/s3_internal.h`.
-- The wired and single-chip builds call it from several tasks (event bus,
-  status tick, log sink), so the send loop runs under `s_tx_mutex`: a second
+- **Wired and single-chip builds** call it directly from several tasks (event
+  bus, status tick, log sink), so the send runs under `s_tx_mutex`: a second
   task waits its turn (it used to trip a `configASSERT` and reboot the hub).
-  A call from inside the loop on the same task returns at once.
+  A call from inside the send on the same task returns at once.
 - Inside the send loop: no `ESP_LOG*` and no early returns between the
   `s_broadcast_task` guard stores — with the WS log sink enabled a log line
   re-enters the WS TX path, and a stuck guard would permanently mute the
@@ -130,10 +132,41 @@ Lua uploads) is gone.
 ## Threading
 
 - `s_mutex` protects only the fd table (`s_fds`, `s_fd_authed`,
-  `s_fd_count`); never held across an httpd send.
-- `httpd_ws_send_frame_async` enqueues on the httpd control socket; the
-  single-broadcaster rule means fan-out ordering is decided in the TX
-  worker's queue, not by racing producers.
+  `s_fd_count`); never held across an httpd send, and never across an
+  `ESP_LOG*`: the wired and single-chip WS log sinks call `ws_server_broadcast`
+  from inside the log call, which takes `s_mutex` again (a self-deadlock on this
+  non-recursive mutex). `add_fd` / `remove_fd` collect what to log, unlock, then log.
+- `httpd_ws_send_frame_async` writes from the CALLING task, as two `send()`s
+  (header, then payload) with no lock of its own. `send_locked()` is its only
+  caller and holds `s_tx_mutex` for every frame, broadcast fan-out and
+  `ws_server_reply` alike, so two tasks can never interleave on a socket (an
+  unlocked reply once did: the browser failed the connection, close 1006).
+  On the dual-chip net-core the fan-out order is decided in the TX worker's
+  queue; on wired/single-chip the producers (event bus, status tick, log sink)
+  race for `s_tx_mutex`, so their order is the order they win it.
+- Lock order is `s_tx_mutex`, then `s_mutex`, never the reverse. A broadcast
+  re-checks every recipient under `s_mutex` once it holds the TX lock (still in
+  the table, and signed in when sign-in is on) and skips any that fails: its fd
+  snapshot was taken before it waited for the lock, and httpd can meanwhile close
+  an fd and hand the number to a new connection (an HTTP fetch, or a client that
+  has not signed in). `s_mutex` stays a leaf lock: nothing is called while it is
+  held. Replies are never re-checked (their target is the requester).
+- A failed send evicts its fd while the TX lock is still held (`remove_fd_quiet`,
+  s_tx_mutex then s_mutex, nothing logged). A waiter that outranks the failing
+  sender (httpd, priority 5, behind TaskEventBus, 2) takes the lock at the give
+  and runs before the giver executes another line; with the eviction after the
+  give, its re-check found the dead fd and it stalled on it a second time. The
+  close request and the log lines come after the release.
+- A broadcast with no recipient returns before it takes `s_tx_mutex`, so a log
+  line (wired/mono WS log sink) with nobody to send to never queues behind a
+  reply. `ws_server_reply` asserts that the calling task is not already inside a
+  send (marker set): a reply from inside a send would take `s_tx_mutex` twice.
+  The assert sits below the sentinel-hook fast path, which never takes the lock.
+- `ws_server` queues httpd work (`httpd_sess_trigger_close`) from the httpd task
+  itself, so `ws_server.cpp` refuses to compile with
+  `CONFIG_HTTPD_QUEUE_WORK_BLOCKING=y`: a full control queue would then block the
+  only task that drains it. (Unset in every shipped config; `test/host` checks
+  that the `#error` stays.)
 - Callers must not hold their own mutexes across `ws_server_broadcast` /
   `ws_server_reply` (WEB-F2): format under a local lock, snapshot, release,
   then send.
@@ -142,9 +175,10 @@ Lua uploads) is gone.
 
 | Condition | Behaviour |
 |-----------|-----------|
-| fd table full | `WS client limit (3) reached, closing fd=%d` + `httpd_sess_trigger_close`. |
-| Send failure (broadcast) | fd removed first, then `ws_broadcast: send failed fd=%d err=%d (removed)`. |
-| Send failure (reply) | fd removed first, then `ws_reply: send failed fd=%d err=%d (removed)`. |
+| fd table full | `WS client limit (3) reached, closing fd=%d` + `httpd_sess_trigger_close` — for a fresh handshake and for a socket first seen on a data frame (`ensure_fd`; it used to be left open as a zombie). |
+| Send failure (broadcast) | fd evicted while `s_tx_mutex` is still held (so a waiting broadcaster's re-check no longer finds it), then — after the release — its session closed (`httpd_sess_trigger_close`), `WS client removed`, and `ws_broadcast: send failed fd=%d err=%d (removed)`. The close is requested only by the call that actually removed the fd: a second failure for an fd that is already gone (a sender with an older fd snapshot) closes nothing, because httpd queues closes by session pointer. |
+| Send failure (reply) | Same order: evicted under the TX lock, then closed (only if this call removed it), then `ws_reply: send failed fd=%d err=%d (removed)`. Without the close the socket stayed open and the browser's next frame re-adopted it unauthenticated (`ensure_fd`): every command answered `auth required` until reload. Now the page reconnects and signs in again. |
+| Send lock not taken | The frame is dropped; the fd is healthy, so it is neither evicted nor closed. |
 | Inbound frame > 8 KB | `ws frame %u B exceeds cap %u — dropped`; connection stays up. |
 | Frame buffer OOM | `ESP_ERR_NO_MEM` returned to httpd. |
 | `httpd_ws_recv_frame` error | fd removed, error returned to httpd (session torn down → `close_fn`). |
