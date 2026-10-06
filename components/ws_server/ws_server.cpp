@@ -15,6 +15,13 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+// httpd_sess_trigger_close (adopt_client, drop_failed_fd) queues work from the
+// httpd task itself. With CONFIG_HTTPD_QUEUE_WORK_BLOCKING a full control queue
+// would block that task for good: only it drains the queue.
+#if CONFIG_HTTPD_QUEUE_WORK_BLOCKING
+#error "ws_server needs CONFIG_HTTPD_QUEUE_WORK_BLOCKING=n: it queues httpd work from the httpd task, so a full queue would deadlock it"
+#endif
+
 // DS10 (DS_FINDINGS): cap on an inbound WS text frame. Covers rule DSL +
 // script.check Lua source; frames beyond this are dropped (a misbehaving/hostile
 // client can't force a huge per-frame allocation).
@@ -23,7 +30,7 @@
 static const char*       TAG      = "ws_server";
 static httpd_handle_t    s_server = nullptr;
 static SemaphoreHandle_t s_mutex  = nullptr;
-static SemaphoreHandle_t s_tx_mutex = nullptr;  // one broadcast send loop at a time
+static SemaphoreHandle_t s_tx_mutex = nullptr;  // one frame write at a time (broadcast or reply); taken before s_mutex, never after
 static WsRxCallback      s_rx_cb  = nullptr;
 static char              s_api_token[33] = {};
 

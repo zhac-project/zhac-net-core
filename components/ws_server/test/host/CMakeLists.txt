@@ -23,5 +23,18 @@ target_include_directories(ws_server_host_test PRIVATE
 target_link_libraries(ws_server_host_test PRIVATE Threads::Threads)
 target_compile_options(ws_server_host_test PRIVATE -Wall -Wextra -Werror)
 
+# ws_server queues httpd work (httpd_sess_trigger_close) from the httpd task itself. With
+# CONFIG_HTTPD_QUEUE_WORK_BLOCKING a full control queue would block that task forever, so ws_server.cpp
+# refuses to compile with it. Build the file with the option on and expect exactly that #error.
+add_library(ws_server_blocking_probe OBJECT EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/../../ws_server.cpp)
+target_include_directories(ws_server_blocking_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_compile_definitions(ws_server_blocking_probe PRIVATE CONFIG_HTTPD_QUEUE_WORK_BLOCKING=1)
+
 enable_testing()
 add_test(NAME ws_server_host COMMAND ws_server_host_test)
+add_test(NAME ws_server_rejects_blocking_queue_work
+         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ws_server_blocking_probe)
+set_tests_properties(ws_server_rejects_blocking_queue_work PROPERTIES
+    PASS_REGULAR_EXPRESSION "needs CONFIG_HTTPD_QUEUE_WORK_BLOCKING=n")

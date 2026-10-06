@@ -26,14 +26,21 @@ void             ws_server_init();
 void             ws_server_broadcast(const char* json, size_t len);
 // Send `json` to a single client identified by its httpd socket fd.
 // Intended for command responses correlated by `id` back to the sender.
+// It takes turns with every other sender, so it can block behind a frame that is
+// already in flight: up to about SO_SNDTIMEO (3 s) for each stalled recipient of
+// that frame. It normally runs on the httpd task, so such a stall delays every
+// HTTP request and WS frame for that long. Must not be called from inside a send
+// (ws_server_in_broadcast() true): that asserts.
 void             ws_server_reply(int fd, const char* json, size_t len);
 httpd_handle_t   ws_server_get_handle();
 void             ws_server_set_rx_callback(WsRxCallback cb);
 void             ws_server_set_api_token(const char* token);
 int              ws_server_client_count();
-// True when the CALLING task is currently inside ws_server_broadcast()'s
-// send loop. The WS log sink uses this to drop fan-out of log lines emitted
-// from within the broadcast path itself (TX-path re-entry guard).
+// True when the CALLING task is currently inside a send to a WS client: the
+// broadcast fan-out or ws_server_reply (the TX lock is held, the marker set).
+// The WS log sink uses this to drop fan-out of log lines emitted from within the
+// send path itself (TX-path re-entry guard); ws_server_broadcast returns at once
+// for such a call, and ws_server_reply asserts.
 bool             ws_server_in_broadcast();
 
 // F18: per-fd auth state for first-message WS authentication. A socket may
