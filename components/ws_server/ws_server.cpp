@@ -15,7 +15,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-// httpd_sess_trigger_close (adopt_client, drop_failed_fd) queues work from the
+// httpd_sess_trigger_close (adopt_client, send_locked) queues work from the
 // httpd task itself. With CONFIG_HTTPD_QUEUE_WORK_BLOCKING a full control queue
 // would block that task for good: only it drains the queue.
 #if CONFIG_HTTPD_QUEUE_WORK_BLOCKING
@@ -111,25 +111,31 @@ static void ensure_fd(int fd, bool authed_if_new) {
     if (!present) adopt_client(fd, authed_if_new);
 }
 
-// True if the fd was in the table and this call removed it. Logs after
-// unlocking, like add_fd.
-static bool remove_fd(int fd) {
-    bool removed = false;
-    int  total   = 0;
+// Take the fd out of the table WITHOUT logging; returns the table size afterwards,
+// or -1 if the fd was not in it. For send_locked, which holds s_tx_mutex and must
+// not log under it; everything else calls remove_fd().
+static int remove_fd_quiet(int fd) {
+    int left = -1;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
         if (s_fds[i] == fd) {
             --s_fd_count;
             s_fds[i]       = s_fds[s_fd_count];
             s_fd_authed[i] = s_fd_authed[s_fd_count];   // F18: keep auth state aligned
-            removed = true;
-            total   = s_fd_count;
+            left = s_fd_count;
             break;
         }
     }
     xSemaphoreGive(s_mutex);
-    if (removed) ESP_LOGI(TAG, "WS client removed fd=%d total=%d", fd, total);
-    return removed;
+    return left;
+}
+
+// True if the fd was in the table and this call removed it. Logs after
+// unlocking, like add_fd.
+static bool remove_fd(int fd) {
+    const int left = remove_fd_quiet(fd);
+    if (left >= 0) ESP_LOGI(TAG, "WS client removed fd=%d total=%d", fd, left);
+    return left >= 0;
 }
 
 // F18: per-fd auth state for first-message WS authentication.
@@ -430,18 +436,17 @@ static bool fd_may_receive(int fd) {
     return ok;
 }
 
-// The ONLY place that writes frames to client sockets. httpd_ws_send_frame_async
-// sends a frame as TWO send()s (header, then payload) with no lock of its own,
-// so two tasks writing one socket interleave them: one frame's header lands
-// inside the other's payload and the browser fails the connection (close 1006).
-// Every writer — broadcast fan-out and point replies alike — therefore takes
-// turns on s_tx_mutex and sets the s_broadcast_task marker, so a log line
-// emitted from inside the send is dropped by the log sink instead of
-// re-entering ws_server_broadcast on this task and deadlocking on the mutex.
-// Sends `pkt` to fds[0..n); res[i] = that send's result. Returns false, having
-// sent nothing, when the lock was not taken (callers drop the frame; the fd is
-// healthy, so it must NOT be evicted). Never logs: a failure log here would
-// recurse through the log sink.
+// The ONLY place that writes frames to client sockets, and the only place that
+// handles their failure. httpd_ws_send_frame_async sends a frame as TWO send()s
+// (header, then payload) with no lock of its own, so two tasks writing one socket
+// interleave them: one frame's header lands inside the other's payload and the
+// browser fails the connection (close 1006). Every writer — broadcast fan-out and
+// point replies alike — therefore takes turns on s_tx_mutex and sets the
+// s_broadcast_task marker, so a log line emitted from inside the send is dropped
+// by the log sink instead of re-entering ws_server_broadcast on this task and
+// deadlocking on the mutex. Sends `pkt` to fds[0..n), n <= MAX_WS_CLIENTS. If the
+// lock was not taken nothing is sent and nothing is evicted: those fds are
+// healthy (with portMAX_DELAY it cannot happen anyway).
 //
 // `recheck` (broadcast only): the fd list was snapshotted BEFORE the lock was
 // taken, and this task may have waited a long time for it (behind a reply that
@@ -449,39 +454,60 @@ static bool fd_may_receive(int fd) {
 // can have closed an fd and handed its number to a new connection: an HTTP fetch
 // (the frame would land inside its response) or a WS client that has not signed
 // in yet (it would get what the auth gate withholds). So each fd is checked again
-// once the lock is held; one that fails is skipped, res = ESP_OK (nothing to
-// evict). Replies are never re-checked: their target is the requester, signed in
-// or not.
-static bool send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, esp_err_t* res, bool recheck) {
-    if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) return false;
+// once the lock is held, and one that fails is skipped. Replies are never
+// re-checked: their target is the requester, signed in or not.
+//
+// A fd whose send FAILED is a dead or stalled client. It
+//  1. leaves the table at once, WHILE s_tx_mutex IS STILL HELD. A waiter that
+//     outranks this task (httpd, priority 5, behind TaskEventBus, 2) takes the
+//     lock at the give and runs before this task executes another line: with the
+//     eviction after the give, its re-check would still find the dead fd and it
+//     would stall on it a second time (up to WS_SEND_TIMEOUT_S more, with the
+//     whole web server behind it). The removal is quiet: nothing is logged under
+//     either lock, because the wired/single-chip log sinks broadcast from inside
+//     the log call;
+//  2. has its session closed after the lock is released, but only if THIS call
+//     removed it. Dropping the fd alone leaves the TCP socket open as far as httpd
+//     is concerned; the browser's next frame reaches ws_handler, ensure_fd()
+//     re-adopts it with authed=0, and with sign-in on every command then answers
+//     "auth required" until the page reloads. Closed, the page reconnects (1 s)
+//     and signs in again. httpd queues a close by session POINTER, so a second
+//     close for the same session (another sender with a stale fd snapshot, a reply
+//     after a broadcast) could close whatever new connection has since taken that
+//     slot. The close is queued to the httpd task (httpd_queue_work), so any task
+//     may request it, httpd itself included. Best effort, like adopt_client: the
+//     result is ignored (a full httpd control queue leaves the old behaviour for
+//     this fd);
+//  3. is logged last, so a log line emitted from httpd_sess_trigger_close, or the
+//     warning itself, can never be broadcast back to the dead fd. `who` names the
+//     sender in the warning.
+// Lock order: s_tx_mutex, then s_mutex (fd_may_receive, remove_fd_quiet), and
+// never the other way round: s_mutex is a leaf lock — nothing is called while it
+// is held.
+static void send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, bool recheck, const char* who) {
+    esp_err_t err[MAX_WS_CLIENTS];
+    int       left[MAX_WS_CLIENTS];   // table size after we removed that fd; -1: it did not fail, or was already gone
+    if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) return;
     s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
     // NOTE: no early returns between the guard stores — in_broadcast must clear.
     for (int i = 0; i < n; i++) {
-        res[i] = (recheck && !fd_may_receive(fds[i])) ? ESP_OK
-                                                      : httpd_ws_send_frame_async(s_server, fds[i], pkt);
+        err[i]  = ESP_OK;
+        left[i] = -1;
+        if (recheck && !fd_may_receive(fds[i])) continue;
+        err[i] = httpd_ws_send_frame_async(s_server, fds[i], pkt);
+        if (err[i] != ESP_OK) left[i] = remove_fd_quiet(fds[i]);
     }
     s_broadcast_task.store(nullptr, std::memory_order_release);
     xSemaphoreGive(s_tx_mutex);
-    return true;
-}
 
-// After a failed send: out of the table, then close the session. Dropping the fd
-// alone leaves the TCP socket open as far as httpd is concerned; the browser's
-// next frame reaches ws_handler, ensure_fd() re-adopts it with authed=0, and with
-// sign-in on every command then answers "auth required" until the page reloads.
-// Closed, the page reconnects (1 s) and signs in again. Callers log AFTER this:
-// the fd is already out of the table, so a log line emitted from
-// httpd_sess_trigger_close can't be broadcast back to the dead fd. The close is
-// queued to the httpd task (httpd_queue_work), so any task may call it, httpd
-// itself included; call it outside s_tx_mutex. Best effort, like register_client:
-// the result is ignored (a full httpd control queue leaves the old behaviour for
-// this fd). Not for a lock that was never taken: that fd is healthy.
-// Only the call that actually removed the fd closes it. httpd queues a close by
-// session POINTER, so a second one (another sender with a stale fd snapshot
-// failing on the same fd, a reply after a broadcast) could close whatever new
-// connection has since taken that slot.
-static void drop_failed_fd(int fd) {
-    if (remove_fd(fd)) httpd_sess_trigger_close(s_server, fd);
+    for (int i = 0; i < n; i++) {
+        if (err[i] == ESP_OK) continue;
+        if (left[i] >= 0) {
+            httpd_sess_trigger_close(s_server, fds[i]);
+            ESP_LOGI(TAG, "WS client removed fd=%d total=%d", fds[i], left[i]);
+        }
+        ESP_LOGW(TAG, "%s: send failed fd=%d err=%d (removed)", who, fds[i], err[i]);
+    }
 }
 
 void ws_server_broadcast(const char* json, size_t len) {
@@ -543,23 +569,12 @@ void ws_server_broadcast(const char* json, size_t len) {
     pkt.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(json));
     pkt.len     = len;
 
-    // NO ESP_LOG inside the send loop — with the WS log sink enabled a log
-    // line re-enters the WS TX path, and logging a failure against a dead fd
-    // used to recurse (log → sink → broadcast → fail → log → …) until stack
-    // overflow. Collect failures, remove the dead fds FIRST, then log.
-    //
     // Two tasks broadcasting at once tripped the old single-writer assert and
     // rebooted the wired hub (main's status tick vs the event bus). Take turns.
-    esp_err_t res[MAX_WS_CLIENTS];
-    if (!send_locked(fds, count, &pkt, res, true)) return;
-
-    for (int i = 0; i < count; i++) {
-        if (res[i] == ESP_OK) continue;
-        drop_failed_fd(fds[i]);   // cleanup first (table, then session)…
-        ESP_LOGW(TAG, "ws_broadcast: send failed fd=%d err=%d (removed)",
-                 fds[i], res[i]);   // …log after — bounded: the
-        // fd is already gone, so a re-broadcast of this line can't re-fail.
-    }
+    // send_locked also evicts a failed fd, closes its session and logs the failure,
+    // in that order and outside the locks: a failure log used to recurse (log →
+    // sink → broadcast → fail → log → …) until stack overflow.
+    send_locked(fds, count, &pkt, true, "ws_broadcast");
 }
 
 void ws_server_reply(int fd, const char* json, size_t len) {
@@ -580,13 +595,7 @@ void ws_server_reply(int fd, const char* json, size_t len) {
     pkt.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(json));
     pkt.len     = len;
     // Same turn-taking as the broadcast loop (see send_locked): a reply runs on
-    // the httpd task while another task may be broadcasting to this socket.
-    esp_err_t ret = ESP_OK;
-    if (!send_locked(&fd, 1, &pkt, &ret, false)) return;
-    if (ret != ESP_OK) {
-        // Same ordering rule as the broadcast loop: drop the fd (and close its
-        // session) before touching the log pipeline.
-        drop_failed_fd(fd);
-        ESP_LOGW(TAG, "ws_reply: send failed fd=%d err=%d (removed)", fd, ret);
-    }
+    // the httpd task while another task may be broadcasting to this socket. A
+    // failed send is handled there too (evict, close, log).
+    send_locked(&fd, 1, &pkt, false, "ws_reply");
 }

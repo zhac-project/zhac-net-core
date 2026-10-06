@@ -25,6 +25,12 @@
 // ws_server_broadcast from inside the log call (zhac-wired-core main/log_ring.cpp, dispatch_to_sinks),
 // and broadcast takes s_mutex: a log line emitted under s_mutex would take it twice. The shim mutex is
 // error-checking, so that is counted (g_self_deadlocks) instead of hanging the test.
+//
+// Fourth part: a failed send evicts the dead fd WHILE THE TX LOCK IS STILL HELD. A waiter that outranks the
+// failing sender (httpd, priority 5, behind TaskEventBus, 2) takes the lock at the give and runs before the giver
+// executes another line; if the fd were evicted only after the give, that waiter would still find it in the table
+// and stall on the dead client a second time. The shim models the preemption (g_preempt_rank), and checks the lock
+// order (s_tx_mutex, then s_mutex) on every take of the whole run.
 #include "ws_server.h"
 #include "esp_log.h"            // host_log(), defined below
 #include "freertos/semphr.h"   // g_take_fails, g_self_deadlocks hooks
@@ -54,6 +60,9 @@ static std::atomic<bool> g_parked{false};  // the first sender sits between head
 static std::atomic<bool> g_gate{false};    // while set, the first sender stays parked: the test holds the TX lock
 static std::atomic<int>  g_unmarked{0};    // sends entered without the in-broadcast marker
 static int               g_fail_fd = -1;   // sends to this fd fail (a dead or stalled client)
+static std::atomic<bool> g_stall{false};   // while set, a send to g_fail_fd stalls first (a dead peer's SO_SNDTIMEO)
+static std::atomic<bool> g_stalled{false}; // a sender is stalled on g_fail_fd right now
+static std::atomic<int>  g_fail_sends{0};  // sends attempted to g_fail_fd
 
 static void nap() { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
 
@@ -61,7 +70,13 @@ esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* f)
     // A log line emitted from in here must see the marker, or it re-enters the log sink.
     if (!ws_server_in_broadcast()) g_unmarked++;
     if (fd == g_fail_fd) {                                        // nothing written
-        host_log("httpd_ws", "Failed to send WS header");
+        g_fail_sends++;
+        if (g_stall) {                                            // the send times out after a while ...
+            g_stalled = true;
+            for (int i = 0; i < 5000 && g_stall; i++) nap();
+            g_stalled = false;
+        }
+        host_log("httpd_ws", "Failed to send WS header");          // ... and fails
         return ESP_FAIL;
     }
     const int mine = ++g_entered;
@@ -200,6 +215,42 @@ static void stale_snapshot_case(const char* name, bool new_conn_is_ws_client, in
     close(n[1]);
 }
 
+// xSemaphoreCreateMutex ranks mutexes by creation order: ws_server_init makes s_mutex (0), then s_tx_mutex (1).
+static constexpr int kTxRank = 1;
+
+// The failing sender hands the TX lock to a waiter that outranks it. The sender (`failing`) takes the lock and stalls
+// on the dead fd A until its send times out; a broadcaster that snapshotted {sv, A} meanwhile waits for the lock.
+// When the sender fails and gives the lock, the shim lets that waiter run its whole critical section first. It must
+// find A already out of the table: exactly ONE send ever goes to A.
+static void handoff_case(const char* name, void (*failing)(int), size_t sv_frames, int sv_peer) {
+    int a[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, a);
+    add_client(a[0]);
+    g_entered = 2;                          // no parking: this is not a race scenario
+    g_fail_sends = 0;
+    g_closes.clear();
+    g_fail_fd = a[0];
+    g_stall   = true;
+    g_preempt_rank = kTxRank;
+    std::thread sender(failing, a[0]);      // takes the TX lock, stalls on A
+    for (int i = 0; i < 2000 && !g_stalled; i++) nap();
+    const int waiting = g_waiting[kTxRank];
+    std::thread waiter(do_broadcast, 0);    // snapshots {sv, A}, then blocks on the TX lock
+    for (int i = 0; i < 2000 && g_waiting[kTxRank] == waiting; i++) nap();
+    g_stall = false;                        // A's send times out: it fails, and the lock is handed over
+    sender.join();
+    waiter.join();
+    g_preempt_rank = -1;
+    g_fail_fd = -1;
+    std::vector<std::string> f;
+    printf("      sends to the dead fd: %d, closes requested: %zu\n", g_fail_sends.load(), g_closes.size());
+    CHECK(g_fail_sends == 1, name);
+    std::string what = std::string(name) + " (one close for A; the healthy client still got its frames)";
+    CHECK(g_closes.size() == 1 && g_closes[0].fd == a[0] && read_frames(sv_peer, f) && f.size() == sv_frames, what.c_str());
+    close(a[0]);
+    close(a[1]);
+}
+
 int main() {
     ws_server_init();                       // stub httpd captures the /ws handler
     int sv[2];
@@ -280,29 +331,45 @@ int main() {
     g_fail_fd = -1;
     CHECK(g_closes.size() == 1 && g_closes[0].fd == c5[0], "stale fd snapshot (two broadcasts): closed once");
 
+    // The hand-off. The table is {sv} here. A failing broadcast: sv gets its frame and the waiter's.
+    read_frames(sv[1], f);
+    handoff_case("hand-off after a failed broadcast: a waiter that takes the lock sends nothing more to the dead fd",
+                 do_broadcast, 2, sv[1]);
+    // A failing reply to the dead client, the waiter is a broadcast: sv gets only the waiter's frame.
+    handoff_case("hand-off after a failed reply: a waiter that takes the lock sends nothing more to the dead fd",
+                 do_reply, 1, sv[1]);
+
     // The wired WS log sink broadcasts from inside the log call. A log line emitted while s_mutex is held would
-    // take it a second time (the shim counts that instead of hanging): add_fd and remove_fd log after unlocking.
-    int c6[2];
+    // take it a second time (the shim counts that instead of hanging). Inside a send the marker hides such a
+    // re-entry, so the table is also changed from OUTSIDE the TX lock: add_fd on a handshake, remove_fd when httpd ends
+    // a session (the captured close_fn). Neither may log under s_mutex.
+    int c6[2], c7[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, c6);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, c7);
     read_frames(sv[1], f);                  // forget what the scenarios above sent
     g_sink_on = true;
-    add_client(c6[0]);                      // add_fd logs "WS client added"
+    add_client(c6[0]);                      // add_fd logs "WS client added"                                  (log frame 1)
     CHECK(g_self_deadlocks.exchange(0) == 0, "add_fd logs outside s_mutex (log sink on)");
     // A failing send logs from INSIDE the writer, on the task that holds the TX lock (marker set). The sink's
     // broadcast must return at once there: without the re-entry guard it would take s_tx_mutex a second time.
     g_fail_fd = c4[0];                      // open, but no longer in the table: only the in-send line and the warning
-    do_reply(c4[0]);
+    do_reply(c4[0]);                        //                                                                (log frame 2)
     g_fail_fd = -1;
     CHECK(g_self_deadlocks.exchange(0) == 0, "a log line from inside a failing send is dropped by the marker (log sink on)");
-    g_fail_fd = c6[0];
-    do_broadcast(0);                        // evicts c6: remove_fd logs "WS client removed", then the warning
-    g_fail_fd = -1;
+    g_close_fn(nullptr, c6[0]);             // httpd ends c6's session: remove_fd logs "WS client removed"   (log frame 3)
     CHECK(g_self_deadlocks.exchange(0) == 0, "remove_fd logs outside s_mutex (log sink on)");
+    // A failed send evicts quietly under the TX lock; the close and both log lines come after the release, so the
+    // sink sees them (a line logged under the TX lock would be dropped by the marker).
+    add_client(c7[0]);                      //                                                                (log frame 4)
+    g_fail_fd = c7[0];
+    do_broadcast(0);                        // event frame; evicts c7; then "removed" and the warning        (log frames 5, 6)
+    g_fail_fd = -1;
+    CHECK(g_self_deadlocks.exchange(0) == 0, "a failed send evicts, closes and logs outside both locks (log sink on)");
     g_sink_on = false;
     int logs = 0, events = 0;
     const bool got = read_frames(sv[1], f);
     for (const auto& m : f) { logs += m == kLog; events += m == kEvent; }
-    CHECK(got && logs >= 4 && events == 1, "the sink hook ran: log frames and the event reached the healthy client");
+    CHECK(got && logs == 6 && events == 1, "the sink hook ran: six log frames and the event reached the healthy client");
 
     // A socket httpd knows but the table does not (evicted, or never registered) sends a data frame. ensure_fd adopts
     // it with the same capped send timeout as the handshake; when the table is full it closes the socket, as the
@@ -378,5 +445,6 @@ int main() {
     read_frames(sv[1], f);
     ws_server_set_api_token(nullptr);
 
+    CHECK(g_lock_order_violations == 0, "lock order, every take of the run: s_tx_mutex is never taken while s_mutex is held");
     return g_failures ? 1 : 0;
 }
