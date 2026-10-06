@@ -140,6 +140,13 @@ Lua uploads) is gone.
   `ws_server_reply` alike, so two tasks can never interleave on a socket (an
   unlocked reply once did: the browser failed the connection, close 1006).
   Fan-out ordering is decided in the TX worker's queue, not by racing producers.
+- Lock order is `s_tx_mutex`, then `s_mutex`, never the reverse. A broadcast
+  re-checks every recipient under `s_mutex` once it holds the TX lock (still in
+  the table, and signed in when sign-in is on) and skips any that fails: its fd
+  snapshot was taken before it waited for the lock, and httpd can meanwhile close
+  an fd and hand the number to a new connection (an HTTP fetch, or a client that
+  has not signed in). `s_mutex` stays a leaf lock: nothing is called while it is
+  held. Replies are never re-checked (their target is the requester).
 - Callers must not hold their own mutexes across `ws_server_broadcast` /
   `ws_server_reply` (WEB-F2): format under a local lock, snapshot, release,
   then send.

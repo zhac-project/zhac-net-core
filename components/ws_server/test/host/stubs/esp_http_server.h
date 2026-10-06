@@ -4,6 +4,7 @@
 // Host stub of the esp_http_server API that ws_server.cpp calls. Left to the test: the
 // WebSocket frame writer httpd_ws_send_frame_async (IDF's two-send() writer) and
 // httpd_sess_trigger_close (which the test records).
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -14,7 +15,7 @@ typedef int esp_err_t;
 #define ESP_ERR_TIMEOUT 0x107
 
 typedef void* httpd_handle_t;
-enum httpd_method_t { HTTP_GET = 1 };
+enum httpd_method_t { HTTP_DELETE = 0, HTTP_GET = 1 };   // data frames after the handshake arrive with method 0
 struct httpd_req_t { httpd_method_t method; void* user_ctx; };   // user_ctx carries the fake sockfd
 enum httpd_ws_type_t { HTTPD_WS_TYPE_TEXT = 1 };
 enum httpd_ws_client_info_t { HTTPD_WS_CLIENT_INVALID, HTTPD_WS_CLIENT_HTTP, HTTPD_WS_CLIENT_WEBSOCKET };
@@ -33,7 +34,9 @@ struct httpd_config_t {
 #define HTTPD_DEFAULT_CONFIG() httpd_config_t{}
 
 inline const httpd_uri_t* g_ws_uri = nullptr;   // captured by httpd_register_uri_handler
-inline esp_err_t httpd_start(httpd_handle_t* h, const httpd_config_t*) { *h = reinterpret_cast<httpd_handle_t>(1); return ESP_OK; }
+inline httpd_close_func_t g_close_fn = nullptr;  // captured by httpd_start: what httpd runs when a session ends
+inline std::atomic<int> g_fd_info_calls{0};      // httpd_ws_get_fd_info calls (a broadcaster calls it once per snapshot fd)
+inline esp_err_t httpd_start(httpd_handle_t* h, const httpd_config_t* c) { *h = reinterpret_cast<httpd_handle_t>(1); g_close_fn = c->close_fn; return ESP_OK; }
 inline esp_err_t httpd_register_uri_handler(httpd_handle_t, const httpd_uri_t* u) { g_ws_uri = u; return ESP_OK; }
 inline int httpd_req_to_sockfd(httpd_req_t* r) { return static_cast<int>(reinterpret_cast<intptr_t>(r->user_ctx)); }
 inline esp_err_t httpd_req_get_hdr_value_str(httpd_req_t*, const char*, char*, size_t) { return ESP_FAIL; }
@@ -41,7 +44,7 @@ inline size_t httpd_req_get_url_query_len(httpd_req_t*) { return 0; }
 inline esp_err_t httpd_req_get_url_query_str(httpd_req_t*, char*, size_t) { return ESP_FAIL; }
 inline esp_err_t httpd_query_key_value(const char*, const char*, char*, size_t) { return ESP_FAIL; }
 inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t*, size_t) { return ESP_FAIL; }
-inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { return HTTPD_WS_CLIENT_WEBSOCKET; }
+inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { g_fd_info_calls++; return HTTPD_WS_CLIENT_WEBSOCKET; }
 inline bool httpd_uri_match_wildcard(const char*, const char*, size_t) { return true; }
 esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* frame);   // supplied by the test
 esp_err_t httpd_sess_trigger_close(httpd_handle_t, int fd);                             // supplied by the test

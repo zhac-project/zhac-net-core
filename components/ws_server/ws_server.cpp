@@ -388,6 +388,21 @@ bool ws_server_in_broadcast() {
            xTaskGetCurrentTaskHandle();
 }
 
+// Broadcast only (see send_locked, `recheck`): is this fd still a registered
+// client, and signed in when sign-in is on? Takes s_mutex while the caller holds
+// s_tx_mutex. That is the only lock order there is: s_mutex is a leaf lock
+// (nothing is called, and nothing logged, while it is held), so no task ever
+// takes s_tx_mutex while holding it.
+static bool fd_may_receive(int fd) {
+    bool ok = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_fd_count; i++) {
+        if (s_fds[i] == fd) { ok = s_api_token[0] == '\0' || s_fd_authed[i]; break; }
+    }
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
 // The ONLY place that writes frames to client sockets. httpd_ws_send_frame_async
 // sends a frame as TWO send()s (header, then payload) with no lock of its own,
 // so two tasks writing one socket interleave them: one frame's header lands
@@ -400,11 +415,24 @@ bool ws_server_in_broadcast() {
 // sent nothing, when the lock was not taken (callers drop the frame; the fd is
 // healthy, so it must NOT be evicted). Never logs: a failure log here would
 // recurse through the log sink.
-static bool send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, esp_err_t* res) {
+//
+// `recheck` (broadcast only): the fd list was snapshotted BEFORE the lock was
+// taken, and this task may have waited a long time for it (behind a reply that
+// is draining to a slow client, or a send stalled on a dead one). By then httpd
+// can have closed an fd and handed its number to a new connection: an HTTP fetch
+// (the frame would land inside its response) or a WS client that has not signed
+// in yet (it would get what the auth gate withholds). So each fd is checked again
+// once the lock is held; one that fails is skipped, res = ESP_OK (nothing to
+// evict). Replies are never re-checked: their target is the requester, signed in
+// or not.
+static bool send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, esp_err_t* res, bool recheck) {
     if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) return false;
     s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
     // NOTE: no early returns between the guard stores — in_broadcast must clear.
-    for (int i = 0; i < n; i++) res[i] = httpd_ws_send_frame_async(s_server, fds[i], pkt);
+    for (int i = 0; i < n; i++) {
+        res[i] = (recheck && !fd_may_receive(fds[i])) ? ESP_OK
+                                                      : httpd_ws_send_frame_async(s_server, fds[i], pkt);
+    }
     s_broadcast_task.store(nullptr, std::memory_order_release);
     xSemaphoreGive(s_tx_mutex);
     return true;
@@ -491,7 +519,7 @@ void ws_server_broadcast(const char* json, size_t len) {
     // Two tasks broadcasting at once tripped the old single-writer assert and
     // rebooted the wired hub (main's status tick vs the event bus). Take turns.
     esp_err_t res[MAX_WS_CLIENTS];
-    if (!send_locked(fds, count, &pkt, res)) return;
+    if (!send_locked(fds, count, &pkt, res, true)) return;
 
     for (int i = 0; i < count; i++) {
         if (res[i] == ESP_OK) continue;
@@ -518,7 +546,7 @@ void ws_server_reply(int fd, const char* json, size_t len) {
     // Same turn-taking as the broadcast loop (see send_locked): a reply runs on
     // the httpd task while another task may be broadcasting to this socket.
     esp_err_t ret = ESP_OK;
-    if (!send_locked(&fd, 1, &pkt, &ret)) return;
+    if (!send_locked(&fd, 1, &pkt, &ret, false)) return;
     if (ret != ESP_OK) {
         // Same ordering rule as the broadcast loop: drop the fd (and close its
         // session) before touching the log pipeline.

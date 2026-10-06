@@ -50,6 +50,7 @@ static int g_failures = 0;
 static std::atomic<int>  g_entered{0};     // senders that reached the writer (the first one parks)
 static std::atomic<int>  g_headers{0};     // headers written so far
 static std::atomic<bool> g_parked{false};  // the first sender sits between header and payload
+static std::atomic<bool> g_gate{false};    // while set, the first sender stays parked: the test holds the TX lock
 static std::atomic<int>  g_unmarked{0};    // sends entered without the in-broadcast marker
 static int               g_fail_fd = -1;   // sends to this fd fail (a dead or stalled client)
 
@@ -69,7 +70,8 @@ esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* f)
     ++g_headers;                            // counted AFTER the send: a second header on the wire is certain
     if (mine == 1) {
         g_parked = true;
-        for (int i = 0; i < 200 && g_headers < 2; i++) nap();
+        if (g_gate) { for (int i = 0; i < 5000 && g_gate; i++) nap(); }          // held until the test lets go
+        else        { for (int i = 0; i < 200 && g_headers < 2; i++) nap(); }
     }
     send(fd, f->payload, f->len, MSG_NOSIGNAL);                   // ... then payload
     return ESP_OK;
@@ -140,6 +142,46 @@ static void scenario(const char* name, void (*first)(int), void (*second)(int), 
     const bool clean = read_frames(peer, f);
     CHECK(clean && f.size() == 2 &&
           ((f[0] == kReply && f[1] == kEvent) || (f[0] == kEvent && f[1] == kReply)), name);
+}
+
+// A broadcaster snapshots the fd list, then waits for the TX lock behind a reply that the test holds mid-frame.
+// While it waits, httpd ends A's session and lwIP hands A's number to a NEW connection. Once the broadcaster has the
+// lock it must send that connection nothing: it is either not a client at all (an HTTP fetch: the frame would land
+// inside its response) or a client that has not signed in yet (it would get what the auth gate withholds).
+static void stale_snapshot_case(const char* name, bool new_conn_is_ws_client, int sv_server, int sv_peer) {
+    int a[2], n[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, a);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, n);
+    add_client(a[0]);                       // sign-in is on: registered, not signed in ...
+    ws_server_fd_set_authed(a[0]);          // ... until it signs in
+    const int a_fd = a[0];
+
+    g_entered = 0;
+    g_headers = 0;
+    g_parked  = false;
+    g_gate    = true;
+    std::thread holder(do_reply, sv_server);                // a reply parked mid-frame, holding the TX lock
+    for (int i = 0; i < 1000 && !g_parked; i++) nap();
+    const int seen = g_fd_info_calls;
+    std::thread b(do_broadcast, 0);                         // snapshots {sv, A}, then waits for the lock
+    for (int i = 0; i < 2000 && g_fd_info_calls < seen + 2; i++) nap();
+
+    g_close_fn(nullptr, a_fd);                              // httpd ends A's session: close_fn removes it, closes it
+    dup2(n[0], a_fd);                                       // lwIP gives the same number to the next connection
+    close(n[0]);
+    if (new_conn_is_ws_client) add_client(a_fd);            // a WS client that has not signed in yet
+
+    g_gate = false;
+    holder.join();
+    b.join();
+    std::vector<std::string> f;
+    CHECK(read_frames(n[1], f) && f.empty(), name);
+    std::string what = std::string(name) + " (the signed-in client still gets reply and event, nothing is closed)";
+    CHECK(read_frames(sv_peer, f) && f.size() == 2 && f[0] == kReply && f[1] == kEvent && g_closes.empty(), what.c_str());
+
+    if (new_conn_is_ws_client) g_close_fn(nullptr, a_fd); else close(a_fd);
+    close(a[1]);
+    close(n[1]);
 }
 
 int main() {
@@ -244,6 +286,27 @@ int main() {
     const bool got = read_frames(sv[1], f);
     for (const auto& m : f) { logs += m == kLog; events += m == kEvent; }
     CHECK(got && logs >= 4 && events == 1, "the sink hook ran: log frames and the event reached the healthy client");
+
+    // Sign-in on. sv[0] registered while it was off, so it stays signed in; everything new starts signed out.
+    ws_server_set_api_token("0123456789abcdef0123456789abcdef");
+    int u[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, u);
+    add_client(u[0]);
+    g_entered = 2;                          // no parking
+    do_reply(u[0]);
+    CHECK(read_frames(u[1], f) && f.size() == 1 && f[0] == kReply,
+          "a reply still reaches a client that has not signed in (only broadcasts are re-checked)");
+    do_broadcast(0);
+    CHECK(read_frames(u[1], f) && f.empty(), "auth gate: a client that has not signed in gets no broadcast");
+    g_close_fn(nullptr, u[0]);
+    read_frames(sv[1], f);                  // forget what was sent above
+    g_closes.clear();
+
+    stale_snapshot_case("stale fd snapshot, number reused by a client that has not signed in: nothing sent to it",
+                        true, sv[0], sv[1]);
+    stale_snapshot_case("stale fd snapshot, number reused by a non-WebSocket connection: nothing sent to it",
+                        false, sv[0], sv[1]);
+    ws_server_set_api_token(nullptr);
 
     return g_failures ? 1 : 0;
 }
