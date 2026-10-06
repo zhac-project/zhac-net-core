@@ -101,6 +101,8 @@ static std::atomic<bool> g_warned{false};   // the "send failed" warning has bee
 static std::atomic<bool> g_sink_on{false};  // host_log() behaves like the wired WS log sink
 static std::atomic<bool> g_log_replies{false};  // the NEXT log line answers a client: a caller replying from inside a send
 static int               g_reply_fd = -1;
+static int               g_hook_calls = 0;
+static void reply_hook(const char*, size_t) { g_hook_calls++; }   // stands in for remote_client's reply hook
 
 static const std::string kLog = R"({"type":"log","level":"I","entry":"x"})";
 
@@ -443,6 +445,21 @@ int main() {
     CHECK(g_assert_failures.exchange(0) == 1, "ws_server_reply asserts when it is called from inside a send");
     g_self_deadlocks = 0;                   // the second take that the assert replaced
     read_frames(sv[1], f);
+
+    // The sentinel fast path (a reply routed to remote_client) never takes s_tx_mutex, so a reply through it from inside
+    // a send is harmless and must not assert: the assert is only exact on the httpd path, after the fast path.
+    constexpr int kSentinel = -7;
+    ws_server_register_reply_hook(kSentinel, reply_hook);
+    g_reply_fd = kSentinel;
+    g_assert_aborts = false;
+    g_log_replies   = true;
+    g_fail_fd = c4[0];
+    do_reply(c4[0]);
+    g_fail_fd = -1;
+    g_assert_aborts = true;
+    CHECK(g_assert_failures.exchange(0) == 0 && g_hook_calls == 1,
+          "a reply through the sentinel hook reaches the hook and does not assert, even from inside a send");
+    ws_server_register_reply_hook(0, nullptr);
     ws_server_set_api_token(nullptr);
 
     CHECK(g_lock_order_violations == 0, "lock order, every take of the run: s_tx_mutex is never taken while s_mutex is held");

@@ -578,10 +578,6 @@ void ws_server_broadcast(const char* json, size_t len) {
 }
 
 void ws_server_reply(int fd, const char* json, size_t len) {
-    // A reply issued from inside our own send (the marker is set on this task,
-    // e.g. from a log hook) would take s_tx_mutex a second time: a silent
-    // self-deadlock. Fail loudly instead.
-    configASSERT(!ws_server_in_broadcast());
     // Sentinel-fd fast path: route the reply to a registered hook
     // (e.g. remote_client) instead of the local httpd send. The
     // sentinel is chosen outside the legal httpd fd range.
@@ -590,6 +586,11 @@ void ws_server_reply(int fd, const char* json, size_t len) {
         return;
     }
     if (!s_server || fd < 0) return;
+    // A reply issued from inside our own send (the marker is set on this task,
+    // e.g. from a log hook) would take s_tx_mutex a second time: a silent
+    // self-deadlock. Fail loudly instead. Below the sentinel fast path on
+    // purpose: that route never takes the lock, so it is safe there.
+    configASSERT(!ws_server_in_broadcast());
     httpd_ws_frame_t pkt{};
     pkt.type    = HTTPD_WS_TYPE_TEXT;
     pkt.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(json));

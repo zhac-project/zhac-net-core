@@ -30,7 +30,8 @@ void             ws_server_broadcast(const char* json, size_t len);
 // already in flight: up to about SO_SNDTIMEO (3 s) for each stalled recipient of
 // that frame. It normally runs on the httpd task, so such a stall delays every
 // HTTP request and WS frame for that long. Must not be called from inside a send
-// (ws_server_in_broadcast() true): that asserts.
+// (ws_server_in_broadcast() true): that asserts, except through the reply hook
+// below, which takes no lock.
 void             ws_server_reply(int fd, const char* json, size_t len);
 httpd_handle_t   ws_server_get_handle();
 void             ws_server_set_rx_callback(WsRxCallback cb);

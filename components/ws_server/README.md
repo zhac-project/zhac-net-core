@@ -49,7 +49,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 | `ws_server_set_rx_callback(cb)` | Installs the inbound text-frame callback (single slot, latest wins, `nullptr` detaches). |
 | `ws_server_set_api_token(token)` | Sets the 32-char token (`char[33]`, truncated). `nullptr`/`""` disables auth entirely (token set ⇔ auth on). |
 | `ws_server_client_count()` | Live fd count under `s_mutex`. |
-| `ws_server_in_broadcast()` | True when the *calling* task is inside a send to a WS client: the broadcast fan-out or `ws_server_reply` (`send_locked` holds the TX lock and sets the marker). Used by the log pipeline to drop WS fan-out of lines logged from within the TX path; `ws_server_broadcast` returns at once for such a call and `ws_server_reply` asserts. |
+| `ws_server_in_broadcast()` | True when the *calling* task is inside a send to a WS client: the broadcast fan-out or `ws_server_reply` (`send_locked` holds the TX lock and sets the marker). Used by the log pipeline to drop WS fan-out of lines logged from within the TX path; `ws_server_broadcast` returns at once for such a call and `ws_server_reply` asserts (not on the sentinel-hook route, which takes no lock). |
 | `ws_server_fd_is_authed(fd)` / `ws_server_fd_set_authed(fd)` | F18 per-fd auth state; the dispatch layer permits only `auth` until set. |
 | `ws_server_fd_deauth_all()` | Q48: clears every authed flag on token rotation — stale-token sockets must re-auth. |
 | `ws_server_register_reply_hook(sentinel_fd, hook)` | Routes `ws_server_reply` for one reserved sentinel fd (outside legal httpd range) to a hook (e.g. remote_client). Single slot; register before traffic; `nullptr` unregisters. |
@@ -161,6 +161,7 @@ Lua uploads) is gone.
   line (wired/mono WS log sink) with nobody to send to never queues behind a
   reply. `ws_server_reply` asserts that the calling task is not already inside a
   send (marker set): a reply from inside a send would take `s_tx_mutex` twice.
+  The assert sits below the sentinel-hook fast path, which never takes the lock.
 - `ws_server` queues httpd work (`httpd_sess_trigger_close`) from the httpd task
   itself, so `ws_server.cpp` refuses to compile with
   `CONFIG_HTTPD_QUEUE_WORK_BLOCKING=y`: a full control queue would then block the
