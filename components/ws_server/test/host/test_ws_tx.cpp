@@ -10,9 +10,10 @@
 //
 // The writer below is IDF's, plus a rendezvous that stands in for the blocking lwIP round
 // trip between the two send()s: the FIRST sender parks after its header until a second
-// sender enters the writer (or 200 ms pass). Unserialised, the second enters at once and
-// its whole frame lands inside the first: deterministic corruption. Serialised, the second
-// blocks on the lock and the first simply times out.
+// sender has written ITS header (or 200 ms pass). Unserialised, the second does so at once
+// and its whole frame lands inside the first: deterministic corruption. Serialised, the
+// second blocks on the lock and the first simply times out. On failure the writer logs a
+// W-level line from inside the send, as IDF does (httpd_ws.c "Failed to send WS header").
 //
 // Second part: a failed send must CLOSE the session (httpd_sess_trigger_close), not only drop
 // the fd from the broadcast table. Otherwise the socket stays open, the browser's next frame
@@ -25,6 +26,7 @@
 // and broadcast takes s_mutex: a log line emitted under s_mutex would take it twice. The shim mutex is
 // error-checking, so that is counted (g_self_deadlocks) instead of hanging the test.
 #include "ws_server.h"
+#include "esp_log.h"            // host_log(), defined below
 #include "freertos/semphr.h"   // g_take_fails, g_self_deadlocks hooks
 
 #include <sys/socket.h>
@@ -45,7 +47,8 @@ static int g_failures = 0;
     else      { printf("FAIL: %s\n", msg); g_failures++; }         \
 } while (0)
 
-static std::atomic<int>  g_entered{0};     // senders that reached the writer
+static std::atomic<int>  g_entered{0};     // senders that reached the writer (the first one parks)
+static std::atomic<int>  g_headers{0};     // headers written so far
 static std::atomic<bool> g_parked{false};  // the first sender sits between header and payload
 static std::atomic<int>  g_unmarked{0};    // sends entered without the in-broadcast marker
 static int               g_fail_fd = -1;   // sends to this fd fail (a dead or stalled client)
@@ -55,14 +58,18 @@ static void nap() { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
 esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* f) {
     // A log line emitted from in here must see the marker, or it re-enters the log sink.
     if (!ws_server_in_broadcast()) g_unmarked++;
-    if (fd == g_fail_fd) return ESP_FAIL;                         // nothing written
+    if (fd == g_fail_fd) {                                        // nothing written
+        host_log("httpd_ws", "Failed to send WS header");
+        return ESP_FAIL;
+    }
     const int mine = ++g_entered;
     const bool big = f->len > 125;
     const uint8_t h[4] = {0x81, big ? uint8_t(126) : uint8_t(f->len), uint8_t(f->len >> 8), uint8_t(f->len)};
     send(fd, h, big ? 4 : 2, MSG_NOSIGNAL);                       // header ...
+    ++g_headers;                            // counted AFTER the send: a second header on the wire is certain
     if (mine == 1) {
         g_parked = true;
-        for (int i = 0; i < 200 && g_entered < 2; i++) nap();
+        for (int i = 0; i < 200 && g_headers < 2; i++) nap();
     }
     send(fd, f->payload, f->len, MSG_NOSIGNAL);                   // ... then payload
     return ESP_OK;
@@ -122,6 +129,7 @@ static bool read_frames(int peer, std::vector<std::string>& out) {
 // `first` is parked between its header and payload; `second` is then released against it.
 static void scenario(const char* name, void (*first)(int), void (*second)(int), int fd, int peer) {
     g_entered = 0;
+    g_headers = 0;
     g_parked  = false;
     std::thread a(first, fd);
     for (int i = 0; i < 1000 && !g_parked; i++) nap();
@@ -202,6 +210,7 @@ int main() {
     add_client(c5[0]);
     g_closes.clear();
     g_entered = 0;
+    g_headers = 0;
     g_parked  = false;
     g_fail_fd = c5[0];
     std::thread b1(do_broadcast, 0);
@@ -220,13 +229,21 @@ int main() {
     g_sink_on = true;
     add_client(c6[0]);                      // add_fd logs "WS client added"
     CHECK(g_self_deadlocks.exchange(0) == 0, "add_fd logs outside s_mutex (log sink on)");
+    // A failing send logs from INSIDE the writer, on the task that holds the TX lock (marker set). The sink's
+    // broadcast must return at once there: without the re-entry guard it would take s_tx_mutex a second time.
+    g_fail_fd = c4[0];                      // open, but no longer in the table: only the in-send line and the warning
+    do_reply(c4[0]);
+    g_fail_fd = -1;
+    CHECK(g_self_deadlocks.exchange(0) == 0, "a log line from inside a failing send is dropped by the marker (log sink on)");
     g_fail_fd = c6[0];
     do_broadcast(0);                        // evicts c6: remove_fd logs "WS client removed", then the warning
     g_fail_fd = -1;
     CHECK(g_self_deadlocks.exchange(0) == 0, "remove_fd logs outside s_mutex (log sink on)");
     g_sink_on = false;
-    CHECK(read_frames(sv[1], f) && f.size() == 4 && f[0] == kLog && f[1] == kEvent && f[2] == kLog && f[3] == kLog,
-          "the sink hook ran: three log frames and the event reached the healthy client");
+    int logs = 0, events = 0;
+    const bool got = read_frames(sv[1], f);
+    for (const auto& m : f) { logs += m == kLog; events += m == kEvent; }
+    CHECK(got && logs >= 4 && events == 1, "the sink hook ran: log frames and the event reached the healthy client");
 
     return g_failures ? 1 : 0;
 }
