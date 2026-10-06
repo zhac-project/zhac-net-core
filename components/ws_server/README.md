@@ -148,6 +148,10 @@ Lua uploads) is gone.
   an fd and hand the number to a new connection (an HTTP fetch, or a client that
   has not signed in). `s_mutex` stays a leaf lock: nothing is called while it is
   held. Replies are never re-checked (their target is the requester).
+- A broadcast with no recipient returns before it takes `s_tx_mutex`, so a log
+  line (wired/mono WS log sink) with nobody to send to never queues behind a
+  reply. `ws_server_reply` asserts that the calling task is not already inside a
+  send (marker set): a reply from inside a send would take `s_tx_mutex` twice.
 - Callers must not hold their own mutexes across `ws_server_broadcast` /
   `ws_server_reply` (WEB-F2): format under a local lock, snapshot, release,
   then send.

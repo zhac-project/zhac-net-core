@@ -84,11 +84,14 @@ static std::vector<Close> g_closes;
 static std::mutex g_closes_mu;
 static std::atomic<bool> g_warned{false};   // the "send failed" warning has been logged
 static std::atomic<bool> g_sink_on{false};  // host_log() behaves like the wired WS log sink
+static std::atomic<bool> g_log_replies{false};  // the NEXT log line answers a client: a caller replying from inside a send
+static int               g_reply_fd = -1;
 
 static const std::string kLog = R"({"type":"log","level":"I","entry":"x"})";
 
 void host_log(const char*, const char* fmt, ...) {
     if (strstr(fmt, "send failed")) g_warned = true;
+    if (g_log_replies.exchange(false)) ws_server_reply(g_reply_fd, kLog.data(), kLog.size());
     // The wired sink (log_ring.cpp dispatch_to_sinks) broadcasts every log line from inside the log call.
     if (g_sink_on) ws_server_broadcast(kLog.data(), kLog.size());
 }
@@ -340,6 +343,39 @@ int main() {
                         true, sv[0], sv[1]);
     stale_snapshot_case("stale fd snapshot, number reused by a non-WebSocket connection: nothing sent to it",
                         false, sv[0], sv[1]);
+
+    // A broadcast with nobody to send to must not queue behind the TX lock: on wired/mono, with the WS log sink on,
+    // every log line from every task is one, and most have no client signed in.
+    ws_server_fd_deauth_all();              // nobody signed in: no recipient
+    g_entered = 0;
+    g_headers = 0;
+    g_parked  = false;
+    g_gate    = true;
+    std::thread holder(do_reply, sv[0]);    // a reply parked mid-frame, holding the TX lock
+    for (int i = 0; i < 1000 && !g_parked; i++) nap();
+    std::atomic<bool> done{false};
+    std::thread nobody([&] { do_broadcast(0); done = true; });
+    for (int i = 0; i < 300 && !done; i++) nap();
+    const bool returned = done;
+    g_gate = false;
+    holder.join();
+    nobody.join();
+    CHECK(returned, "a broadcast with no recipient does not wait for the TX lock");
+    ws_server_fd_set_authed(sv[0]);
+    read_frames(sv[1], f);
+
+    // A reply issued from inside our own send (the marker is set on this task) would take s_tx_mutex a second time and
+    // deadlock silently. It asserts instead; the shim counts the assert and, for this one call, does not abort.
+    g_reply_fd = sv[0];
+    g_assert_aborts = false;
+    g_log_replies   = true;                 // the line logged from inside the failing send answers a client
+    g_fail_fd = c4[0];
+    do_reply(c4[0]);
+    g_fail_fd = -1;
+    g_assert_aborts = true;
+    CHECK(g_assert_failures.exchange(0) == 1, "ws_server_reply asserts when it is called from inside a send");
+    g_self_deadlocks = 0;                   // the second take that the assert replaced
+    read_frames(sv[1], f);
     ws_server_set_api_token(nullptr);
 
     return g_failures ? 1 : 0;

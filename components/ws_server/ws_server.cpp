@@ -525,6 +525,11 @@ void ws_server_broadcast(const char* json, size_t len) {
         if (auth_on && !snap_authed[i]) continue;
         fds[count++] = snap_fd[i];
     }
+    // Nobody to send to: do not queue behind the TX lock. With the wired/mono WS
+    // log sink on, every log line from every task is a broadcast, and most of
+    // them have no client signed in; they would all wait behind a reply that is
+    // draining to a slow client.
+    if (count == 0) return;
 
     httpd_ws_frame_t pkt{};
     pkt.type    = HTTPD_WS_TYPE_TEXT;
@@ -551,6 +556,10 @@ void ws_server_broadcast(const char* json, size_t len) {
 }
 
 void ws_server_reply(int fd, const char* json, size_t len) {
+    // A reply issued from inside our own send (the marker is set on this task,
+    // e.g. from a log hook) would take s_tx_mutex a second time: a silent
+    // self-deadlock. Fail loudly instead.
+    configASSERT(!ws_server_in_broadcast());
     // Sentinel-fd fast path: route the reply to a registered hook
     // (e.g. remote_client) instead of the local httpd send. The
     // sentinel is chosen outside the legal httpd fd range.
