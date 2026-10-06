@@ -396,6 +396,22 @@ static bool send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, esp_err_t*
     return true;
 }
 
+// After a failed send: out of the table, then close the session. Dropping the fd
+// alone leaves the TCP socket open as far as httpd is concerned; the browser's
+// next frame reaches ws_handler, ensure_fd() re-adopts it with authed=0, and with
+// sign-in on every command then answers "auth required" until the page reloads.
+// Closed, the page reconnects (1 s) and signs in again. Callers log AFTER this:
+// the fd is already out of the table, so a log line emitted from
+// httpd_sess_trigger_close can't be broadcast back to the dead fd. The close is
+// queued to the httpd task (httpd_queue_work), so any task may call it, httpd
+// itself included; call it outside s_tx_mutex. Best effort, like register_client:
+// the result is ignored (a full httpd control queue leaves the old behaviour for
+// this fd). Not for a lock that was never taken: that fd is healthy.
+static void drop_failed_fd(int fd) {
+    remove_fd(fd);
+    httpd_sess_trigger_close(s_server, fd);
+}
+
 void ws_server_broadcast(const char* json, size_t len) {
     if (!s_server || !s_mutex || !s_tx_mutex) return;
     // A line logged from inside our own send loop would come back here on the
@@ -462,7 +478,7 @@ void ws_server_broadcast(const char* json, size_t len) {
 
     for (int i = 0; i < count; i++) {
         if (res[i] == ESP_OK) continue;
-        remove_fd(fds[i]);   // cleanup first…
+        drop_failed_fd(fds[i]);   // cleanup first (table, then session)…
         ESP_LOGW(TAG, "ws_broadcast: send failed fd=%d err=%d (removed)",
                  fds[i], res[i]);   // …log after — bounded: the
         // fd is already gone, so a re-broadcast of this line can't re-fail.
@@ -487,9 +503,9 @@ void ws_server_reply(int fd, const char* json, size_t len) {
     esp_err_t ret = ESP_OK;
     if (!send_locked(&fd, 1, &pkt, &ret)) return;
     if (ret != ESP_OK) {
-        // Same ordering rule as the broadcast loop: drop the fd before
-        // touching the log pipeline.
-        remove_fd(fd);
+        // Same ordering rule as the broadcast loop: drop the fd (and close its
+        // session) before touching the log pipeline.
+        drop_failed_fd(fd);
         ESP_LOGW(TAG, "ws_reply: send failed fd=%d err=%d (removed)", fd, ret);
     }
 }

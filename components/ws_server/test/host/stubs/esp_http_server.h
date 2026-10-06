@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
-// Host stub of the esp_http_server API that ws_server.cpp calls. Only the WebSocket
-// frame writer, httpd_ws_send_frame_async, is left to the test (IDF's two-send() writer).
+// Host stub of the esp_http_server API that ws_server.cpp calls. Left to the test: the
+// WebSocket frame writer httpd_ws_send_frame_async (IDF's two-send() writer) and
+// httpd_sess_trigger_close (which the test records).
 #include <cstddef>
 #include <cstdint>
 
@@ -39,8 +40,8 @@ inline esp_err_t httpd_req_get_hdr_value_str(httpd_req_t*, const char*, char*, s
 inline size_t httpd_req_get_url_query_len(httpd_req_t*) { return 0; }
 inline esp_err_t httpd_req_get_url_query_str(httpd_req_t*, char*, size_t) { return ESP_FAIL; }
 inline esp_err_t httpd_query_key_value(const char*, const char*, char*, size_t) { return ESP_FAIL; }
-inline esp_err_t httpd_sess_trigger_close(httpd_handle_t, int) { return ESP_OK; }
 inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t*, size_t) { return ESP_FAIL; }
 inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { return HTTPD_WS_CLIENT_WEBSOCKET; }
 inline bool httpd_uri_match_wildcard(const char*, const char*, size_t) { return true; }
 esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* frame);   // supplied by the test
+esp_err_t httpd_sess_trigger_close(httpd_handle_t, int fd);                             // supplied by the test
